@@ -171,8 +171,12 @@ def run_sft_benchmark(
         "trainer.resume_mode=disable",
     ]
 
-    # Create temporary wandb directory for this benchmark run
-    with tempfile.TemporaryDirectory() as wandb_tmpdir:
+    # Create temporary directories for this benchmark run (no persistent checkpoints)
+    with tempfile.TemporaryDirectory() as benchmark_tmpdir, \
+         tempfile.TemporaryDirectory() as wandb_tmpdir:
+        # Point checkpoint dir to temp so last-step checkpoint is discarded
+        cmd.append(f"trainer.default_local_dir={benchmark_tmpdir}/checkpoints")
+
         wandb_dir = Path(wandb_tmpdir) / "wandb"
         wandb_dir.mkdir()
 
@@ -203,7 +207,7 @@ def run_sft_benchmark(
                 # Check for OOM
                 if "OutOfMemoryError" in combined or "CUDA out of memory" in combined:
                     raise torch.cuda.OutOfMemoryError(f"CUDA OOM: {combined[-1000:]}")
-                raise RuntimeError(f"SFT benchmark failed: {combined[-2000:]}")
+                raise RuntimeError(f"SFT benchmark failed: {combined[-8000:]}")
 
             # Parse metrics from console output as fallback
             metrics = _parse_verl_sft_output(result.stdout, result.stderr)

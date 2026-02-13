@@ -208,7 +208,8 @@ def run_grpo_benchmark(
             "trainer.experiment_name=grpo_benchmark",
             f"trainer.n_gpus_per_node={num_gpus}",
             f"trainer.nnodes={num_nodes}",
-            "trainer.save_freq=9999",  # Don't save checkpoints
+            "trainer.save_freq=-1",  # Don't save checkpoints
+            f"trainer.default_local_dir={tmpdir}/checkpoints",
             "trainer.val_before_train=False",
             "trainer.test_freq=9999",
             f"trainer.total_epochs={num_steps}",
