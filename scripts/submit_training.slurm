@@ -45,7 +45,7 @@ module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Activate virtual environment
-PROJECT_DIR=/cluster/projects/nn12068k/haaklau/rlvr-for-grokking
+PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 source $PROJECT_DIR/venv/bin/activate
 
 # Environment variables

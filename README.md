@@ -1,6 +1,6 @@
-# RLVR for Grokking
+# LLM Training Experiments
 
-Reinforcement Learning with Verifiable Rewards (RLVR) using GRPO for grokking experiments on the Olivia HPC cluster.
+LLM training experiments on the Olivia HPC cluster using verl for GRPO and SFT.
 
 ## Structure
 

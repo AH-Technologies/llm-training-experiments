@@ -10,7 +10,7 @@ DATA_DIR=${DATA_DIR:-"./data/astar_grokking_dataset"}
 TRAIN_FILE="${DATA_DIR}/astar_train.parquet"
 VAL_FILE="${DATA_DIR}/astar_val.parquet"
 
-PROJECT_DIR=${PROJECT_DIR:-"/cluster/projects/nn12068k/haaklau/rlvr-for-grokking"}
+PROJECT_DIR=${PROJECT_DIR:-"/cluster/projects/nn12068k/haaklau/llm-training-experiments"}
 
 N_GPUS=${N_GPUS:-4}
 

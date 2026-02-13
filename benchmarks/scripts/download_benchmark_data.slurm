@@ -15,7 +15,7 @@
 
 set -x
 
-PROJECT_DIR=/cluster/projects/nn12068k/haaklau/rlvr-for-grokking
+PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 cd $PROJECT_DIR
 
 module load NRIS/GPU

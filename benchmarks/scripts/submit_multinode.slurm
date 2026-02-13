@@ -15,7 +15,7 @@
 
 set -x
 
-PROJECT_DIR=/cluster/projects/nn12068k/haaklau/rlvr-for-grokking
+PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 cd $PROJECT_DIR
 
 module load NRIS/GPU
@@ -38,7 +38,7 @@ echo ""
 
 # Run on each node using srun
 srun --nodes=2 --ntasks-per-node=1 bash -c '
-    cd /cluster/projects/nn12068k/haaklau/rlvr-for-grokking
+    cd /cluster/projects/nn12068k/haaklau/llm-training-experiments
     source venv/bin/activate
 
     python -m benchmarks.benchmark_runner \
