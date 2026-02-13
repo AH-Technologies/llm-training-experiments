@@ -69,5 +69,8 @@ outputs/
 # Ray
 ray_results/
 
+# Tiktoken encodings (downloaded at setup, required by vLLM)
+tiktoken_encodings/
+
 # Benchmark logs
 benchmarks/results/

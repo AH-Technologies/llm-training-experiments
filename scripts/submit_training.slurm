@@ -62,7 +62,8 @@ export NCCL_IB_DISABLE=0
 # vLLM settings
 export VLLM_USE_V1=1
 
-# Tiktoken encoding files for offline use (openai_harmony needs these)
+# Tiktoken encoding files for offline use (openai_harmony/vLLM needs these)
+export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
 
 # Fix for NRIS HPC: Slurm sets both CUDA and ROCm env vars, verl errors on this
@@ -177,6 +178,6 @@ echo "Starting training for $TASK..."
 echo "Using script: $TRAIN_SCRIPT"
 
 chmod +x $TRAIN_SCRIPT
-bash $TRAIN_SCRIPT
+bash $TRAIN_SCRIPT "${@:2}"
 
 echo "Training complete!"

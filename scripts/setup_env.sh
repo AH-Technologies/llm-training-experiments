@@ -77,6 +77,15 @@ curl -L -o "/tmp/${FLASH_ATTN_WHEEL}" "$FLASH_ATTN_URL"
 pip install "/tmp/${FLASH_ATTN_WHEEL}"
 rm -f "/tmp/${FLASH_ATTN_WHEEL}"
 
+# Download tiktoken encodings for offline use (compute nodes have no internet)
+# Required by vLLM's openai_harmony module
+echo "Downloading tiktoken encodings for offline use..."
+mkdir -p $PROJECT_DIR/tiktoken_encodings
+curl -L -o $PROJECT_DIR/tiktoken_encodings/o200k_base.tiktoken \
+    "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+curl -L -o $PROJECT_DIR/tiktoken_encodings/cl100k_base.tiktoken \
+    "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+
 # Install additional dependencies
 echo "Installing additional dependencies..."
 pip install pandas pyarrow wandb hydra-core omegaconf
