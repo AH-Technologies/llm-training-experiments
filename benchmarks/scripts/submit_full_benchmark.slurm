@@ -25,6 +25,7 @@ source venv/bin/activate
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export WANDB_MODE=disabled
+export PYTHONUNBUFFERED=1
 
 echo "=== Full Benchmark Suite ==="
 echo "Start time: $(date)"
@@ -35,7 +36,7 @@ echo ""
 # Step 1: Find max batch size for each model
 # Step 2: Test batch sizes 1,2,4,8,16,... up to max to find optimal throughput
 python -m benchmarks.benchmark_runner \
-    --models 0.5B 1.5B 3B 7B 14B 32B \
+    --models 0.5B 1.5B 3B 7B 14B 32B 72B \
     --training-types sft grpo \
     --num-gpus 4 \
     --sequence-length 2048 \

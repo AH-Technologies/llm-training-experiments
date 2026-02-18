@@ -8,21 +8,26 @@ Uses OpenMathInstruct-2 dataset for realistic throughput measurements.
 Throughput is calculated as TRAINED tokens/sec (response tokens only),
 not total processed tokens, for accurate comparison.
 
-Extracts actual timing from wandb logs:
-- train/time(s): actual time per training step from verl
+Extracts actual timing from verl's file logger (most reliable),
+console output, or falls back to wall-clock estimation.
+
+Metrics extraction priority:
+1. File logger JSONL (VERL_FILE_LOGGER_PATH) - most reliable
+2. Console output parsing - immediate, flushed
+3. Wall-clock estimation - fallback
 """
 
-import glob
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 import torch
+
+from benchmarks.gpu_monitor import GPUMemoryMonitor
 
 
 # Default dataset paths (relative to project root)
@@ -31,55 +36,71 @@ DEFAULT_VAL_FILE = "data/benchmark/openmath_sft_val.parquet"
 DEFAULT_STATS_FILE = "data/benchmark/openmath_sft_stats.json"
 
 
-def extract_wandb_metrics(wandb_dir: Path) -> dict:
+def extract_file_logger_metrics(file_logger_path: Path) -> dict:
     """
-    Extract metrics from wandb offline logs.
+    Extract metrics from verl's file logger JSONL output.
 
-    verl's SFT trainer logs:
-    - train/time(s): time per training step
-    - train/loss: training loss
+    verl's FileLogger writes lines like:
+        {"step": N, "data": {"train/time(s)": 5.678, "train/loss": 0.123, ...}}
 
     Returns dict with averaged metrics from the training run.
     """
     metrics = {}
-
-    # Find the most recent run directory
-    run_dirs = sorted(wandb_dir.glob("run-*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not run_dirs:
+    if not file_logger_path.exists():
         return metrics
 
-    run_dir = run_dirs[0]
+    try:
+        steps_data = []
+        with open(file_logger_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    steps_data.append(json.loads(line))
 
-    # Try to read wandb history file
-    history_file = run_dir / "files" / "wandb-history.jsonl"
-    if history_file.exists():
+        if steps_data:
+            # Skip warmup steps
+            skip_steps = min(3, len(steps_data) // 4)
+            valid_steps = steps_data[skip_steps:]
+
+            for key in ["train/time(s)", "train/loss"]:
+                values = [
+                    s["data"].get(key)
+                    for s in valid_steps
+                    if isinstance(s.get("data"), dict) and s["data"].get(key) is not None
+                ]
+                if values:
+                    metrics[key] = sum(values) / len(values)
+    except Exception:
+        pass
+
+    return metrics
+
+
+def parse_console_metrics(stdout: str, stderr: str) -> dict:
+    """
+    Parse verl's console output for SFT metrics.
+
+    verl's console logger format (from aggregate_logger.py):
+        step:N - train/time(s):5.678 - train/loss:0.123 - ...
+
+    Returns dict with averaged metrics.
+    """
+    metrics = {}
+    combined = stdout + stderr
+
+    # Match verl console format: train/time(s):<value>
+    step_times = []
+    for match in re.finditer(r"train/time\(s\):(\d+\.?\d*)", combined):
         try:
-            with open(history_file) as f:
-                steps_data = [json.loads(line) for line in f]
-
-            if steps_data:
-                # Aggregate metrics (skip warmup steps)
-                skip_steps = min(3, len(steps_data) // 4)
-                valid_steps = steps_data[skip_steps:]
-
-                for key in ["train/time(s)", "train/loss"]:
-                    values = [s.get(key) for s in valid_steps if s.get(key) is not None]
-                    if values:
-                        metrics[key] = sum(values) / len(values)
-        except Exception:
+            step_times.append(float(match.group(1)))
+        except ValueError:
             pass
 
-    # Also try summary file
-    summary_file = run_dir / "files" / "wandb-summary.json"
-    if summary_file.exists():
-        try:
-            with open(summary_file) as f:
-                summary = json.load(f)
-                for key in ["train/time(s)", "train/loss"]:
-                    if key in summary and key not in metrics:
-                        metrics[key] = summary[key]
-        except Exception:
-            pass
+    if step_times:
+        # Skip warmup steps
+        if len(step_times) > 5:
+            step_times = step_times[3:]
+        metrics["train/time(s)"] = sum(step_times) / len(step_times)
 
     return metrics
 
@@ -103,6 +124,7 @@ def run_sft_benchmark(
     train_file: str = None,
     val_file: str = None,
     num_nodes: int = 1,
+    offload: bool = False,
 ) -> dict:
     """
     Run SFT benchmark via verl's fsdp_sft_trainer and return metrics.
@@ -115,6 +137,7 @@ def run_sft_benchmark(
         - samples_per_second: Samples processed per second
         - time_per_step_ms: Average time per training step
         - total_time_s: Total benchmark time
+        - metrics_source: "file_logger", "console", or "estimated"
     """
 
     project_dir = Path(__file__).parent.parent
@@ -130,17 +153,35 @@ def run_sft_benchmark(
     # Get multi-node settings from environment (set by SLURM)
     master_addr = os.environ.get("MASTER_ADDR", "localhost")
     master_port = os.environ.get("MASTER_PORT", "29502")
-    node_rank = int(os.environ.get("SLURM_NODEID", "0"))
 
     # Build verl fsdp_sft_trainer command
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={num_gpus}",
-        f"--nnodes={num_nodes}",
-        f"--node_rank={node_rank}",
-        f"--master_addr={master_addr}",
-        f"--master_port={master_port}",
-        "-m", "verl.trainer.fsdp_sft_trainer",
+    if num_nodes > 1:
+        # Multi-node: use srun to launch torchrun on each allocated node.
+        # c10d rendezvous handles node rank assignment automatically.
+        cmd = [
+            "srun",
+            f"--nodes={num_nodes}",
+            "--ntasks-per-node=1",
+            "torchrun",
+            f"--nproc_per_node={num_gpus}",
+            f"--nnodes={num_nodes}",
+            "--rdzv_backend=c10d",
+            f"--rdzv_endpoint={master_addr}:{master_port}",
+            "-m", "verl.trainer.fsdp_sft_trainer",
+        ]
+    else:
+        # Single-node: direct torchrun
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={num_gpus}",
+            f"--nnodes=1",
+            "--node_rank=0",
+            f"--master_addr={master_addr}",
+            f"--master_port={master_port}",
+            "-m", "verl.trainer.fsdp_sft_trainer",
+        ]
+
+    cmd += [
         f"model.partial_pretrain={model_name}",
         "model.trust_remote_code=True",
         "model.enable_gradient_checkpointing=True",
@@ -163,7 +204,7 @@ def run_sft_benchmark(
         "trainer.experiment_name=sft_benchmark",
         f"trainer.total_training_steps={num_steps}",
         "trainer.total_epochs=9999",  # Use steps, not epochs
-        'trainer.logger=["console","wandb"]',
+        'trainer.logger=["console","file"]',
         f"trainer.n_gpus_per_node={num_gpus}",
         f"trainer.nnodes={num_nodes}",
         "trainer.save_freq=-1",
@@ -171,31 +212,39 @@ def run_sft_benchmark(
         "trainer.resume_mode=disable",
     ]
 
+    # CPU offloading for large models that don't fit without it
+    if offload:
+        cmd.extend([
+            f"model.fsdp_config.cpu_offload=True",
+            f"model.fsdp_config.offload_params=True",
+        ])
+
     # Create temporary directories for this benchmark run (no persistent checkpoints)
-    with tempfile.TemporaryDirectory() as benchmark_tmpdir, \
-         tempfile.TemporaryDirectory() as wandb_tmpdir:
+    with tempfile.TemporaryDirectory() as benchmark_tmpdir:
+        benchmark_tmpdir = Path(benchmark_tmpdir)
+
         # Point checkpoint dir to temp so last-step checkpoint is discarded
         cmd.append(f"trainer.default_local_dir={benchmark_tmpdir}/checkpoints")
 
-        wandb_dir = Path(wandb_tmpdir) / "wandb"
-        wandb_dir.mkdir()
+        # Set up file logger path
+        file_logger_path = benchmark_tmpdir / "sft_metrics.jsonl"
 
         env = os.environ.copy()
-        env["WANDB_MODE"] = "offline"  # Save logs locally for extraction
-        env["WANDB_DIR"] = str(wandb_dir)
+        env["VERL_FILE_LOGGER_PATH"] = str(file_logger_path)
 
-        # Run benchmark
+        # Run benchmark with GPU memory monitoring
         start_time = time.perf_counter()
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour timeout
-                env=env,
-                cwd=project_dir,
-            )
+            with GPUMemoryMonitor(poll_interval=1.0) as gpu_monitor:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,  # 1 hour timeout
+                    env=env,
+                    cwd=project_dir,
+                )
 
             total_time = time.perf_counter() - start_time
 
@@ -209,19 +258,33 @@ def run_sft_benchmark(
                     raise torch.cuda.OutOfMemoryError(f"CUDA OOM: {combined[-1000:]}")
                 raise RuntimeError(f"SFT benchmark failed: {combined[-8000:]}")
 
-            # Parse metrics from console output as fallback
-            metrics = _parse_verl_sft_output(result.stdout, result.stderr)
+            # Three-tier metric extraction:
+            # 1. File logger JSONL (most reliable)
+            # 2. Console output parsing
+            # 3. Wall-clock estimation (fallback)
+
+            metrics = {
+                "peak_memory_gb": gpu_monitor.peak_memory_gb,
+                "tokens_per_second": None,
+                "samples_per_second": None,
+                "time_per_step_ms": None,
+            }
             metrics["total_time_s"] = total_time
 
-            # Try to extract actual metrics from wandb logs
-            wandb_metrics = extract_wandb_metrics(wandb_dir)
-
-            # Use actual time per step from wandb if available
-            if "train/time(s)" in wandb_metrics:
-                metrics["time_per_step_ms"] = wandb_metrics["train/time(s)"] * 1000
-                metrics["metrics_source"] = "wandb"
+            # Tier 1: File logger
+            file_metrics = extract_file_logger_metrics(file_logger_path)
+            if "train/time(s)" in file_metrics:
+                metrics["time_per_step_ms"] = file_metrics["train/time(s)"] * 1000
+                metrics["metrics_source"] = "file_logger"
             else:
-                metrics["metrics_source"] = "estimated"
+                # Tier 2: Console output
+                console_metrics = parse_console_metrics(result.stdout, result.stderr)
+                if "train/time(s)" in console_metrics:
+                    metrics["time_per_step_ms"] = console_metrics["train/time(s)"] * 1000
+                    metrics["metrics_source"] = "console"
+                else:
+                    # Tier 3: Wall-clock estimation
+                    metrics["metrics_source"] = "estimated"
 
             # Calculate time per step
             if metrics.get("time_per_step_ms") is not None:
@@ -265,61 +328,6 @@ def run_sft_benchmark(
 
         except subprocess.TimeoutExpired:
             raise RuntimeError("SFT benchmark timed out (1 hour)")
-
-
-def _parse_verl_sft_output(stdout: str, stderr: str) -> dict:
-    """Parse verl SFT trainer output to extract metrics."""
-
-    metrics = {
-        "peak_memory_gb": None,
-        "tokens_per_second": None,
-        "samples_per_second": None,
-        "time_per_step_ms": None,
-    }
-
-    combined = stdout + stderr
-
-    # Look for step timing info
-    # verl logs: "step X/Y, loss: Z, time: Ws"
-    step_times = []
-    for match in re.finditer(r"time[:\s]+(\d+\.?\d*)\s*s", combined, re.IGNORECASE):
-        try:
-            step_times.append(float(match.group(1)) * 1000)  # Convert to ms
-        except ValueError:
-            pass
-
-    # Also look for ms format
-    for match in re.finditer(r"time[:\s]+(\d+\.?\d*)\s*ms", combined, re.IGNORECASE):
-        try:
-            step_times.append(float(match.group(1)))
-        except ValueError:
-            pass
-
-    if step_times:
-        # Skip first few warmup steps
-        if len(step_times) > 5:
-            step_times = step_times[3:]
-        metrics["time_per_step_ms"] = sum(step_times) / len(step_times)
-
-    # Look for memory info
-    for match in re.finditer(r"memory.*?(\d+\.?\d*)\s*GB", combined, re.IGNORECASE):
-        try:
-            metrics["peak_memory_gb"] = float(match.group(1))
-        except ValueError:
-            pass
-
-    # Also check nvidia-smi style output
-    for match in re.finditer(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", combined):
-        try:
-            used_mb = float(match.group(1))
-            metrics["peak_memory_gb"] = max(
-                metrics["peak_memory_gb"] or 0,
-                used_mb / 1024
-            )
-        except ValueError:
-            pass
-
-    return metrics
 
 
 # Allow running standalone for testing

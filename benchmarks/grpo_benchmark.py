@@ -5,18 +5,23 @@ GRPO benchmark module.
 Runs GRPO training via verl to measure throughput and memory usage.
 Uses synthetic prompts to avoid dataset dependencies.
 
-Extracts actual metrics from wandb logs for accurate measurements:
+Extracts actual metrics from verl's file logger (most reliable),
+console output, or falls back to wall-clock estimation.
+
+Metrics extraction priority:
+1. File logger JSONL (VERL_FILE_LOGGER_PATH) - most reliable
+2. Console output parsing - immediate, flushed
+3. Wall-clock estimation - fallback
+
+Key GRPO metrics:
 - perf/throughput: tokens/sec/GPU from verl
-- response_length/mean: actual average response length
 - perf/time_per_step: actual step timing
+- response_length/mean: actual average response length
 """
 
-import gc
-import glob
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -25,69 +30,86 @@ from pathlib import Path
 import pandas as pd
 import torch
 
+from benchmarks.gpu_monitor import GPUMemoryMonitor
 
-# Fallback average response length if wandb metrics unavailable
+
+# Fallback average response length if metrics unavailable
 DEFAULT_AVG_RESPONSE_LENGTH = 300
 
 
-def extract_wandb_metrics(wandb_dir: Path) -> dict:
+def extract_file_logger_metrics(file_logger_path: Path) -> dict:
     """
-    Extract metrics from wandb offline logs.
+    Extract metrics from verl's file logger JSONL output.
 
-    verl logs these useful metrics to wandb:
-    - perf/throughput: tokens/sec/GPU (actual measured)
-    - perf/time_per_step: actual step time
-    - response_length/mean: actual average response length
-    - prompt_length/mean: actual prompt length
+    verl's FileLogger writes lines like:
+        {"step": N, "data": {"perf/throughput": 1234.5, "perf/time_per_step": 5.678, ...}}
 
     Returns dict with averaged metrics from the training run.
     """
     metrics = {}
-
-    # Find the most recent run directory
-    run_dirs = sorted(wandb_dir.glob("run-*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not run_dirs:
+    if not file_logger_path.exists():
         return metrics
 
-    run_dir = run_dirs[0]
-
-    # Try to read the wandb binary file using wandb's API
     try:
-        import wandb
+        steps_data = []
+        with open(file_logger_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    steps_data.append(json.loads(line))
 
-        # Load the run from offline files
-        history_file = run_dir / "files" / "wandb-history.jsonl"
-        if history_file.exists():
-            with open(history_file) as f:
-                steps_data = [json.loads(line) for line in f]
+        if steps_data:
+            # Skip warmup steps
+            skip_steps = min(3, len(steps_data) // 4)
+            valid_steps = steps_data[skip_steps:]
 
-            if steps_data:
-                # Aggregate metrics (skip warmup steps)
-                skip_steps = min(3, len(steps_data) // 4)
-                valid_steps = steps_data[skip_steps:]
-
-                for key in ["perf/throughput", "perf/time_per_step",
-                            "response_length/mean", "prompt_length/mean"]:
-                    values = [s.get(key) for s in valid_steps if s.get(key) is not None]
-                    if values:
-                        metrics[key] = sum(values) / len(values)
-
-    except Exception as e:
-        # Fallback: try to parse the .wandb binary file
+            for key in ["perf/throughput", "perf/time_per_step",
+                        "response_length/mean", "prompt_length/mean"]:
+                values = [
+                    s["data"].get(key)
+                    for s in valid_steps
+                    if isinstance(s.get("data"), dict) and s["data"].get(key) is not None
+                ]
+                if values:
+                    metrics[key] = sum(values) / len(values)
+    except Exception:
         pass
 
-    # Also try parsing the summary file
-    summary_file = run_dir / "files" / "wandb-summary.json"
-    if summary_file.exists():
-        try:
-            with open(summary_file) as f:
-                summary = json.load(f)
-                for key in ["perf/throughput", "perf/time_per_step",
-                            "response_length/mean", "prompt_length/mean"]:
-                    if key in summary and key not in metrics:
-                        metrics[key] = summary[key]
-        except Exception:
-            pass
+    return metrics
+
+
+def parse_console_metrics(stdout: str, stderr: str) -> dict:
+    """
+    Parse verl's console output for GRPO metrics.
+
+    verl's console logger format (from aggregate_logger.py):
+        step:N - perf/throughput:1234.5 - perf/time_per_step:5.678 - ...
+
+    Returns dict with averaged metrics.
+    """
+    metrics = {}
+    combined = stdout + stderr
+
+    # Match verl console format for each metric key
+    metric_patterns = {
+        "perf/throughput": r"perf/throughput:(\d+\.?\d*)",
+        "perf/time_per_step": r"perf/time_per_step:(\d+\.?\d*)",
+        "response_length/mean": r"response_length/mean:(\d+\.?\d*)",
+        "prompt_length/mean": r"prompt_length/mean:(\d+\.?\d*)",
+    }
+
+    for key, pattern in metric_patterns.items():
+        values = []
+        for match in re.finditer(pattern, combined):
+            try:
+                values.append(float(match.group(1)))
+            except ValueError:
+                pass
+        if values:
+            # Skip warmup steps
+            if len(values) > 5:
+                values = values[3:]
+            metrics[key] = sum(values) / len(values)
 
     return metrics
 
@@ -137,7 +159,7 @@ def run_grpo_benchmark(
 
     Token Counting:
     - GRPO generates `rollout_n` responses per prompt
-    - Trained tokens = batch_size × rollout_n × avg_response_length
+    - Trained tokens = batch_size x rollout_n x avg_response_length
 
     Returns dict with:
         - peak_memory_gb: Peak GPU memory usage
@@ -147,6 +169,7 @@ def run_grpo_benchmark(
         - time_per_step_ms: Average time per training step
         - total_time_s: Total benchmark time
         - offload_config: Dict describing offload settings
+        - metrics_source: "file_logger", "console", or "estimated"
     """
 
     project_dir = Path(__file__).parent.parent
@@ -164,7 +187,6 @@ def run_grpo_benchmark(
         )
 
         # Prepare verl command
-        # We'll capture timing from the output
         max_prompt_length = min(512, sequence_length // 2)
         max_response_length = sequence_length - max_prompt_length
 
@@ -203,7 +225,7 @@ def run_grpo_benchmark(
             f"custom_reward_function.path={project_dir}/benchmarks/simple_reward.py",
             "custom_reward_function.name=compute_score",
             "trainer.critic_warmup=0",
-            'trainer.logger=["console","wandb"]',
+            'trainer.logger=["console","file"]',
             "trainer.project_name=benchmark",
             "trainer.experiment_name=grpo_benchmark",
             f"trainer.n_gpus_per_node={num_gpus}",
@@ -216,26 +238,28 @@ def run_grpo_benchmark(
             f"trainer.total_training_steps={num_steps}",
         ]
 
-        # Create temporary wandb directory for this benchmark run
-        wandb_dir = tmpdir / "wandb"
-        wandb_dir.mkdir()
+        # Set up file logger path
+        file_logger_path = tmpdir / "grpo_metrics.jsonl"
 
         # Run benchmark
         start_time = time.perf_counter()
 
         env = os.environ.copy()
-        env["WANDB_MODE"] = "offline"  # Save logs locally for extraction
-        env["WANDB_DIR"] = str(wandb_dir)
+        env["VERL_FILE_LOGGER_PATH"] = str(file_logger_path)
+        # Remove ROCR_VISIBLE_DEVICES to prevent conflict with CUDA_VISIBLE_DEVICES
+        # that Ray sets for workers. verl raises ValueError if both are set.
+        env.pop("ROCR_VISIBLE_DEVICES", None)
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour timeout
-                env=env,
-                cwd=project_dir,
-            )
+            with GPUMemoryMonitor(poll_interval=1.0) as gpu_monitor:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,  # 1 hour timeout
+                    env=env,
+                    cwd=project_dir,
+                )
 
             total_time = time.perf_counter() - start_time
 
@@ -245,12 +269,18 @@ def run_grpo_benchmark(
                     raise torch.cuda.OutOfMemoryError("CUDA OOM in GRPO")
                 raise RuntimeError(f"GRPO failed: {result.stderr[-1000:]}")
 
-            # Parse metrics from console output as fallback
-            metrics = _parse_verl_output(result.stdout, result.stderr)
-            metrics["total_time_s"] = total_time
+            # Three-tier metric extraction:
+            # 1. File logger JSONL (most reliable)
+            # 2. Console output parsing
+            # 3. Wall-clock estimation (fallback)
 
-            # Try to extract actual metrics from wandb logs
-            wandb_metrics = extract_wandb_metrics(wandb_dir)
+            metrics = {
+                "peak_memory_gb": gpu_monitor.peak_memory_gb,
+                "tokens_per_second": None,
+                "samples_per_second": None,
+                "time_per_step_ms": None,
+            }
+            metrics["total_time_s"] = total_time
 
             # Record offload configuration
             metrics["offload_config"] = {
@@ -258,22 +288,36 @@ def run_grpo_benchmark(
                 "ref_offload": ref_offload,
             }
 
-            # Use actual metrics from wandb if available
-            if "perf/throughput" in wandb_metrics:
+            # Tier 1: File logger
+            file_metrics = extract_file_logger_metrics(file_logger_path)
+
+            # Tier 2: Console output (used as fallback for each metric)
+            console_metrics = parse_console_metrics(result.stdout, result.stderr)
+
+            # Determine metrics source and extract timing
+            if "perf/time_per_step" in file_metrics:
+                metrics["time_per_step_ms"] = file_metrics["perf/time_per_step"] * 1000
+                metrics["metrics_source"] = "file_logger"
+            elif "perf/time_per_step" in console_metrics:
+                metrics["time_per_step_ms"] = console_metrics["perf/time_per_step"] * 1000
+                metrics["metrics_source"] = "console"
+            else:
+                metrics["metrics_source"] = "estimated"
+
+            # Extract throughput (prefer file logger, then console)
+            verl_metrics = file_metrics if file_metrics else console_metrics
+            if "perf/throughput" in verl_metrics:
                 # verl logs throughput as tokens/sec/GPU, multiply by num_gpus
-                metrics["tokens_per_second"] = wandb_metrics["perf/throughput"] * num_gpus
-                metrics["wandb_throughput_per_gpu"] = wandb_metrics["perf/throughput"]
+                metrics["tokens_per_second"] = verl_metrics["perf/throughput"] * num_gpus
+                metrics["wandb_throughput_per_gpu"] = verl_metrics["perf/throughput"]
 
-            if "perf/time_per_step" in wandb_metrics:
-                metrics["time_per_step_ms"] = wandb_metrics["perf/time_per_step"] * 1000
+            if "response_length/mean" in verl_metrics:
+                metrics["avg_response_length"] = verl_metrics["response_length/mean"]
 
-            if "response_length/mean" in wandb_metrics:
-                metrics["avg_response_length"] = wandb_metrics["response_length/mean"]
+            if "prompt_length/mean" in verl_metrics:
+                metrics["avg_prompt_length"] = verl_metrics["prompt_length/mean"]
 
-            if "prompt_length/mean" in wandb_metrics:
-                metrics["avg_prompt_length"] = wandb_metrics["prompt_length/mean"]
-
-            # Calculate time per step (prefer wandb, fallback to estimate)
+            # Calculate time per step (prefer extracted, fallback to estimate)
             if metrics.get("time_per_step_ms") is not None:
                 time_per_step_s = metrics["time_per_step_ms"] / 1000
             else:
@@ -282,11 +326,11 @@ def run_grpo_benchmark(
                 time_per_step_s = effective_time / num_steps
                 metrics["time_per_step_ms"] = time_per_step_s * 1000
 
-            # Calculate token throughput if not from wandb
+            # Calculate token throughput if not from verl
             avg_response_length = metrics.get("avg_response_length", DEFAULT_AVG_RESPONSE_LENGTH)
 
             if "tokens_per_second" not in metrics or metrics["tokens_per_second"] is None:
-                # Fallback calculation: batch_size × rollout_n × avg_response_length
+                # Fallback calculation: batch_size x rollout_n x avg_response_length
                 generated_tokens_per_step = batch_size * rollout_n * avg_response_length
                 metrics["tokens_per_second"] = generated_tokens_per_step / time_per_step_s
 
@@ -298,56 +342,11 @@ def run_grpo_benchmark(
             # Store config for analysis
             metrics["rollout_n"] = rollout_n
             metrics["avg_response_length"] = avg_response_length
-            metrics["metrics_source"] = "wandb" if "perf/throughput" in wandb_metrics else "estimated"
 
             return metrics
 
         except subprocess.TimeoutExpired:
             raise RuntimeError("GRPO benchmark timed out (1 hour)")
-
-
-def _parse_verl_output(stdout: str, stderr: str) -> dict:
-    """Parse verl output to extract metrics."""
-
-    # Default values if parsing fails
-    metrics = {
-        "peak_memory_gb": None,
-        "tokens_per_second": None,
-        "samples_per_second": None,
-        "time_per_step_ms": None,
-    }
-
-    combined = stdout + stderr
-
-    # Look for timing info in verl output
-    # verl typically logs: "step X, time: Y.Zs"
-    import re
-
-    step_times = []
-    for match in re.finditer(r"step.*?time[:\s]+(\d+\.?\d*)\s*s", combined, re.IGNORECASE):
-        try:
-            step_times.append(float(match.group(1)) * 1000)  # Convert to ms
-        except ValueError:
-            pass
-
-    if step_times:
-        metrics["time_per_step_ms"] = sum(step_times) / len(step_times)
-
-    # Look for memory info
-    for match in re.finditer(r"memory.*?(\d+\.?\d*)\s*GB", combined, re.IGNORECASE):
-        try:
-            metrics["peak_memory_gb"] = float(match.group(1))
-        except ValueError:
-            pass
-
-    # Look for throughput
-    for match in re.finditer(r"throughput.*?(\d+\.?\d*)\s*tokens?/s", combined, re.IGNORECASE):
-        try:
-            metrics["tokens_per_second"] = float(match.group(1))
-        except ValueError:
-            pass
-
-    return metrics
 
 
 # Allow running standalone

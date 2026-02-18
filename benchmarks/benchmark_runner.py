@@ -56,7 +56,7 @@ class BenchmarkResult:
     time_per_step_ms: Optional[float] = None
     total_steps: int = 0
     total_time_s: Optional[float] = None
-    metrics_source: Optional[str] = None  # "wandb" or "estimated"
+    metrics_source: Optional[str] = None  # "file_logger", "console", or "estimated"
 
 
 # Model configurations to benchmark
@@ -68,6 +68,8 @@ MODELS = {
     "14B": "Qwen/Qwen2.5-14B",
     "32B": "Qwen/Qwen2.5-32B",
     "72B": "Qwen/Qwen2.5-72B",
+    "120B": "openai/gpt-oss-120b",
+    "235B": "Qwen/Qwen3-235B-A22B",
 }
 
 # Starting batch sizes for binary search (will be halved on OOM)
@@ -79,6 +81,8 @@ INITIAL_BATCH_SIZES = {
     "14B": 4,
     "32B": 4,
     "72B": 4,
+    "120B": 4,
+    "235B": 4,
 }
 
 # Batch size limits
@@ -115,16 +119,21 @@ def find_max_batch_size(
     num_steps: int = 10,
     actor_offload: bool = False,
     ref_offload: bool = True,
+    num_nodes: int = 1,
 ) -> tuple[int, BenchmarkResult]:
     """
     Binary search to find maximum batch size that fits in memory.
 
     Returns (max_batch_size, benchmark_result)
     """
-    batch_size = INITIAL_BATCH_SIZES.get(model_size, 8)
+    # Batch size must be divisible by total number of GPUs (dp_size)
+    total_gpus = num_gpus * num_nodes
+    min_batch_size = max(MIN_BATCH_SIZE, total_gpus)
+
+    batch_size = max(INITIAL_BATCH_SIZES.get(model_size, 8), min_batch_size)
     last_successful_result = None
 
-    while batch_size >= MIN_BATCH_SIZE:
+    while batch_size >= min_batch_size:
         # Cap at maximum
         if batch_size > MAX_BATCH_SIZE_CAP:
             print(f"Reached max batch size cap ({MAX_BATCH_SIZE_CAP})")
@@ -141,6 +150,7 @@ def find_max_batch_size(
             num_gpus=num_gpus,
             sequence_length=sequence_length,
             num_steps=num_steps,
+            num_nodes=num_nodes,
             actor_offload=actor_offload,
             ref_offload=ref_offload,
         )
@@ -151,17 +161,74 @@ def find_max_batch_size(
             # Try larger batch size
             batch_size = batch_size * 2
         else:
-            print(f"OOM: batch_size={batch_size} too large")
+            is_oom = result.error_message and "OOM" in result.error_message
+            if is_oom:
+                print(f"OOM: batch_size={batch_size} too large")
+            else:
+                print(f"FAILED: batch_size={batch_size} - {result.error_message}")
             if last_successful_result:
+                break
+            if not is_oom:
+                # Non-OOM errors (e.g. env issues) won't be fixed by reducing batch size
                 break
             # Try smaller batch size
             batch_size = batch_size // 2
 
     if last_successful_result:
         return last_successful_result.batch_size, last_successful_result
-    else:
-        # Even minimum batch size failed
-        return 0, result
+
+    # Phase 2: OOM fallback — retry with CPU offloading
+    is_oom = result.error_message and "OOM" in result.error_message
+    if is_oom and not actor_offload:
+        print(f"\n{'='*60}")
+        print(f"OOM at minimum batch size, retrying with CPU offloading...")
+        print(f"{'='*60}")
+
+        batch_size = max(INITIAL_BATCH_SIZES.get(model_size, 8), min_batch_size)
+        last_successful_result = None
+
+        while batch_size >= min_batch_size:
+            if batch_size > MAX_BATCH_SIZE_CAP:
+                print(f"Reached max batch size cap ({MAX_BATCH_SIZE_CAP})")
+                break
+
+            print(f"\n{'='*60}")
+            print(f"Testing {model_size} with batch_size={batch_size} (offloaded)")
+            print(f"{'='*60}")
+
+            result = run_single_benchmark(
+                model_size=model_size,
+                training_type=training_type,
+                batch_size=batch_size,
+                num_gpus=num_gpus,
+                sequence_length=sequence_length,
+                num_steps=num_steps,
+                num_nodes=num_nodes,
+                actor_offload=True,
+                ref_offload=ref_offload,
+            )
+
+            if result.success:
+                last_successful_result = result
+                print(f"SUCCESS: batch_size={batch_size} fits (with offloading)!")
+                batch_size = batch_size * 2
+            else:
+                is_oom = result.error_message and "OOM" in result.error_message
+                if is_oom:
+                    print(f"OOM: batch_size={batch_size} too large (even with offloading)")
+                else:
+                    print(f"FAILED: batch_size={batch_size} - {result.error_message}")
+                if last_successful_result:
+                    break
+                if not is_oom:
+                    break
+                batch_size = batch_size // 2
+
+        if last_successful_result:
+            return last_successful_result.batch_size, last_successful_result
+
+    # Even minimum batch size failed (with and without offloading)
+    return 0, result
 
 
 def find_optimal_throughput(
@@ -173,14 +240,19 @@ def find_optimal_throughput(
     num_steps: int = 20,
     actor_offload: bool = False,
     ref_offload: bool = True,
+    num_nodes: int = 1,
 ) -> list[BenchmarkResult]:
     """
     Test multiple batch sizes up to max_batch_size to find optimal throughput.
 
     Returns list of BenchmarkResults for each tested batch size.
     """
-    # Filter batch sizes to test (only those <= max_batch_size)
-    batch_sizes_to_test = [bs for bs in BATCH_SIZE_RANGE if bs <= max_batch_size]
+    # Batch size must be divisible by total number of GPUs (dp_size)
+    total_gpus = num_gpus * num_nodes
+    min_batch_size = max(MIN_BATCH_SIZE, total_gpus)
+
+    # Filter batch sizes to test (only those in valid range)
+    batch_sizes_to_test = [bs for bs in BATCH_SIZE_RANGE if min_batch_size <= bs <= max_batch_size]
 
     # Always include max_batch_size if not in the list
     if max_batch_size not in batch_sizes_to_test:
@@ -202,6 +274,7 @@ def find_optimal_throughput(
             num_gpus=num_gpus,
             sequence_length=sequence_length,
             num_steps=num_steps,
+            num_nodes=num_nodes,
             actor_offload=actor_offload,
             ref_offload=ref_offload,
         )
@@ -275,6 +348,7 @@ def run_single_benchmark(
                 num_steps=num_steps,
                 gradient_accumulation=gradient_accumulation,
                 num_nodes=num_nodes,
+                offload=actor_offload,
             )
         elif training_type == "grpo":
             result = _run_grpo_benchmark(
@@ -320,6 +394,7 @@ def _run_sft_benchmark(
     num_steps: int,
     gradient_accumulation: int = 1,
     num_nodes: int = 1,
+    offload: bool = False,
 ) -> dict:
     """Run SFT benchmark using the sft_benchmark module."""
     from benchmarks.sft_benchmark import run_sft_benchmark
@@ -332,6 +407,7 @@ def _run_sft_benchmark(
         num_steps=num_steps,
         gradient_accumulation=gradient_accumulation,
         num_nodes=num_nodes,
+        offload=offload,
     )
 
 
@@ -432,15 +508,16 @@ def print_summary(results: list[BenchmarkResult]):
                 offload = "actor+ref" if r.actor_offload else ("ref" if r.ref_offload else "none")
                 print(f"{r.model_size_b}B{'':<5} {r.num_gpus:<5} {r.batch_size:<6} {offload:<12} {mem:<9} {tps:<10} {ms:<9} {status}")
         else:
-            print(f"{'Model':<10} {'GPUs':<6} {'Batch':<8} {'Mem(GB)':<10} {'Tok/s':<12} {'ms/step':<10} {'Status'}")
+            print(f"{'Model':<8} {'GPUs':<5} {'Batch':<6} {'Offload':<12} {'Mem(GB)':<9} {'Tok/s':<10} {'ms/step':<9} {'Status'}")
             print("-"*90)
 
-            for r in sorted(type_results, key=lambda x: x.model_size_b):
+            for r in sorted(type_results, key=lambda x: (x.model_size_b, x.actor_offload)):
                 status = "OK" if r.success else "FAIL"
                 mem = f"{r.peak_memory_gb:.1f}" if r.peak_memory_gb else "-"
                 tps = f"{r.tokens_per_second:.0f}" if r.tokens_per_second else "-"
                 ms = f"{r.time_per_step_ms:.1f}" if r.time_per_step_ms else "-"
-                print(f"{r.model_size_b}B{'':<7} {r.num_gpus:<6} {r.batch_size:<8} {mem:<10} {tps:<12} {ms:<10} {status}")
+                offload = "cpu" if r.actor_offload else "none"
+                print(f"{r.model_size_b}B{'':<5} {r.num_gpus:<5} {r.batch_size:<6} {offload:<12} {mem:<9} {tps:<10} {ms:<9} {status}")
 
 
 def print_optimal_summary(results: list[BenchmarkResult]):
@@ -456,9 +533,9 @@ def print_optimal_summary(results: list[BenchmarkResult]):
         if r.success and r.tokens_per_second:
             if r.training_type == "grpo":
                 offload_label = "actor+ref" if r.actor_offload else ("ref" if r.ref_offload else "none")
-                key = (r.model_size_b, r.training_type, offload_label)
             else:
-                key = (r.model_size_b, r.training_type, "")
+                offload_label = "cpu" if r.actor_offload else "none"
+            key = (r.model_size_b, r.training_type, offload_label)
             grouped[key].append(r)
 
     print(f"\n{'Model':<8} {'Type':<6} {'Offload':<10} {'Opt Batch':<10} {'Max Batch':<10} {'Best Tok/s':<12}")
@@ -622,10 +699,16 @@ def main():
                         num_steps=min(args.num_steps, 10),  # Fewer steps for max search
                         actor_offload=offload_config["actor_offload"],
                         ref_offload=offload_config["ref_offload"],
+                        num_nodes=args.num_nodes,
                     )
                     print(f"Max batch size for {model_size} ({training_type}, {config_label}): {max_batch}")
 
                     if args.find_optimal and max_batch > 0:
+                        # Use offload settings from the successful result
+                        # (may have been auto-enabled by OOM fallback)
+                        effective_actor_offload = max_result.actor_offload
+                        effective_ref_offload = max_result.ref_offload
+
                         # Step 2: Test range of batch sizes to find optimal throughput
                         throughput_results = find_optimal_throughput(
                             model_size=model_size,
@@ -634,8 +717,9 @@ def main():
                             sequence_length=args.sequence_length,
                             max_batch_size=max_batch,
                             num_steps=args.num_steps,
-                            actor_offload=offload_config["actor_offload"],
-                            ref_offload=offload_config["ref_offload"],
+                            actor_offload=effective_actor_offload,
+                            ref_offload=effective_ref_offload,
+                            num_nodes=args.num_nodes,
                         )
                         results.extend(throughput_results)
                     else:
