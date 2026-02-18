@@ -101,9 +101,10 @@ Example:
 python -m benchmarks.benchmark_runner [OPTIONS]
 
 Options:
-  --models              Model sizes: 0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B, or "all"
+  --models              Model sizes: 0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B, 120B, 235B, or "all"
   --training-types      Training methods: sft, grpo, or "all"
   --num-gpus            GPUs per node (default: 4)
+  --num-nodes           Number of nodes (default: 1)
   --sequence-length     Token sequence length (default: 2048)
   --num-steps           Training steps per benchmark (default: 50)
   --find-optimal        Find max batch size, then test range for optimal throughput

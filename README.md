@@ -15,6 +15,7 @@ LLM training experiments on the Olivia HPC cluster using verl for GRPO and SFT.
 │   ├── setup_env.sh             # Environment setup (run on GPU node)
 │   ├── submit_training.slurm    # SLURM job submission
 │   ├── prepare_pi13_data.py     # Data preparation for Pi13 dataset
+│   ├── prepare_multi_prompt_val.py # Multi-prompt validation data prep
 │   └── run_grpo_*.sh            # Various GRPO training configurations
 │
 └── src/
@@ -46,7 +47,7 @@ Single-node benchmark (tests 1B to 14B models):
 sbatch benchmarks/scripts/submit_benchmark.slurm
 ```
 
-Multi-node benchmark (tests 32B and 72B models):
+Multi-node benchmark (tests 32B, 72B, 120B, and 235B models on 2 nodes):
 ```bash
 sbatch benchmarks/scripts/submit_multinode.slurm
 ```
@@ -56,6 +57,20 @@ sbatch benchmarks/scripts/submit_multinode.slurm
 ```bash
 sbatch scripts/submit_training.slurm pi13_math500
 ```
+
+### Multi-prompt validation
+
+Evaluates each validation question with 3 prompting strategies and logs separate metrics in wandb:
+
+- `math_no_cot` — raw question, no CoT instruction
+- `math_train_cot` — training-style suffix appended to user message
+- `math_qwen_cot` — Qwen system message CoT (matches `qwen25-math-cot` from One-Shot-RLVR eval)
+
+```bash
+MULTI_PROMPT_VAL=1 sbatch scripts/submit_training.slurm pi1_math500_v2
+```
+
+The multi-prompt parquet is auto-generated on first run. Wandb metrics are logged as `val-core/{math_no_cot,math_train_cot,math_qwen_cot}/reward/...`.
 
 ## Dependencies
 
