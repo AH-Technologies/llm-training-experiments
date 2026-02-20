@@ -115,19 +115,27 @@ def parse_console_metrics(stdout: str, stderr: str) -> dict:
 
 
 def create_synthetic_dataset(num_samples: int, output_path: Path) -> Path:
-    """Create a synthetic parquet dataset for GRPO benchmarking."""
+    """Create a synthetic parquet dataset for GRPO benchmarking.
 
-    # Simple math-like prompts
-    prompts = []
+    Matches the format verl expects: prompt as chat messages (list of dicts),
+    data_source as string, reward_model as dict with ground_truth.
+    """
+    import numpy as np
+
+    samples = []
     for i in range(num_samples):
         a, b = i % 100, (i * 7) % 100
-        prompt = f"What is {a} + {b}? Think step by step and provide the answer."
-        prompts.append({
-            "prompt": prompt,
-            "answer": str(a + b),
+        answer = str(a + b)
+        samples.append({
+            "prompt": np.array(
+                [{"role": "user", "content": f"What is {a} + {b}? Think step by step and provide the answer."}],
+                dtype=object,
+            ),
+            "data_source": "synthetic_math",
+            "reward_model": {"ground_truth": answer},
         })
 
-    df = pd.DataFrame(prompts)
+    df = pd.DataFrame(samples)
     df.to_parquet(output_path)
     return output_path
 
@@ -140,9 +148,10 @@ def run_grpo_benchmark(
     num_steps: int,
     rollout_n: int = 8,  # Match production settings
     temperature: float = 0.6,
-    actor_offload: bool = False,  # CPU offload for actor params/optimizer
+    actor_offload: bool = True,  # CPU offload for actor params/optimizer
     ref_offload: bool = True,  # CPU offload for reference model (always True by default)
     num_nodes: int = 1,
+    gpu_memory_utilization: float = 0.7,  # vLLM GPU memory fraction for KV cache
 ) -> dict:
     """
     Run GRPO benchmark via verl and return metrics.
@@ -190,6 +199,10 @@ def run_grpo_benchmark(
         max_prompt_length = min(512, sequence_length // 2)
         max_response_length = sequence_length - max_prompt_length
 
+        # Scale token budget so it doesn't bottleneck large batches
+        total_gpus = num_gpus * num_nodes
+        ppo_max_token_len_per_gpu = max(16000, batch_size * sequence_length // total_gpus)
+
         cmd = [
             "python3", "-m", "verl.trainer.main_ppo",
             "algorithm.adv_estimator=grpo",
@@ -207,7 +220,7 @@ def run_grpo_benchmark(
             "actor_rollout_ref.actor.optim.lr=1e-6",
             f"actor_rollout_ref.actor.ppo_mini_batch_size={batch_size}",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",
-            "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16000",
+            f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={ppo_max_token_len_per_gpu}",
             "actor_rollout_ref.actor.use_kl_loss=True",
             "actor_rollout_ref.actor.kl_loss_coef=0.001",
             f"actor_rollout_ref.actor.fsdp_config.param_offload={str(actor_offload)}",
@@ -216,7 +229,9 @@ def run_grpo_benchmark(
             f"actor_rollout_ref.rollout.n={rollout_n}",
             f"actor_rollout_ref.rollout.temperature={temperature}",
             "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-            "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+            f"actor_rollout_ref.rollout.gpu_memory_utilization={gpu_memory_utilization}",
+            f"actor_rollout_ref.rollout.max_model_len={sequence_length}",
+            "actor_rollout_ref.rollout.enable_chunked_prefill=True",
             "actor_rollout_ref.rollout.enforce_eager=True",
             f"actor_rollout_ref.ref.fsdp_config.param_offload={str(ref_offload)}",
             "algorithm.kl_ctrl.kl_coef=0.001",
@@ -225,7 +240,7 @@ def run_grpo_benchmark(
             f"custom_reward_function.path={project_dir}/benchmarks/simple_reward.py",
             "custom_reward_function.name=compute_score",
             "trainer.critic_warmup=0",
-            'trainer.logger=["console","file"]',
+            'trainer.logger=["console"]',
             "trainer.project_name=benchmark",
             "trainer.experiment_name=grpo_benchmark",
             f"trainer.n_gpus_per_node={num_gpus}",
@@ -256,6 +271,7 @@ def run_grpo_benchmark(
                     cmd,
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=3600,  # 1 hour timeout
                     env=env,
                     cwd=project_dir,
@@ -264,9 +280,22 @@ def run_grpo_benchmark(
             total_time = time.perf_counter() - start_time
 
             if result.returncode != 0:
-                # Check for OOM
-                if "OutOfMemoryError" in result.stderr or "CUDA out of memory" in result.stderr:
-                    raise torch.cuda.OutOfMemoryError("CUDA OOM in GRPO")
+                # Check for OOM (CUDA OOM or vLLM KV cache memory errors)
+                combined_output = result.stderr + result.stdout
+                oom_patterns = [
+                    "OutOfMemoryError",
+                    "CUDA out of memory",
+                    "No available memory for the cache blocks",
+                    "KV cache is needed, which is larger than the available",
+                ]
+                if any(pat in combined_output for pat in oom_patterns):
+                    # Find the line with memory details
+                    oom_detail = ""
+                    for line in combined_output.splitlines():
+                        if "out of memory" in line.lower() or "tried to allocate" in line.lower() or "cache blocks" in line.lower():
+                            oom_detail = line.strip()
+                            break
+                    raise torch.cuda.OutOfMemoryError(f"CUDA OOM: {oom_detail or combined_output[-1000:]}")
                 raise RuntimeError(f"GRPO failed: {result.stderr[-1000:]}")
 
             # Three-tier metric extraction:

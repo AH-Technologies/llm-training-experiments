@@ -2,11 +2,11 @@
 #SBATCH --job-name=full-benchmark
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=4
 #SBATCH --cpus-per-task=72
-#SBATCH --mem=400G
+#SBATCH --mem=800G
 #SBATCH --output=benchmarks/results/full-benchmark-%j.out
 #SBATCH --error=benchmarks/results/full-benchmark-%j.err
 
@@ -24,6 +24,8 @@ source venv/bin/activate
 
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
+export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
+export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export WANDB_MODE=disabled
 export PYTHONUNBUFFERED=1
 
@@ -32,16 +34,14 @@ echo "Start time: $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 echo ""
 
-# Run full benchmark with optimal batch size search
-# Step 1: Find max batch size for each model
-# Step 2: Test batch sizes 1,2,4,8,16,... up to max to find optimal throughput
+# Run full benchmark: binary search for max batch size per model
 python -m benchmarks.benchmark_runner \
     --models 0.5B 1.5B 3B 7B 14B 32B 72B \
     --training-types sft grpo \
     --num-gpus 4 \
     --sequence-length 2048 \
-    --num-steps 20 \
-    --find-optimal \
+    --num-steps 10 \
+    --find-max-batch \
     --output-dir benchmarks/results
 
 echo ""

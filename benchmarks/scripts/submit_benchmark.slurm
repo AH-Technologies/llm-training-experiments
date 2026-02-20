@@ -33,6 +33,8 @@ source venv/bin/activate
 # Set environment variables
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
+export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
+export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 # Note: WANDB_MODE is set to "offline" inside the benchmark scripts for metric extraction
 
 # GPU info

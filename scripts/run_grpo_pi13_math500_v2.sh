@@ -18,7 +18,23 @@ unset ROCR_VISIBLE_DEVICES
 MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
 DATA_DIR=${DATA_DIR:-"./data"}
 TRAIN_FILE="${DATA_DIR}/pi13_r128.parquet"
-VAL_FILE="${DATA_DIR}/math500.parquet"
+
+# Multi-prompt validation: evaluate with 3 prompting strategies (no CoT, train CoT, Qwen CoT)
+# Set MULTI_PROMPT_VAL=1 to enable. Logs separate wandb metrics per prompt style.
+MULTI_PROMPT_VAL=${MULTI_PROMPT_VAL:-0}
+
+if [ "${MULTI_PROMPT_VAL}" = "1" ]; then
+    VAL_FILE="${DATA_DIR}/math500_multi_prompt.parquet"
+    VAL_BATCH_SIZE=1500  # 500 questions × 3 prompt styles
+    # Always regenerate to pick up script changes
+    echo "Generating multi-prompt validation file..."
+    python3 scripts/prepare_multi_prompt_val.py \
+        --input "${DATA_DIR}/math500.parquet" \
+        --output "${VAL_FILE}"
+else
+    VAL_FILE="${DATA_DIR}/math500.parquet"
+    VAL_BATCH_SIZE=500
+fi
 
 REWARD_FN_PATH="src/rlvr_grokking/rewards/deepscaler_reward.py"
 REWARD_FN_NAME="compute_score"
@@ -28,7 +44,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${VAL_FILE} \
     data.train_batch_size=128 \
-    data.val_batch_size=500 \
+    data.val_batch_size=${VAL_BATCH_SIZE} \
     data.max_prompt_length=1024 \
     data.max_response_length=3072 \
     data.filter_overlong_prompts=True \
@@ -64,7 +80,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
-    trainer.experiment_name='grpo_pi13_math500_v2_lr_increased' \
+    trainer.experiment_name='grpo_pi13_math500_v2_lr_increased_multi_val' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

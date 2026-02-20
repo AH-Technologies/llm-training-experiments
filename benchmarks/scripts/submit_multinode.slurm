@@ -6,7 +6,7 @@
 #SBATCH --nodes=2
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
-#SBATCH --mem=400G
+#SBATCH --mem=800G
 #SBATCH --output=benchmarks/results/multinode-%j.out
 #SBATCH --error=benchmarks/results/multinode-%j.err
 
@@ -24,7 +24,9 @@ source venv/bin/activate
 
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
-# Note: WANDB_MODE is set to "offline" inside the benchmark scripts
+export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
+export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
+export WANDB_MODE=disabled
 export PYTHONUNBUFFERED=1
 
 # Get master node info for distributed training
@@ -41,7 +43,7 @@ echo ""
 # Multi-node training is handled internally via srun in sft_benchmark.py.
 python -m benchmarks.benchmark_runner \
     --models 32B 72B 120B 235B \
-    --training-types sft \
+    --training-types sft grpo \
     --num-gpus 4 \
     --num-nodes 2 \
     --sequence-length 2048 \
