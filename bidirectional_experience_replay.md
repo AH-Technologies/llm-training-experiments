@@ -91,6 +91,37 @@ for step in training:
     train_step(rollouts, rewards)
 ```
 
+### 2.5 Advantage Clamping: Stabilising Phase 3 Training
+
+BER's injection creates a predictable but extreme advantage distribution within each group. In Phase 3, a group of 8 rollouts has 7 correct (reward=1) and 1 injected incorrect (reward=0):
+
+```
+mean = 7/8 = 0.875,  std ≈ 0.331
+
+advantage_correct  = (1.0 - 0.875) / 0.331 = +0.378   (×7 rollouts)
+advantage_injected = (0.0 - 0.875) / 0.331 = -2.645   (×1 rollout)
+```
+
+The injected negative gets a **-2.645 advantage** — 7× stronger per-rollout than each positive signal. While this is the intended learning signal (push away from incorrect reasoning), the magnitude can cause periodic policy instability: the model collapses to ~20% accuracy for a few steps, then recovers via Phase 1 positive injection, then re-saturates and collapses again.
+
+**Advantage clamping** addresses this by bounding the advantage tensor before the PPO policy loss is computed. This is implemented as an override of `_update_actor()` in `BERRayPPOTrainer`, which clamps `batch.batch["advantages"]` to `[adv_clamp_min, adv_clamp_max]` (default `[-2.0, 2.0]`) before calling the parent actor update.
+
+With default bounds of [-2.0, 2.0]:
+- The injected negative advantage is clamped from -2.645 → -2.0 (a 24% reduction)
+- All positive advantages (+0.378) are unaffected
+- Normal Phase 2 groups (mixed correct/incorrect) are also mostly unaffected, since their advantages are typically within [-2, 2]
+
+The clamping is **global** (applied to all advantages, not just BER-injected indices), which is both simpler to implement and more principled — any extreme advantage can cause instability, regardless of source.
+
+**Configuration:**
+```bash
++ber.adv_clamp_enabled=True    # Enable/disable (default: False)
++ber.adv_clamp_min=-2.0        # Lower bound (default: -2.0)
++ber.adv_clamp_max=2.0         # Upper bound (default: 2.0)
+```
+
+**Logged metrics:** `ber/adv_clamped_low`, `ber/adv_clamped_high`, `ber/adv_min_pre_clamp`, `ber/adv_max_pre_clamp`.
+
 ---
 
 ## 3. Power-Sampled Seeding for Difficult Problems

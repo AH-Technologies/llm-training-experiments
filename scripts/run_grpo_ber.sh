@@ -27,6 +27,11 @@ BER_INJECTION_FRACTION=${BER_INJECTION_FRACTION:-0.1}
 # Tighter PPO clip ratio to prevent large policy steps with BER injection
 PPO_CLIP_RATIO=${PPO_CLIP_RATIO:-0.1}
 
+# Advantage clamping (mitigates policy collapse from extreme BER advantages)
+BER_ADV_CLAMP_ENABLED=${BER_ADV_CLAMP_ENABLED:-False}
+BER_ADV_CLAMP_MIN=${BER_ADV_CLAMP_MIN:--1.0}
+BER_ADV_CLAMP_MAX=${BER_ADV_CLAMP_MAX:-1.0}
+
 # Multi-prompt validation
 MULTI_PROMPT_VAL=${MULTI_PROMPT_VAL:-0}
 
@@ -103,4 +108,7 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     +ber.max_error_cache_age=${BER_MAX_ERROR_CACHE_AGE} \
     +ber.buffer_size=${BER_BUFFER_SIZE} \
     +ber.injection_fraction=${BER_INJECTION_FRACTION} \
+    +ber.adv_clamp_enabled=${BER_ADV_CLAMP_ENABLED} \
+    +ber.adv_clamp_min=${BER_ADV_CLAMP_MIN} \
+    +ber.adv_clamp_max=${BER_ADV_CLAMP_MAX} \
     "$@"
