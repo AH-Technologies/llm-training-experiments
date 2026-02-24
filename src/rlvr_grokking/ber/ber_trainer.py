@@ -25,6 +25,11 @@ class BERConfig:
     enabled: bool = False
     correct_cache_path: Optional[str] = None
     max_error_cache_age: int = 500
+    # Advantage clamping: limits extreme advantages from BER-injected samples
+    # to prevent policy collapse from outsized negative gradients.
+    adv_clamp_enabled: bool = False
+    adv_clamp_min: float = -2.0
+    adv_clamp_max: float = 2.0
 
 
 class BERRayPPOTrainer(RayPPOTrainer):
@@ -86,6 +91,46 @@ class BERRayPPOTrainer(RayPPOTrainer):
         self._log_ber_metrics(ber_metrics)
 
         return reward_tensor, reward_extra_infos_dict
+
+    def _update_actor(self, batch):
+        """Override to clamp advantages before the actor update.
+
+        BER injection creates outlier advantages (e.g. -2.645 for a single
+        injected negative in an otherwise all-correct group). Clamping prevents
+        these from causing destabilising gradient steps.
+        """
+        if self.ber_config.enabled and self.ber_config.adv_clamp_enabled:
+            adv = batch.batch["advantages"]
+            clamped = torch.clamp(adv, min=self.ber_config.adv_clamp_min, max=self.ber_config.adv_clamp_max)
+
+            n_clamped_low = (adv < self.ber_config.adv_clamp_min).sum().item()
+            n_clamped_high = (adv > self.ber_config.adv_clamp_max).sum().item()
+
+            if n_clamped_low > 0 or n_clamped_high > 0:
+                print(
+                    f"[BER step {self.global_steps}] Advantage clamping: "
+                    f"{n_clamped_low} below {self.ber_config.adv_clamp_min}, "
+                    f"{n_clamped_high} above {self.ber_config.adv_clamp_max}. "
+                    f"Original range: [{adv.min().item():.3f}, {adv.max().item():.3f}]"
+                )
+
+            batch.batch["advantages"] = clamped
+
+            # Log clamping metrics
+            clamp_metrics = {
+                "ber/adv_clamped_low": n_clamped_low,
+                "ber/adv_clamped_high": n_clamped_high,
+                "ber/adv_min_pre_clamp": adv.min().item(),
+                "ber/adv_max_pre_clamp": adv.max().item(),
+            }
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log(clamp_metrics, step=self.global_steps)
+            except ImportError:
+                pass
+
+        return super()._update_actor(batch)
 
     def _log_ber_metrics(self, ber_metrics: dict):
         """Log BER metrics to console and wandb."""
@@ -178,10 +223,15 @@ class BERTaskRunner(TaskRunner):
             enabled=ber_cfg_raw.get("enabled", False),
             correct_cache_path=ber_cfg_raw.get("correct_cache_path", None),
             max_error_cache_age=ber_cfg_raw.get("max_error_cache_age", 500),
+            adv_clamp_enabled=ber_cfg_raw.get("adv_clamp_enabled", False),
+            adv_clamp_min=float(ber_cfg_raw.get("adv_clamp_min", -2.0)),
+            adv_clamp_max=float(ber_cfg_raw.get("adv_clamp_max", 2.0)),
         )
         print(f"[BER] Config: enabled={ber_config.enabled}, "
               f"correct_cache={ber_config.correct_cache_path}, "
-              f"max_error_cache_age={ber_config.max_error_cache_age}")
+              f"max_error_cache_age={ber_config.max_error_cache_age}, "
+              f"adv_clamp={ber_config.adv_clamp_enabled} "
+              f"[{ber_config.adv_clamp_min}, {ber_config.adv_clamp_max}]")
 
         # Use BER-enhanced trainer instead of standard RayPPOTrainer
         trainer = BERRayPPOTrainer(

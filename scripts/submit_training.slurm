@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=rlvr-grokking
 #SBATCH --account=nn12068k
-#SBATCH --time=48:00:00
+#SBATCH --time=30:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -51,7 +51,8 @@ PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 source $PROJECT_DIR/venv/bin/activate
 
 # Environment variables
-export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
+# Use a per-job cache dir so concurrent jobs don't conflict
+export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface_${SLURM_JOB_ID}
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export HF_TOKEN=${HF_TOKEN:-""}  # Set your HuggingFace token here or in your environment
@@ -205,5 +206,11 @@ echo "Using script: $TRAIN_SCRIPT"
 
 chmod +x $TRAIN_SCRIPT
 bash $TRAIN_SCRIPT "${@:2}"
+
+# Clean up the per-job cache directory
+if [ -d "$HF_HOME" ]; then
+    echo "Cleaning up job cache at $HF_HOME"
+    rm -rf "$HF_HOME"
+fi
 
 echo "Training complete!"

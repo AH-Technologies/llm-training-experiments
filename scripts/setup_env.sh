@@ -97,7 +97,8 @@ pip install -e . --no-deps
 # Create directories
 mkdir -p logs checkpoints data
 
-# Set HuggingFace cache
+# Set HuggingFace cache (shared location for interactive setup only;
+# job scripts use per-job caches via huggingface_$SLURM_JOB_ID)
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 mkdir -p $HF_HOME
 

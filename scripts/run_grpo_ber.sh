@@ -22,6 +22,10 @@ TRAIN_FILE="${DATA_DIR}/pi13_r128.parquet"
 # BER config
 BER_CORRECT_CACHE=${BER_CORRECT_CACHE:-"${DATA_DIR}/ber_correct_cache_pi13.pt"}
 BER_MAX_ERROR_CACHE_AGE=${BER_MAX_ERROR_CACHE_AGE:-500}
+# Advantage clamping (mitigates policy collapse from extreme BER advantages)
+BER_ADV_CLAMP_ENABLED=${BER_ADV_CLAMP_ENABLED:-False}
+BER_ADV_CLAMP_MIN=${BER_ADV_CLAMP_MIN:--1.0}
+BER_ADV_CLAMP_MAX=${BER_ADV_CLAMP_MAX:-1.0}
 
 # Multi-prompt validation
 MULTI_PROMPT_VAL=${MULTI_PROMPT_VAL:-0}
@@ -94,4 +98,7 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     +ber.enabled=True \
     +ber.correct_cache_path=${BER_CORRECT_CACHE} \
     +ber.max_error_cache_age=${BER_MAX_ERROR_CACHE_AGE} \
+    +ber.adv_clamp_enabled=${BER_ADV_CLAMP_ENABLED} \
+    +ber.adv_clamp_min=${BER_ADV_CLAMP_MIN} \
+    +ber.adv_clamp_max=${BER_ADV_CLAMP_MAX} \
     "$@"
