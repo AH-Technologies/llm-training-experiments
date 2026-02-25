@@ -1,13 +1,17 @@
 #!/bin/bash
 #
-# check_gpus.sh - Check GPU availability on SLURM cluster
+# check_gpus.sh - Check GPU availability on Olivia HPC (NRIS)
 #
 # Usage:
 #   ./check_gpus.sh              # Show all GPU nodes
-#   ./check_gpus.sh h100         # Show only H100 nodes
+#   ./check_gpus.sh h200         # Show only H200 nodes
 #   ./check_gpus.sh --free       # Show only nodes with free GPUs
 #   ./check_gpus.sh -w           # Watch mode (updates every 5s)
 #
+
+# Olivia HPC configuration
+PARTITION="accel"
+ACCOUNT="nn12068k"
 
 # Colors for better readability
 RED='\033[0;31m'
@@ -18,8 +22,8 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-# GPU memory is now extracted dynamically from SLURM features (gpu16g, gpu32g, gpu40g, gpu80g, etc.)
-# No static mapping needed anymore!
+# GH200 has 120GB GPU memory (96GB HBM3 + unified memory)
+DEFAULT_GPU_MEM=120
 
 # Parse arguments
 FILTER_TYPE=""
@@ -44,13 +48,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --free          Show only nodes with free GPUs"
             echo "  -h, --help      Show this help message"
             echo ""
-            echo "GPU_TYPE: Filter by GPU type (h100, h200, a100, v100, p100)"
+            echo "GPU_TYPE: Filter by GPU type (h200, gh200)"
             echo ""
             echo "Examples:"
             echo "  $0              # Show all GPU nodes"
-            echo "  $0 h100         # Show only H100 nodes"
+            echo "  $0 h200         # Show only H200 nodes"
             echo "  $0 --free       # Show only nodes with free GPUs"
-            echo "  $0 -w h100      # Watch H100 nodes"
+            echo "  $0 -w           # Watch mode"
             exit 0
             ;;
         *)
@@ -61,18 +65,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 show_gpu_status() {
-    clear 2>/dev/null || true
-    
-    echo -e "${BOLD}${CYAN}=== GPU NODE STATUS ===${NC}"
-    echo -e "${BOLD}Partition: GPUQ | Account: share-ie-idi | User: $USER${NC}"
+    # Only clear in watch mode
+    if [[ "$WATCH_MODE" == true ]]; then
+        clear 2>/dev/null || true
+    fi
+
+    echo -e "${BOLD}${CYAN}=== OLIVIA HPC - GPU NODE STATUS ===${NC}"
+    echo -e "${BOLD}Partition: ${PARTITION} | Account: ${ACCOUNT} | User: $USER${NC}"
     echo ""
-    
+
     printf "${BOLD}%-15s | %-8s | %5s | %-18s | %8s | %9s | %8s | %-12s | %s${NC}\n" \
            "Node" "GPU" "Total" "Status Breakdown" "GPU Mem" "CPUs Free" "Mem Free" "State" "Users"
     echo "----------------|----------|-------|--------------------| ---------|-----------|----------|--------------|----------------"
-    
+
     # Get list of GPU nodes
-    nodes=$(sinfo -p GPUQ -N -h -o "%N" | sort -u)
+    nodes=$(sinfo -p ${PARTITION} -N -h -o "%N" | sort -u)
     
     total_gpus=0
     total_used=0
@@ -132,9 +139,11 @@ show_gpu_status() {
             gpu_mem_per_unit="${BASH_REMATCH[1]}"
         fi
 
-        # Format GPU memory string
+        # Format GPU memory string (default to GH200's 120GB if not found)
         if [[ $gpu_mem_per_unit -gt 0 ]]; then
             gpu_mem_str="${gpu_mem_per_unit}G"
+        elif [[ "$gpu_type" == "h200" ]] || [[ "$gpu_type" == "gh200" ]]; then
+            gpu_mem_str="${DEFAULT_GPU_MEM}G"
         else
             gpu_mem_str="N/A"
         fi
@@ -214,15 +223,10 @@ show_gpu_status() {
             status_breakdown="-"
         fi
         
-        # Get users running on this node (only visible if PrivateData != jobs)
-        users=$(squeue -a -h -w "$node" -o "%u" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+        # Get users running on this node
+        users=$(squeue -h -w "$node" -o "%u" | sort -u | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
         if [[ -z "$users" ]]; then
-            # PrivateData=jobs hides other users; show allocation count instead
-            if [[ $gpu_used -gt 0 ]]; then
-                users="(${gpu_used} alloc)"
-            else
-                users="-"
-            fi
+            users="-"
         fi
         
         # Color coding based on availability (use idle, not free, for accurate coloring)

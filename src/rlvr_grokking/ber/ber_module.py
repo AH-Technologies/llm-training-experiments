@@ -5,23 +5,27 @@ homogeneous rollout groups:
 - Phase 1 (all-incorrect): inject a cached correct response → positive signal
 - Phase 2 (mixed): normal GRPO + cache the latest incorrect rollout
 - Phase 3 (all-correct): inject a cached incorrect response → negative signal
+
+v2: Ring buffer for error cache + injection fraction to control signal strength.
 """
 
+import random
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
 @dataclass
 class BERCache:
-    """Holds cached correct and incorrect responses for BER injection."""
+    """Holds cached correct response and a ring buffer of incorrect responses."""
     correct_cache: Optional[dict] = None  # {"response_tokens": 1D tensor, "reward": 1.0}
-    error_cache: Optional[dict] = None    # {"response_tokens": 1D tensor, "reward": 0.0, "step_cached": int}
+    error_buffer: list = field(default_factory=list)  # FIFO ring buffer of error dicts
+    buffer_size: int = 32
 
     @classmethod
-    def from_disk(cls, correct_cache_path: Optional[str] = None) -> "BERCache":
-        """Load pre-generated correct cache from disk. Error cache starts empty."""
-        cache = cls()
+    def from_disk(cls, correct_cache_path: Optional[str] = None, buffer_size: int = 32) -> "BERCache":
+        """Load pre-generated correct cache from disk. Error buffer starts empty."""
+        cache = cls(buffer_size=buffer_size)
         if correct_cache_path is not None:
             data = torch.load(correct_cache_path, map_location="cpu", weights_only=True)
             cache.correct_cache = {
@@ -30,16 +34,36 @@ class BERCache:
             }
         return cache
 
+    def add_error(self, error_dict: dict):
+        """Add error to ring buffer, evicting oldest if full."""
+        self.error_buffer.append(error_dict)
+        if len(self.error_buffer) > self.buffer_size:
+            self.error_buffer.pop(0)
+
+    def evict_stale(self, global_step: int, max_age: int):
+        """Remove entries older than max_age steps."""
+        self.error_buffer = [
+            e for e in self.error_buffer
+            if (global_step - e["step_cached"]) <= max_age
+        ]
+
+    def sample_error(self) -> Optional[dict]:
+        """Sample a random error from the buffer."""
+        if not self.error_buffer:
+            return None
+        return random.choice(self.error_buffer)
+
 
 def classify_and_inject(
     batch,
     reward_tensor: torch.Tensor,
     n_rollouts: int,
-    correct_cache: Optional[dict],
-    error_cache: Optional[dict],
+    ber_cache: "BERCache",
     global_step: int,
     pad_token_id: int,
     max_error_cache_age: int = 500,
+    injection_fraction: float = 0.1,
+    stop_grad_injected: bool = False,
 ) -> tuple:
     """Classify rollout groups and inject cached responses.
 
@@ -49,15 +73,17 @@ def classify_and_inject(
         reward_tensor: [B*n, response_len] token-level reward scores.
                        Score is placed at last valid token position.
         n_rollouts: Number of rollouts per prompt group (n=8 typically).
-        correct_cache: Dict with "response_tokens" (1D) and "reward" (float), or None.
-        error_cache: Dict with "response_tokens" (1D), "reward" (0.0),
-                     "step_cached" (int), or None.
+        ber_cache: BERCache with correct_cache and error_buffer.
         global_step: Current training step.
         pad_token_id: Tokenizer pad token ID.
-        max_error_cache_age: Max steps before error cache is too stale.
+        max_error_cache_age: Max steps before error cache entries are evicted.
+        injection_fraction: Fraction of Phase 3 groups to inject into (0.0-1.0).
+        stop_grad_injected: If True, zero response_mask for injected slots so
+                            they affect advantage computation but produce no
+                            gradient (Strategy 5 / AR3PO Option II).
 
     Returns:
-        (batch, reward_tensor, error_cache, metrics_dict)
+        (batch, reward_tensor, metrics_dict)
     """
     # Per-rollout scores: sum token-level rewards to get scalar per rollout
     scores = reward_tensor.sum(dim=-1)  # [B*n]
@@ -65,9 +91,16 @@ def classify_and_inject(
     n_groups = total_rollouts // n_rollouts
     scores_grouped = scores.view(n_groups, n_rollouts)  # [B, n]
 
-    # Check if error cache is too stale
-    if error_cache is not None and (global_step - error_cache["step_cached"]) > max_error_cache_age:
-        error_cache = None
+    # Evict stale entries from the error buffer
+    ber_cache.evict_stale(global_step, max_error_cache_age)
+
+    # Compute buffer age stats
+    if ber_cache.error_buffer:
+        oldest_age = global_step - ber_cache.error_buffer[0]["step_cached"]
+        newest_age = global_step - ber_cache.error_buffer[-1]["step_cached"]
+    else:
+        oldest_age = 0
+        newest_age = 0
 
     metrics = {
         "ber/phase1_groups": 0,
@@ -75,11 +108,13 @@ def classify_and_inject(
         "ber/phase3_groups": 0,
         "ber/injected_positive": 0,
         "ber/injected_negative": 0,
-        "ber/error_cache_age": 0 if error_cache is None else (global_step - error_cache["step_cached"]),
-        "ber/error_cache_available": 1.0 if error_cache is not None else 0.0,
+        "ber/buffer_fill": len(ber_cache.error_buffer),
+        "ber/buffer_oldest_age": oldest_age,
+        "ber/buffer_newest_age": newest_age,
     }
 
     response_len = batch.batch["responses"].shape[1]
+    injected_indices = []  # Track which slots were injected (for stop_grad)
 
     for i in range(n_groups):
         n_correct = (scores_grouped[i] > 0.5).sum().item()
@@ -87,35 +122,46 @@ def classify_and_inject(
         if n_correct == 0:
             # Phase 1: all-incorrect group
             metrics["ber/phase1_groups"] += 1
-            if correct_cache is not None:
+            if ber_cache.correct_cache is not None:
                 replace_idx = i * n_rollouts + (n_rollouts - 1)
-                _replace_response(batch, replace_idx, correct_cache, pad_token_id, response_len)
+                _replace_response(batch, replace_idx, ber_cache.correct_cache, pad_token_id, response_len)
                 _set_reward(reward_tensor, replace_idx, 1.0, batch, response_len)
                 metrics["ber/injected_positive"] += 1
+                injected_indices.append(replace_idx)
 
         elif n_correct == n_rollouts:
-            # Phase 3: all-correct group
+            # Phase 3: all-correct group — inject with probability injection_fraction
             metrics["ber/phase3_groups"] += 1
-            if error_cache is not None:
+            if ber_cache.error_buffer and random.random() < injection_fraction:
+                error = ber_cache.sample_error()
                 replace_idx = i * n_rollouts + (n_rollouts - 1)
-                _replace_response(batch, replace_idx, error_cache, pad_token_id, response_len)
+                _replace_response(batch, replace_idx, error, pad_token_id, response_len)
                 _set_reward(reward_tensor, replace_idx, 0.0, batch, response_len)
                 metrics["ber/injected_negative"] += 1
+                injected_indices.append(replace_idx)
 
         else:
-            # Phase 2: mixed group — cache last wrong rollout
+            # Phase 2: mixed group — add last wrong rollout to buffer
             metrics["ber/phase2_groups"] += 1
             wrong_mask = scores_grouped[i] <= 0.5
             wrong_indices = wrong_mask.nonzero(as_tuple=True)[0]
             if len(wrong_indices) > 0:
                 cache_local_idx = wrong_indices[-1].item()
                 cache_global_idx = i * n_rollouts + cache_local_idx
-                error_cache = _extract_response(batch, cache_global_idx, global_step)
+                ber_cache.add_error(_extract_response(batch, cache_global_idx, global_step))
 
     # Recompute response_mask after modifications
     batch.batch["response_mask"] = _compute_response_mask(batch)
 
-    return batch, reward_tensor, error_cache, metrics
+    # Strategy 5: zero response_mask for injected slots so their reward
+    # affects advantage computation but no gradient flows through them.
+    # The on-policy samples get gradient with advantages shaped by the
+    # injected reward, but the injected response itself is not learned from.
+    if stop_grad_injected and injected_indices:
+        for idx in injected_indices:
+            batch.batch["response_mask"][idx] = 0
+
+    return batch, reward_tensor, metrics
 
 
 def _replace_response(batch, idx: int, cache: dict, pad_token_id: int, response_len: int):

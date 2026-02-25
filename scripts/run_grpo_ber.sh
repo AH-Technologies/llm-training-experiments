@@ -13,7 +13,6 @@
 #       --output data/ber_correct_cache_pi13.pt
 set -x
 
-unset ROCR_VISIBLE_DEVICES
 
 MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
 DATA_DIR=${DATA_DIR:-"./data"}
@@ -22,6 +21,11 @@ TRAIN_FILE="${DATA_DIR}/pi13_r128.parquet"
 # BER config
 BER_CORRECT_CACHE=${BER_CORRECT_CACHE:-"${DATA_DIR}/ber_correct_cache_pi13.pt"}
 BER_MAX_ERROR_CACHE_AGE=${BER_MAX_ERROR_CACHE_AGE:-500}
+BER_BUFFER_SIZE=${BER_BUFFER_SIZE:-32}
+BER_INJECTION_FRACTION=${BER_INJECTION_FRACTION:-0.1}
+
+# Tighter PPO clip ratio to prevent large policy steps with BER injection
+PPO_CLIP_RATIO=${PPO_CLIP_RATIO:-0.1}
 
 # Multi-prompt validation
 MULTI_PROMPT_VAL=${MULTI_PROMPT_VAL:-0}
@@ -56,6 +60,9 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=4e-6 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
+    actor_rollout_ref.actor.clip_ratio=${PPO_CLIP_RATIO} \
+    actor_rollout_ref.actor.clip_ratio_low=${PPO_CLIP_RATIO} \
+    actor_rollout_ref.actor.clip_ratio_high=${PPO_CLIP_RATIO} \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000 \
@@ -94,4 +101,6 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     +ber.enabled=True \
     +ber.correct_cache_path=${BER_CORRECT_CACHE} \
     +ber.max_error_cache_age=${BER_MAX_ERROR_CACHE_AGE} \
+    +ber.buffer_size=${BER_BUFFER_SIZE} \
+    +ber.injection_fraction=${BER_INJECTION_FRACTION} \
     "$@"

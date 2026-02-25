@@ -25,6 +25,9 @@ class BERConfig:
     enabled: bool = False
     correct_cache_path: Optional[str] = None
     max_error_cache_age: int = 500
+    buffer_size: int = 32
+    injection_fraction: float = 0.1
+    stop_grad_injected: bool = False
 
 
 class BERRayPPOTrainer(RayPPOTrainer):
@@ -47,8 +50,13 @@ class BERRayPPOTrainer(RayPPOTrainer):
                     "BER is incompatible with launch_reward_fn_async=True. "
                     "BER hooks into _compute_or_extract_reward which is bypassed in async mode."
                 )
-            self.ber_cache = BERCache.from_disk(self.ber_config.correct_cache_path)
-            print(f"[BER] Initialized. Correct cache: {'loaded' if self.ber_cache.correct_cache else 'None'}")
+            self.ber_cache = BERCache.from_disk(
+                self.ber_config.correct_cache_path,
+                buffer_size=self.ber_config.buffer_size,
+            )
+            print(f"[BER] Initialized. Correct cache: {'loaded' if self.ber_cache.correct_cache else 'None'}, "
+                  f"buffer_size={self.ber_config.buffer_size}, "
+                  f"injection_fraction={self.ber_config.injection_fraction}")
         else:
             self.ber_cache = BERCache()
 
@@ -71,15 +79,16 @@ class BERRayPPOTrainer(RayPPOTrainer):
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id
 
-        batch, reward_tensor, self.ber_cache.error_cache, ber_metrics = classify_and_inject(
+        batch, reward_tensor, ber_metrics = classify_and_inject(
             batch=batch,
             reward_tensor=reward_tensor,
             n_rollouts=self.config.actor_rollout_ref.rollout.n,
-            correct_cache=self.ber_cache.correct_cache,
-            error_cache=self.ber_cache.error_cache,
+            ber_cache=self.ber_cache,
             global_step=self.global_steps,
             pad_token_id=pad_token_id,
             max_error_cache_age=self.ber_config.max_error_cache_age,
+            injection_fraction=self.ber_config.injection_fraction,
+            stop_grad_injected=self.ber_config.stop_grad_injected,
         )
 
         # Log BER metrics
@@ -178,10 +187,16 @@ class BERTaskRunner(TaskRunner):
             enabled=ber_cfg_raw.get("enabled", False),
             correct_cache_path=ber_cfg_raw.get("correct_cache_path", None),
             max_error_cache_age=ber_cfg_raw.get("max_error_cache_age", 500),
+            buffer_size=ber_cfg_raw.get("buffer_size", 32),
+            injection_fraction=ber_cfg_raw.get("injection_fraction", 0.1),
+            stop_grad_injected=ber_cfg_raw.get("stop_grad_injected", False),
         )
         print(f"[BER] Config: enabled={ber_config.enabled}, "
               f"correct_cache={ber_config.correct_cache_path}, "
-              f"max_error_cache_age={ber_config.max_error_cache_age}")
+              f"max_error_cache_age={ber_config.max_error_cache_age}, "
+              f"buffer_size={ber_config.buffer_size}, "
+              f"injection_fraction={ber_config.injection_fraction}, "
+              f"stop_grad_injected={ber_config.stop_grad_injected}")
 
         # Use BER-enhanced trainer instead of standard RayPPOTrainer
         trainer = BERRayPPOTrainer(

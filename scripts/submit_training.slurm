@@ -1,33 +1,30 @@
 #!/bin/bash
 #SBATCH --job-name=rlvr-grokking
-#SBATCH --account=nn12068k
-#SBATCH --time=48:00:00
+#SBATCH --account=share-ie-idi
+#SBATCH --time=46:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=h100:4
 #SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=8G
-#SBATCH --partition=accel
+#SBATCH --mem-per-cpu=16G
+#SBATCH --partition=GPUQ
 #SBATCH --output=logs/slurm-%j.out
 #SBATCH --error=logs/slurm-%j.err
 
-# RLVR GRPO Training on NRIS HPC (GH200 ARM)
+# RLVR GRPO Training on IDUN HPC (H100)
 #
 # Usage:
 #   sbatch scripts/submit_training.slurm pi13_math500
-#   sbatch scripts/submit_training.slurm pi13_math500_medium_wd
-#   sbatch scripts/submit_training.slurm pi13_math500_high_wd
-#   sbatch scripts/submit_training.slurm pi13_math500_pos_ent
-#   sbatch scripts/submit_training.slurm pi13_math500_high_ent
 #   sbatch scripts/submit_training.slurm pi13_math500_v2
 #   sbatch scripts/submit_training.slurm ber
 #   sbatch scripts/submit_training.slurm ber MULTI_PROMPT_VAL=1
 #   sbatch scripts/submit_training.slurm astar_sft
+#   sbatch --gpus-per-node=h100:8 scripts/submit_training.slurm pi13_math500
 
 set -e
 
 # Task type passed as argument
-TASK=${1:-pi13_math500}
+TASK=${1:-ber}
 
 echo "=========================================="
 echo "RLVR Grokking Training with verl"
@@ -43,18 +40,26 @@ echo "=========================================="
 mkdir -p logs checkpoints data
 
 # Load modules - Python only (our venv has PyTorch/vLLM)
-module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Activate virtual environment
-PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
+PROJECT_DIR=/cluster/home/haaklau/code/llm-training-experiments
 source $PROJECT_DIR/venv/bin/activate
 
+# Load .env file (contains WANDB_API_KEY, etc.)
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
 # Environment variables
-export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
+# Reuse shared HuggingFace cache (models already downloaded)
+export HF_HOME=/cluster/projects/itea_lille-idi-epic-studenter/ah-technologies/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
-export HF_DATASETS_CACHE=$HF_HOME/datasets
-export HF_TOKEN=${HF_TOKEN:-""}  # Set your HuggingFace token here or in your environment
+export HF_DATASETS_CACHE=$PROJECT_DIR/.cache/datasets_$(whoami)
+mkdir -p $HF_DATASETS_CACHE
+export HF_TOKEN=${HF_TOKEN:-""}
 export TOKENIZERS_PARALLELISM=false
 
 # NCCL settings for multi-GPU
@@ -62,14 +67,11 @@ export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=0
 
 # vLLM settings
+# Enable V1 engine (required by verl 0.7.0 with vLLM 0.12.0)
 export VLLM_USE_V1=1
 
 # Tiktoken encoding files for offline use (openai_harmony/vLLM needs these)
-export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
-
-# Fix for NRIS HPC: Slurm sets both CUDA and ROCm env vars, verl errors on this
-unset ROCR_VISIBLE_DEVICES
 
 # Verify environment
 echo ""
