@@ -43,6 +43,10 @@ mkdir -p logs checkpoints data
 module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 
+# Unset AMD ROCm variable set by NRIS/GPU — verl crashes if both
+# ROCR_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are set
+unset ROCR_VISIBLE_DEVICES
+
 # Activate virtual environment
 PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 source $PROJECT_DIR/venv/bin/activate
