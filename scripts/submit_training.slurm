@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=rlvr-grokking
 #SBATCH --account=share-ie-idi
-#SBATCH --time=46:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=h100:4
@@ -210,6 +210,16 @@ elif [ "$TASK" == "ber_amplify" ]; then
     fi
 
     TRAIN_SCRIPT="scripts/run_grpo_ber_amplify.sh"
+elif [ "$TASK" == "spt" ]; then
+    # Pi13 -> Math500 with Self-Play Teaching (SPT)
+    echo "Regenerating π13 dataset with 128 duplicates..."
+    python scripts/prepare_pi13_data.py --output-dir ./data --copies 128
+    if [ ! -f "data/math500.parquet" ]; then
+        echo "ERROR: Math500 data file must be present in ./data/"
+        exit 1
+    fi
+
+    TRAIN_SCRIPT="scripts/run_grpo_spt.sh"
 elif [ "$TASK" == "astar_sft" ]; then
     # A* search grokking: SFT on search traces
     ASTAR_DATA_DIR="data/astar_grokking_dataset"
@@ -222,7 +232,7 @@ elif [ "$TASK" == "astar_sft" ]; then
     TRAIN_SCRIPT="scripts/run_sft_astar.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, ber_amplify, astar_sft"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, ber_amplify, spt, astar_sft"
     exit 1
 fi
 
