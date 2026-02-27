@@ -65,6 +65,10 @@ def main():
             max_grad_norm=1.0,
             warmup_ratio=0.0,
             seed=42,
+            model_init_kwargs={
+                "torch_dtype": "bfloat16",
+                "trust_remote_code": True,
+            },
         )
     else:
         # FSDP1 path (0.5B-14B models)
@@ -112,16 +116,23 @@ def main():
     dataset = datasets.load_dataset("parquet", data_files=args.train_file, split="train")
     dataset = dataset.rename_column("response", "completion")
 
-    # Load model — always bf16, DeepSpeed/FSDP handle sharding automatically
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
+    # Load model
+    if args.deepspeed:
+        # DeepSpeed ZeRO-3: pass model name string so HF Trainer loads inside
+        # deepspeed.zero.Init() context — parameters stay on meta device and are
+        # never fully materialized on a single GPU.
+        model_or_name = args.model
+    else:
+        # FSDP path: load model normally, FSDP handles sharding after
+        model_or_name = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
 
     # Create trainer
     trainer = SFTTrainer(
-        model=model,
+        model=model_or_name,
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
