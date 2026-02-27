@@ -1,10 +1,9 @@
 #!/bin/bash
-# GRPO training with Bidirectional Experience Replay (BER)
+# GRPO training with BER "amplify" mode (within-step error amplification)
 #
-# Based on run_grpo_pi13_math500_v2.sh with BER injection:
-# - Phase 1 (all-incorrect): inject cached correct response
-# - Phase 2 (mixed): normal GRPO + cache incorrect rollout
-# - Phase 3 (all-correct): inject cached incorrect response
+# Instead of replaying errors from previous steps, this variant finds
+# wrong samples in the current batch and injects them into more
+# all-correct groups (~10% by default). No cross-step error buffer.
 #
 # Prerequisites:
 #   python scripts/generate_correct_cache.py \
@@ -20,8 +19,6 @@ TRAIN_FILE="${DATA_DIR}/pi13_r128.parquet"
 
 # BER config
 BER_CORRECT_CACHE=${BER_CORRECT_CACHE:-"${DATA_DIR}/ber_correct_cache_pi13.pt"}
-BER_MAX_ERROR_CACHE_AGE=${BER_MAX_ERROR_CACHE_AGE:-500}
-BER_BUFFER_SIZE=${BER_BUFFER_SIZE:-32}
 BER_INJECTION_FRACTION=${BER_INJECTION_FRACTION:-0.1}
 
 # Tighter PPO clip ratio to prevent large policy steps with BER injection
@@ -89,7 +86,7 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
-    trainer.experiment_name='grpo_pi13_ber' \
+    trainer.experiment_name='grpo_pi13_ber_amplify' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
@@ -99,9 +96,8 @@ python3 -m src.rlvr_grokking.ber.main_ber \
     trainer.total_epochs=2000 \
     trainer.total_training_steps=2000 \
     +ber.enabled=True \
+    +ber.mode=amplify \
     +ber.correct_cache_path=${BER_CORRECT_CACHE} \
-    +ber.max_error_cache_age=${BER_MAX_ERROR_CACHE_AGE} \
-    +ber.buffer_size=${BER_BUFFER_SIZE} \
     +ber.injection_fraction=${BER_INJECTION_FRACTION} \
     +ber.recompute_log_probs_injected=False \
     "$@"

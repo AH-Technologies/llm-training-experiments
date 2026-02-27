@@ -17,6 +17,7 @@
 #   sbatch scripts/submit_training.slurm pi13_math500
 #   sbatch scripts/submit_training.slurm pi13_math500_v2
 #   sbatch scripts/submit_training.slurm ber
+#   sbatch scripts/submit_training.slurm ber_amplify
 #   sbatch scripts/submit_training.slurm ber MULTI_PROMPT_VAL=1
 #   sbatch scripts/submit_training.slurm astar_sft
 #   sbatch --gpus-per-node=h100:8 scripts/submit_training.slurm pi13_math500
@@ -185,6 +186,30 @@ elif [ "$TASK" == "ber" ]; then
     fi
 
     TRAIN_SCRIPT="scripts/run_grpo_ber.sh"
+elif [ "$TASK" == "ber_amplify" ]; then
+    # Pi13 -> Math500 with BER "amplify" mode (within-step error amplification)
+    echo "Regenerating π13 dataset with 128 duplicates..."
+    python scripts/prepare_pi13_data.py --output-dir ./data --copies 128
+    if [ ! -f "data/math500.parquet" ]; then
+        echo "ERROR: Math500 data file must be present in ./data/"
+        exit 1
+    fi
+
+    # Generate correct cache if it doesn't exist
+    BER_CACHE="data/ber_correct_cache_pi13.pt"
+    if [ ! -f "$BER_CACHE" ]; then
+        echo "Generating BER correct cache via rejection sampling..."
+        python scripts/generate_correct_cache.py \
+            --model Qwen/Qwen2.5-Math-1.5B \
+            --train_file data/pi13_r128.parquet \
+            --output "$BER_CACHE" \
+            --max_attempts 64 \
+            --temperature 0.6
+    else
+        echo "BER correct cache already exists: $BER_CACHE"
+    fi
+
+    TRAIN_SCRIPT="scripts/run_grpo_ber_amplify.sh"
 elif [ "$TASK" == "astar_sft" ]; then
     # A* search grokking: SFT on search traces
     ASTAR_DATA_DIR="data/astar_grokking_dataset"
@@ -197,7 +222,7 @@ elif [ "$TASK" == "astar_sft" ]; then
     TRAIN_SCRIPT="scripts/run_sft_astar.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, ber_amplify, astar_sft"
     exit 1
 fi
 
