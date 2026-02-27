@@ -1,0 +1,4 @@
+interaction:
+  - name: "self_teach"
+    class_name: "src.rlvr_grokking.self_teach.interaction.SelfTeachInteraction"
+    config: {}

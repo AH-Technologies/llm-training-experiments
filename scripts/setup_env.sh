@@ -30,7 +30,7 @@ module load Python/3.12.3-GCCcore-13.3.0
 echo "Python: $(python3 --version)"
 
 # Set project directory
-PROJECT_DIR=/cluster/home/haaklau/code/llm-training-experiments
+PROJECT_DIR=/cluster/home/alexaau/llm-training-experiments
 cd $PROJECT_DIR
 
 # Remove old venv if exists

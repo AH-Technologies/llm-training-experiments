@@ -43,7 +43,7 @@ mkdir -p logs checkpoints data
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Activate virtual environment
-PROJECT_DIR=/cluster/home/haaklau/code/llm-training-experiments
+PROJECT_DIR=/cluster/home/alexaau/llm-training-experiments
 source $PROJECT_DIR/venv/bin/activate
 
 # Load .env file (contains WANDB_API_KEY, etc.)
@@ -195,9 +195,26 @@ elif [ "$TASK" == "astar_sft" ]; then
         --output-dir ${ASTAR_DATA_DIR} --seed 42
 
     TRAIN_SCRIPT="scripts/run_sft_astar.sh"
+elif [ "$TASK" == "self_teach" ]; then
+    # Self-Teach: Student-Teacher self-play GRPO
+    # 3-turn pipeline with trajectory splitting into separate GRPO groups
+    echo "Regenerating π13 dataset with 128 duplicates..."
+    python scripts/prepare_pi13_data.py --output-dir ./data --copies 128
+    if [ ! -f "data/math500.parquet" ]; then
+        echo "ERROR: Math500 data file must be present in ./data/"
+        exit 1
+    fi
+
+    # Prepare self-teach data (adds interaction_kwargs)
+    echo "Preparing self-teach data..."
+    python scripts/prepare_self_teach_data.py \
+        --input data/pi13_r128.parquet \
+        --output data/pi13_r128_self_teach.parquet
+
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach"
     exit 1
 fi
 
