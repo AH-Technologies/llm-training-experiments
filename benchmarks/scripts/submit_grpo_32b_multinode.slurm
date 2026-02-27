@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=multinode-bench
+#SBATCH --job-name=grpo-32b
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=10:00:00
@@ -7,11 +7,11 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/multinode-%j.out
-#SBATCH --error=benchmarks/results/multinode-%j.err
+#SBATCH --output=benchmarks/results/grpo-32b-%j.out
+#SBATCH --error=benchmarks/results/grpo-32b-%j.err
 
-# Multi-node benchmark for larger models (32B, 72B)
-# Uses 2 nodes x 4 GPUs = 8 GPUs total
+# GRPO benchmark for 32B model on 2 nodes (8 GPUs)
+# Uses verl GRPO trainer with FSDP (no TP for actor, vLLM TP=4)
 
 set -x
 
@@ -28,35 +28,31 @@ export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export WANDB_MODE=disabled
 export PYTHONUNBUFFERED=1
+export CUDA_HOME=/cluster/software/NRIS.old/neoverse_v2/software/NVHPC/25.3-CUDA-12.8.0/Linux_aarch64/25.3/cuda/12.8
+MATH_LIBS=/cluster/software/NRIS.old/neoverse_v2/software/NVHPC/25.3-CUDA-12.8.0/Linux_aarch64/25.3/math_libs/12.8/lib64
+export LIBRARY_PATH=${MATH_LIBS}:${LIBRARY_PATH}
+export LD_LIBRARY_PATH=${MATH_LIBS}:${LD_LIBRARY_PATH}
 
-# Get master node info for distributed training
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
 
-echo "=== Multi-Node Benchmark ==="
+echo "=== GRPO 32B Multi-Node Benchmark ==="
+echo "Start time: $(date)"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
-echo "GPUs per node: 4"
+srun --nodes=2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv
 echo ""
 
-# Run benchmark_runner on the head node only.
-# Multi-node training is handled internally via srun in sft_benchmark.py.
 python -m benchmarks.benchmark_runner \
-    --models 32B 72B 120B 235B \
-    --training-types sft grpo \
+    --models 32B \
+    --training-types grpo \
     --num-gpus 4 \
     --num-nodes 2 \
     --sequence-length 2048 \
-    --num-steps 30 \
+    --num-steps 10 \
     --find-max-batch \
-    --strategy auto \
-    --cleanup-cache \
     --output-dir benchmarks/results
 
-# Clean up the per-job cache directory
-if [ -d "$HF_HOME" ]; then
-    echo "Cleaning up job cache at $HF_HOME"
-    rm -rf "$HF_HOME"
-fi
-
-echo "=== Multi-Node Benchmark Complete ==="
+echo ""
+echo "End time: $(date)"
+echo "=== GRPO 32B Benchmark Complete ==="

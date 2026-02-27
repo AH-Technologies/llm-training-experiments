@@ -145,38 +145,39 @@ def sft_no_fsdp(arch: ModelArch, B: int, S: int, alpha: float = 0.15) -> dict:
     return {"gpu_peak_gb": to_gb(gpu_peak), "cpu_offloaded_gb": 0.0}
 
 
-def sft_fsdp(arch: ModelArch, B: int, S: int, N: int, alpha: float = 0.15) -> dict:
-    """Eq. 8: SFT with FSDP, no offloading."""
+def sft_fsdp(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
+             alpha: float = 0.15) -> dict:
+    """Eq. 8: SFT with FSDP, no offloading. T = tensor parallelism degree."""
     P = arch.P
     states = 16 * P / N
     unit_peak = 2 * fsdp_unit_params(arch.h) * BYTES_BF16  # Eq. 7
-    act = activation_memory(B, S, arch.h, arch.L, arch.a)
-    logits = logits_memory(B, S, arch.V)
+    act = activation_memory(B, S, arch.h, arch.L, arch.a) / T
+    logits = logits_memory(B, S, arch.V) / T
     oh = overhead(states, act, alpha)
     gpu_peak = states + act + unit_peak + logits + oh
     return {"gpu_peak_gb": to_gb(gpu_peak), "cpu_offloaded_gb": 0.0}
 
 
-def sft_fsdp_optim_offload(arch: ModelArch, B: int, S: int, N: int,
+def sft_fsdp_optim_offload(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
                             alpha: float = 0.15) -> dict:
-    """Eq. 9: SFT with FSDP + optimizer offload to CPU."""
+    """Eq. 9: SFT with FSDP + optimizer offload to CPU. T = tensor parallelism degree."""
     P = arch.P
     gpu_states = 4 * P / N  # bf16 weights + bf16 grads
     unit_peak = 2 * fsdp_unit_params(arch.h) * BYTES_BF16
-    act = activation_memory(B, S, arch.h, arch.L, arch.a)
-    logits = logits_memory(B, S, arch.V)
+    act = activation_memory(B, S, arch.h, arch.L, arch.a) / T
+    logits = logits_memory(B, S, arch.V) / T
     oh = overhead(gpu_states, act, alpha)
     gpu_peak = gpu_states + act + unit_peak + logits + oh
     cpu_offloaded = 12 * P / N  # master weights + momentum + variance
     return {"gpu_peak_gb": to_gb(gpu_peak), "cpu_offloaded_gb": to_gb(cpu_offloaded)}
 
 
-def sft_fsdp_full_offload(arch: ModelArch, B: int, S: int, N: int,
+def sft_fsdp_full_offload(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
                            alpha: float = 0.15) -> dict:
-    """Eq. 10: SFT with FSDP + full param & optimizer offload."""
+    """Eq. 10: SFT with FSDP + full param & optimizer offload. T = tensor parallelism degree."""
     unit_peak = 2 * fsdp_unit_params(arch.h) * BYTES_BF16
-    act = activation_memory(B, S, arch.h, arch.L, arch.a)
-    logits = logits_memory(B, S, arch.V)
+    act = activation_memory(B, S, arch.h, arch.L, arch.a) / T
+    logits = logits_memory(B, S, arch.V) / T
     # grad buffer for current unit
     grad_buf = fsdp_unit_params(arch.h) * BYTES_BF16
     oh = overhead(unit_peak, act, alpha)
@@ -368,8 +369,21 @@ def generate_plots(
     max_params: float = 1000.0,
     output_path: Path | None = None,
 ) -> tuple[Path, list[dict]]:
-    """Generate the 4-panel memory estimation plot and return (path, data)."""
+    """Generate SFT and GRPO memory estimation plots (two separate figures).
+
+    SFT figure (3 panels): no offload, optimizer offload, full offload
+    GRPO figure (2 panels): peak memory, per-phase breakdown
+
+    Returns (sft_plot_path, all_data).
+    """
     auto_tp = (T == "auto")
+
+    def _resolve_tp(arch: ModelArch) -> int:
+        if auto_tp:
+            t = min_tp_degree(arch, N, B_micro, S,
+                              gpu_total_gb=gpu_limit, cpu_limit=cpu_limit, alpha=alpha)
+            return t if t is not None else min(8, N)
+        return T if isinstance(T, int) else 1
 
     # Model sizes: log-spaced sweep
     P_values = np.geomspace(min_params, max_params, 200)
@@ -377,6 +391,7 @@ def generate_plots(
 
     # Compute estimates for each model size
     all_data: list[dict] = []
+    sft_no_off_gpu, sft_no_off_cpu = [], []
     sft_optim_gpu, sft_optim_cpu = [], []
     sft_full_gpu, sft_full_cpu = [], []
     grpo_gpu, grpo_cpu = [], []
@@ -385,9 +400,6 @@ def generate_plots(
     for P_b in P_values:
         arch = get_arch(P_b, V)
 
-        sft_opt = sft_fsdp_optim_offload(arch, B_micro, S, N, alpha)
-        sft_ful = sft_fsdp_full_offload(arch, B_micro, S, N, alpha)
-
         if auto_tp:
             selected_T = min_tp_degree(arch, N, B_micro, S,
                                        gpu_total_gb=gpu_limit,
@@ -395,15 +407,18 @@ def generate_plots(
         else:
             selected_T = T
 
-        if selected_T is not None:
-            grpo_est = grpo_phases(arch, B_micro, S, N, selected_T,
-                                   gpu_total_gb=gpu_limit, alpha=alpha)
-        else:
-            # No TP degree fits — use largest candidate for reporting
+        if selected_T is None:
             selected_T = min(8, N)
-            grpo_est = grpo_phases(arch, B_micro, S, N, selected_T,
-                                   gpu_total_gb=gpu_limit, alpha=alpha)
 
+        sft_no = sft_fsdp(arch, B_micro, S, N, T=selected_T, alpha=alpha)
+        sft_opt = sft_fsdp_optim_offload(arch, B_micro, S, N, T=selected_T, alpha=alpha)
+        sft_ful = sft_fsdp_full_offload(arch, B_micro, S, N, T=selected_T, alpha=alpha)
+
+        grpo_est = grpo_phases(arch, B_micro, S, N, selected_T,
+                               gpu_total_gb=gpu_limit, alpha=alpha)
+
+        sft_no_off_gpu.append(sft_no["gpu_peak_gb"])
+        sft_no_off_cpu.append(sft_no["cpu_offloaded_gb"])
         sft_optim_gpu.append(sft_opt["gpu_peak_gb"])
         sft_optim_cpu.append(sft_opt["cpu_offloaded_gb"])
         sft_full_gpu.append(sft_ful["gpu_peak_gb"])
@@ -420,6 +435,7 @@ def generate_plots(
             "arch_h": arch.h,
             "arch_L": arch.L,
             "tp_degree": selected_T,
+            "sft_fsdp_no_offload": sft_no,
             "sft_fsdp_optim_offload": sft_opt,
             "sft_fsdp_full_offload": sft_ful,
             "grpo": grpo_est,
@@ -428,6 +444,8 @@ def generate_plots(
 
     # Convert to arrays
     P_arr = np.array(P_values)
+    sft_no_off_gpu = np.array(sft_no_off_gpu)
+    sft_no_off_cpu = np.array(sft_no_off_cpu)
     sft_optim_gpu = np.array(sft_optim_gpu)
     sft_optim_cpu = np.array(sft_optim_cpu)
     sft_full_gpu = np.array(sft_full_gpu)
@@ -435,70 +453,74 @@ def generate_plots(
     grpo_gpu_arr = np.array(grpo_gpu)
     grpo_cpu_arr = np.array(grpo_cpu)
 
-    # --- Create figure ---
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     tp_label = "auto" if auto_tp else str(T)
     subtitle = (f"N={N} GPUs, TP={tp_label}, B_micro={B_micro}, S={S}, "
                 f"V={V:,}, α={alpha}")
-    fig.suptitle("Memory Estimation: SFT & GRPO Training\n"
-                 f"({subtitle})", fontsize=13, y=0.98)
+    y_max = max(gpu_limit, cpu_limit) * 2.5
 
-    # --- Panel (a): SFT FSDP + optimizer offload ---
-    ax = axes[0, 0]
-    _style_ax(ax)
-    ax.set_title("(a) SFT — FSDP + Optimizer Offload", fontsize=10, fontweight="bold")
-    ax.plot(P_arr, sft_optim_gpu, color=PLOT_COLORS["gpu"], linewidth=2,
-            label="GPU peak")
-    ax.plot(P_arr, sft_optim_cpu, color=PLOT_COLORS["cpu"], linewidth=2,
-            label="CPU offloaded")
-    _add_limits(ax, gpu_limit, cpu_limit, xlim)
-    _annotate_crossing(ax, P_arr, sft_optim_gpu, gpu_limit, "GPU full", PLOT_COLORS["gpu_limit"])
-    _annotate_crossing(ax, P_arr, sft_optim_cpu, cpu_limit, "CPU full", PLOT_COLORS["cpu_limit"])
-    # Reference model dots
-    for name, arch in REFERENCE_MODELS.items():
-        r = sft_fsdp_optim_offload(arch, B_micro, S, N, alpha)
-        ax.plot(arch.P_billions, r["gpu_peak_gb"], "o", color=PLOT_COLORS["gpu"],
-                markersize=3.5, zorder=5)
-        ax.plot(arch.P_billions, r["cpu_offloaded_gb"], "o", color=PLOT_COLORS["cpu"],
-                markersize=3.5, zorder=5)
-    ax.set_xscale("log")
-    ax.set_xlabel("Model Size (B params)")
-    ax.set_ylabel("Memory (GB)")
-    ax.set_xlim(xlim)
-    y_max = max(gpu_limit, cpu_limit) * 2.5  # Cap at ~500 GB for readability
-    ax.set_ylim(0, y_max)
-    ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.legend(fontsize=7, loc="upper left")
+    # =====================================================================
+    # Figure 1: SFT (3 panels — no offload, optimizer offload, full offload)
+    # =====================================================================
+    fig_sft, axes_sft = plt.subplots(1, 3, figsize=(18, 6))
+    fig_sft.suptitle(f"SFT Memory Estimation\n({subtitle})", fontsize=13, y=1.02)
 
-    # --- Panel (b): SFT FSDP + full offload ---
-    ax = axes[0, 1]
-    _style_ax(ax)
-    ax.set_title("(b) SFT — FSDP + Full Offload", fontsize=10, fontweight="bold")
-    ax.plot(P_arr, sft_full_gpu, color=PLOT_COLORS["gpu"], linewidth=2,
-            label="GPU peak")
-    ax.plot(P_arr, sft_full_cpu, color=PLOT_COLORS["cpu"], linewidth=2,
-            label="CPU offloaded")
-    _add_limits(ax, gpu_limit, cpu_limit, xlim)
-    _annotate_crossing(ax, P_arr, sft_full_gpu, gpu_limit, "GPU full", PLOT_COLORS["gpu_limit"])
-    _annotate_crossing(ax, P_arr, sft_full_cpu, cpu_limit, "CPU full", PLOT_COLORS["cpu_limit"])
-    for name, arch in REFERENCE_MODELS.items():
-        r = sft_fsdp_full_offload(arch, B_micro, S, N, alpha)
-        ax.plot(arch.P_billions, r["gpu_peak_gb"], "o", color=PLOT_COLORS["gpu"],
-                markersize=3.5, zorder=5)
-        ax.plot(arch.P_billions, r["cpu_offloaded_gb"], "o", color=PLOT_COLORS["cpu"],
-                markersize=3.5, zorder=5)
-    ax.set_xscale("log")
-    ax.set_xlabel("Model Size (B params)")
-    ax.set_ylabel("Memory (GB)")
-    ax.set_xlim(xlim)
-    ax.set_ylim(0, y_max)
-    ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.legend(fontsize=7, loc="upper left")
+    sft_panels = [
+        ("(a) No Offload", sft_no_off_gpu, sft_no_off_cpu, sft_fsdp),
+        ("(b) Optimizer Offload", sft_optim_gpu, sft_optim_cpu, sft_fsdp_optim_offload),
+        ("(c) Full Offload", sft_full_gpu, sft_full_cpu, sft_fsdp_full_offload),
+    ]
 
-    # --- Panel (c): GRPO peak ---
-    ax = axes[1, 0]
+    for ax, (title, gpu_data, cpu_data, estimator_fn) in zip(axes_sft, sft_panels):
+        _style_ax(ax)
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.plot(P_arr, gpu_data, color=PLOT_COLORS["gpu"], linewidth=2, label="GPU peak")
+        ax.plot(P_arr, cpu_data, color=PLOT_COLORS["cpu"], linewidth=2, label="CPU offloaded")
+        _add_limits(ax, gpu_limit, cpu_limit, xlim)
+        _annotate_crossing(ax, P_arr, gpu_data, gpu_limit, "GPU full", PLOT_COLORS["gpu_limit"])
+        _annotate_crossing(ax, P_arr, cpu_data, cpu_limit, "CPU full", PLOT_COLORS["cpu_limit"])
+        # Reference model dots
+        for name, arch in REFERENCE_MODELS.items():
+            ref_T = _resolve_tp(arch) if auto_tp else (T if T != "auto" else 1)
+            r = estimator_fn(arch, B_micro, S, N, T=ref_T, alpha=alpha)
+            ax.plot(arch.P_billions, r["gpu_peak_gb"], "o", color=PLOT_COLORS["gpu"],
+                    markersize=3.5, zorder=5)
+            ax.plot(arch.P_billions, r["cpu_offloaded_gb"], "o", color=PLOT_COLORS["cpu"],
+                    markersize=3.5, zorder=5)
+        ax.set_xscale("log")
+        ax.set_xlabel("Model Size (B params)")
+        ax.set_ylabel("Memory (GB)")
+        ax.set_xlim(xlim)
+        ax.set_ylim(0, y_max)
+        ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+        ax.legend(fontsize=7, loc="upper left")
+
+    fig_sft.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # Save SFT figure
+    if output_path is None:
+        output_path = Path(__file__).parent / "results" / "memory_estimation_sft.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig_sft.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig_sft)
+    print(f"SFT plot saved to: {output_path}")
+
+    # =====================================================================
+    # Figure 2: GRPO (2 panels — peak memory, per-phase breakdown)
+    # =====================================================================
+    grpo_path = output_path.with_name(
+        output_path.stem.replace("sft", "grpo") + output_path.suffix
+    )
+    # Fallback if stem doesn't contain "sft"
+    if grpo_path == output_path:
+        grpo_path = output_path.with_name("memory_estimation_grpo.png")
+
+    fig_grpo, axes_grpo = plt.subplots(1, 2, figsize=(14, 6))
+    fig_grpo.suptitle(f"GRPO Memory Estimation\n({subtitle})", fontsize=13, y=1.02)
+
+    # Panel (a): GRPO peak
+    ax = axes_grpo[0]
     _style_ax(ax)
-    ax.set_title("(c) GRPO — FSDP + Optim Offload, Ref Offloaded", fontsize=10,
+    ax.set_title("(a) GRPO — FSDP + Optim Offload, Ref Offloaded", fontsize=10,
                  fontweight="bold")
     ax.plot(P_arr, grpo_gpu_arr, color=PLOT_COLORS["gpu"], linewidth=2,
             label="GPU peak (max of phases)")
@@ -522,14 +544,14 @@ def generate_plots(
     ax.set_xlabel("Model Size (B params)")
     ax.set_ylabel("Memory (GB)")
     ax.set_xlim(xlim)
-    ax.set_ylim(0, y_max)  # Same cap as SFT panels for visual consistency
+    ax.set_ylim(0, y_max)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.legend(fontsize=7, loc="upper left")
 
-    # --- Panel (d): GRPO phase breakdown ---
-    ax = axes[1, 1]
+    # Panel (b): GRPO phase breakdown
+    ax = axes_grpo[1]
     _style_ax(ax)
-    ax.set_title("(d) GRPO — Per-Phase GPU Breakdown", fontsize=10, fontweight="bold")
+    ax.set_title("(b) GRPO — Per-Phase GPU Breakdown", fontsize=10, fontweight="bold")
     ax.plot(P_arr, grpo_rollout, color=PLOT_COLORS["rollout"], linewidth=1.8,
             label="Rollout (vLLM)")
     ax.plot(P_arr, grpo_ref, color=PLOT_COLORS["ref"], linewidth=1.8,
@@ -546,19 +568,15 @@ def generate_plots(
     ax.set_xlabel("Model Size (B params)")
     ax.set_ylabel("GPU Memory per Phase (GB)")
     ax.set_xlim(xlim)
-    ax.set_ylim(0, gpu_limit * 3)  # Focus on GPU-relevant range
+    ax.set_ylim(0, gpu_limit * 3)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.legend(fontsize=7, loc="upper left")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig_grpo.tight_layout(rect=[0, 0, 1, 0.95])
 
-    # Save
-    if output_path is None:
-        output_path = Path(__file__).parent / "results" / "memory_estimation.png"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Plot saved to: {output_path}")
+    fig_grpo.savefig(str(grpo_path), dpi=150, bbox_inches="tight")
+    plt.close(fig_grpo)
+    print(f"GRPO plot saved to: {grpo_path}")
 
     return output_path, all_data
 
@@ -644,12 +662,15 @@ def main() -> None:
                 "h": arch.h, "L": arch.L, "a": arch.a,
                 "a_kv": arch.a_kv, "d_ff": arch.d_ff, "V": arch.V,
                 "tp_degree": _resolve_tp(arch),
+                "sft_no_offload": sft_fsdp(
+                    arch, args.micro_batch_size, args.seq_length,
+                    args.num_gpus, T=_resolve_tp(arch), alpha=args.alpha),
                 "sft_optim_offload": sft_fsdp_optim_offload(
                     arch, args.micro_batch_size, args.seq_length,
-                    args.num_gpus, args.alpha),
+                    args.num_gpus, T=_resolve_tp(arch), alpha=args.alpha),
                 "sft_full_offload": sft_fsdp_full_offload(
                     arch, args.micro_batch_size, args.seq_length,
-                    args.num_gpus, args.alpha),
+                    args.num_gpus, T=_resolve_tp(arch), alpha=args.alpha),
                 "grpo": grpo_phases(
                     arch, args.micro_batch_size, args.seq_length,
                     args.num_gpus, _resolve_tp(arch),
@@ -664,20 +685,25 @@ def main() -> None:
     print(f"JSON saved to: {json_path}")
 
     # Print summary for reference models
-    print(f"\n{'Model':<18} {'TP':>3} {'SFT Opt.Off GPU':>16} {'SFT Opt.Off CPU':>16} "
-          f"{'GRPO GPU':>12} {'GRPO CPU':>12} {'Fits?':>6}")
-    print("-" * 87)
+    print(f"\n{'Model':<18} {'TP':>3} {'SFT NoOff GPU':>14} {'SFT OptOff GPU':>15} "
+          f"{'SFT FullOff GPU':>16} {'GRPO GPU':>10} {'GRPO CPU':>10} {'Fits?':>6}")
+    print("-" * 103)
     for name, arch in sorted(REFERENCE_MODELS.items(), key=lambda x: x[1].P):
         ref_T = _resolve_tp(arch)
-        sft = sft_fsdp_optim_offload(arch, args.micro_batch_size, args.seq_length,
-                                      args.num_gpus, args.alpha)
+        sft_no = sft_fsdp(arch, args.micro_batch_size, args.seq_length,
+                           args.num_gpus, T=ref_T, alpha=args.alpha)
+        sft_opt = sft_fsdp_optim_offload(arch, args.micro_batch_size, args.seq_length,
+                                          args.num_gpus, T=ref_T, alpha=args.alpha)
+        sft_ful = sft_fsdp_full_offload(arch, args.micro_batch_size, args.seq_length,
+                                         args.num_gpus, T=ref_T, alpha=args.alpha)
         grpo = grpo_phases(arch, args.micro_batch_size, args.seq_length,
                            args.num_gpus, ref_T,
                            gpu_total_gb=args.gpu_memory, alpha=args.alpha)
         grpo_ok = fits(grpo["gpu_peak_gb"], grpo["cpu_offloaded_gb"],
                        args.gpu_memory, args.cpu_memory)
-        print(f"{name:<18} {ref_T:>3} {sft['gpu_peak_gb']:>13.1f} GB {sft['cpu_offloaded_gb']:>13.1f} GB "
-              f"{grpo['gpu_peak_gb']:>9.1f} GB {grpo['cpu_offloaded_gb']:>9.1f} GB "
+        print(f"{name:<18} {ref_T:>3} {sft_no['gpu_peak_gb']:>11.1f} GB "
+              f"{sft_opt['gpu_peak_gb']:>12.1f} GB {sft_ful['gpu_peak_gb']:>13.1f} GB "
+              f"{grpo['gpu_peak_gb']:>7.1f} GB {grpo['cpu_offloaded_gb']:>7.1f} GB "
               f"{'yes' if grpo_ok else 'NO':>6}")
 
 

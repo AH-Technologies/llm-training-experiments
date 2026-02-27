@@ -152,6 +152,7 @@ def run_grpo_benchmark(
     ref_offload: bool = True,  # CPU offload for reference model (always True by default)
     num_nodes: int = 1,
     gpu_memory_utilization: float = 0.7,  # vLLM GPU memory fraction for KV cache
+    parallelism_config=None,  # Accepted for API compat, GRPO always uses FSDP via verl
 ) -> dict:
     """
     Run GRPO benchmark via verl and return metrics.

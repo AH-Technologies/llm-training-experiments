@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=full-benchmark
+#SBATCH --job-name=sft-singlenode
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=24:00:00
@@ -7,11 +7,13 @@
 #SBATCH --gpus=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/full-benchmark-%j.out
-#SBATCH --error=benchmarks/results/full-benchmark-%j.err
+#SBATCH --output=benchmarks/results/sft-singlenode-%j.out
+#SBATCH --error=benchmarks/results/sft-singlenode-%j.err
 
-# Full benchmark suite - tests all model sizes with both SFT and GRPO
-# This will take several hours to complete
+# SFT benchmarks for 0.5B-32B models on single node (4 GPUs)
+# 0.5B-14B: FSDP with offload
+# 32B: DeepSpeed ZeRO-3 with offload (auto-resolved by benchmark_runner)
+# Finds max batch size for each model via binary search
 
 set -x
 
@@ -28,29 +30,25 @@ export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export WANDB_MODE=disabled
 export PYTHONUNBUFFERED=1
+export CUDA_HOME=/cluster/software/NRIS.old/neoverse_v2/software/NVHPC/25.3-CUDA-12.8.0/Linux_aarch64/25.3/cuda/12.8
+MATH_LIBS=/cluster/software/NRIS.old/neoverse_v2/software/NVHPC/25.3-CUDA-12.8.0/Linux_aarch64/25.3/math_libs/12.8/lib64
+export LIBRARY_PATH=${MATH_LIBS}:${LIBRARY_PATH}
+export LD_LIBRARY_PATH=${MATH_LIBS}:${LD_LIBRARY_PATH}
 
-echo "=== Full Benchmark Suite ==="
+echo "=== SFT Single-Node Benchmark (0.5B-32B) ==="
 echo "Start time: $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 echo ""
 
-# Run full benchmark: binary search for max batch size per model
 python -m benchmarks.benchmark_runner \
-    --models 0.5B 1.5B 3B 7B 14B 32B 72B \
-    --training-types sft grpo \
+    --models 0.5B 1.5B 3B 7B 14B 32B \
+    --training-types sft \
     --num-gpus 4 \
     --sequence-length 2048 \
     --num-steps 10 \
     --find-max-batch \
-    --cleanup-cache \
     --output-dir benchmarks/results
-
-# Clean up the per-job cache directory
-if [ -d "$HF_HOME" ]; then
-    echo "Cleaning up job cache at $HF_HOME"
-    rm -rf "$HF_HOME"
-fi
 
 echo ""
 echo "End time: $(date)"
-echo "=== Full Benchmark Complete ==="
+echo "=== SFT Single-Node Benchmark Complete ==="
