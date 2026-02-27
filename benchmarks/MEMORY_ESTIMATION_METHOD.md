@@ -533,6 +533,193 @@ For multi-node setups with N_total = N_nodes × GPUs_per_node:
 - Communication buffers increase (inter-node bandwidth is lower)
 - Add ~5% overhead for NCCL buffers in multi-node
 
+### 7.7 SFT for 72B+ Models: DeepSpeed ZeRO-3
+
+#### The FSDP2+TP Problem
+
+For SFT on 72B+ models, FSDP alone cannot fit the model on GPU — even with full CPU offloading, the bf16 weights of a 72B model (144 GB) exceed a single GPU's 96 GB HBM. The natural solution would be to combine FSDP with tensor parallelism (TP), where TP shards within a node and FSDP shards across nodes.
+
+In theory, **FSDP2+TP** (via PyTorch's DTensor and Accelerate's `ParallelismConfig`) should work: TP=4 reduces per-GPU weight memory by 4×, and FSDP2 handles optimizer sharding across DP ranks. However, after extensive testing (7+ attempts across multiple approaches), we found this combination is **not production-ready** as of PyTorch 2.5 / Transformers 4.48:
+
+- **DTensor + gradient clipping conflict**: `max_grad_norm` causes crashes when FSDP2 wraps TP-sharded parameters. The DTensor metadata is incompatible with the norm computation across mixed sharding dimensions.
+- **CPU offload + FSDP2 + TP**: This three-way combination has no working examples in the PyTorch or HuggingFace ecosystem. Each pair works (FSDP2+TP without offload, FSDP2+offload without TP), but the triple combination fails with various internal errors.
+- **Accelerate's ParallelismConfig**: While documented, it silently falls back to non-TP behavior in many configurations, making debugging extremely difficult.
+
+#### The DeepSpeed ZeRO-3 Solution
+
+**DeepSpeed ZeRO-3 with full CPU offload** is the proven alternative for large-model SFT. It is mathematically equivalent to FSDP with full sharding — ZeRO-3 partitions parameters, gradients, and optimizer states across all GPUs — but has mature, well-tested CPU offloading support.
+
+Key properties:
+- **No TP needed**: ZeRO-3 shards everything across all `N` GPUs, so with 8 GPUs each only holds `1/8` of model states
+- **Full CPU offload**: Both parameters and optimizer states are offloaded to CPU, with on-demand streaming to GPU
+- **Well-documented**: DeepSpeed ZeRO-3 + offload is one of the most widely used configurations for training large models on limited GPU memory
+
+Memory formula (equivalent to `sft_fsdp_full_offload` with T=1, N=total_gpus):
+
+```
+M_SFT_DS_ZeRO3 ≈ 2×P_unit + A_checkpoint(B_micro) + 2×B_micro×S×V + 0.5 GB   [Eq. 10']
+```
+
+Where `P_unit` is the largest parameter group (one transformer layer ≈ `12h²`), and all optimizer states + inactive parameters reside on CPU.
+
+CPU memory per GPU:
+```
+M_cpu_per_gpu = (12P + 2P) / N = 14P / N                                       [Eq. 21b']
+```
+
+**Example**: Qwen2.5-72B on 2 nodes (8 GPUs):
+- CPU offload per GPU: `14 × 72B / 8 ≈ 126 GB` (within 202 GB limit)
+- GPU peak: `2×12×8192² + activation + logits ≈ 17 GB` (well within 96 GB)
+
+#### Scaling Beyond: What Would Be Needed for 405B+ SFT
+
+For models significantly larger than 72B (e.g., 405B), DeepSpeed ZeRO-3 with CPU offload still works but requires many nodes to keep CPU memory per GPU within the 202 GB limit:
+
+- **405B on 8 nodes (32 GPUs)**: CPU offload per GPU = `14 × 405B / 32 ≈ 177 GB` (fits, barely)
+- **405B on 4 nodes (16 GPUs)**: CPU offload per GPU = `14 × 405B / 16 ≈ 354 GB` (does NOT fit)
+
+For configurations where ZeRO-3 alone is insufficient, one would need a more sophisticated parallelism setup:
+
+1. **Megatron-LM with TP+PP+DP**: The gold standard for training at extreme scale. Tensor parallelism shards activations (solving the FSDP ceiling), pipeline parallelism distributes layers across nodes, and data parallelism handles batch scaling. However, setting this up requires:
+   - Building Megatron-LM and its dependencies (TransformerEngine, Apex) for the target architecture
+   - Model-specific conversion scripts (HuggingFace ↔ Megatron checkpoint format)
+   - Careful tuning of TP/PP/DP ratios and micro-batch scheduling
+
+2. **Hardware compatibility**: On our GH200 (ARM Grace CPU + Hopper GPU), TransformerEngine does not have official ARM builds, which blocks the Megatron path without significant build engineering effort.
+
+3. **Alternative frameworks**: Libraries like FSDP2+TP may mature in future PyTorch releases, or frameworks like Colossal-AI and Nanotron could provide more turnkey solutions. But as of early 2026, DeepSpeed ZeRO-3 remains the most reliable option for large-model SFT without investing in custom infrastructure.
+
+> **Bottom line**: DeepSpeed ZeRO-3 + CPU offload handles 72B comfortably and 405B with enough nodes. Going beyond that (or wanting better throughput at 405B scale) requires building a Megatron-style pipeline, which is a substantial engineering investment beyond our current scope.
+
+### 7.8 Megatron Backend for GRPO: Tensor & Pipeline Parallelism
+
+#### Why FSDP Alone Has a Ceiling
+
+FSDP shards **model states** (weights, gradients, optimizer) across GPUs, but **activations are not sharded** — each GPU computes a full forward/backward pass on its micro-batch independently. This means activation memory per GPU is fixed regardless of how many GPUs are added:
+
+```
+A_checkpoint(B_micro) = B_micro × S × h × (2L + 64 + 4aS/h)    [from Eq. 3]
+```
+
+For models where activation memory alone exceeds 96 GB (e.g., 70B+ with reasonable batch sizes), adding more FSDP GPUs does not help. **This is the fundamental limit of FSDP for GRPO actor training.**
+
+#### Tensor Parallelism Shards Activations
+
+Tensor parallelism (TP) splits individual matrix operations across `T` GPUs within a node. Each GPU computes only `1/T` of the attention heads and FFN columns, so activations are sharded by a factor of `T`:
+
+```
+A_checkpoint_TP = A_checkpoint / T                               [Eq. 22]
+```
+
+This directly addresses the FSDP ceiling. With TP=4 on a 4-GPU node, activation memory is reduced by 4×, enabling models that wouldn't fit with FSDP alone.
+
+**Constraint**: TP requires all-reduce communication between GPUs at every transformer layer (twice per layer: after attention and after FFN). This must use high-bandwidth interconnect (NVLink), so **TP must stay within a single node**. On our GH200 nodes with 4 GPUs: `T ∈ {1, 2, 4}`.
+
+#### Pipeline Parallelism Splits Layers Across Nodes
+
+Pipeline parallelism (PP) partitions transformer layers across `D` pipeline stages, where each stage runs on a different set of GPUs:
+
+```
+L_per_stage = L / D                                              [Eq. 23]
+```
+
+This reduces per-GPU memory for both model states and activations proportionally:
+
+```
+M_states_per_stage = 16P / (N × D)    (approximate, layers aren't equal size)   [Eq. 23a]
+A_per_stage ≈ A_checkpoint / D                                   [Eq. 23b]
+```
+
+PP introduces pipeline bubbles (idle time), so it trades throughput for memory. The bubble fraction is approximately `(D-1) / (D-1 + micro_batches)`.
+
+**When to use PP**: Only when TP alone is insufficient. For our hardware:
+- TP=4 (one full node) is the first choice for large models
+- PP=2 is added for models where TP=4 still doesn't fit (e.g., 405B: 126 layers ÷ 2 = 63 layers per stage)
+
+#### Combined Parallelism: TP + PP + DP
+
+With Megatron, the total GPU count is partitioned as:
+
+```
+N_total = T × D × DP                                            [Eq. 24]
+```
+
+Where:
+- `T` = tensor parallelism degree (within node, NVLink)
+- `D` = pipeline parallelism degree (across nodes OK, uses inter-node network)
+- `DP` = data parallelism degree (derived: `DP = N_total / (T × D)`)
+
+**Batch size constraint**: The global batch must be divisible by `DP` (not `N_total` as with FSDP):
+
+```
+B_global mod DP = 0                                              [Eq. 24a]
+```
+
+#### Megatron Actor Update Memory
+
+With Megatron TP+PP, the actor update phase memory becomes:
+
+```
+M_actor_megatron = M_states / DP + A_checkpoint / (T × D) + M_overhead   [Eq. 25]
+```
+
+With distributed optimizer (Megatron's equivalent of FSDP optimizer sharding):
+
+```
+M_actor_megatron_dist_opt = (2P + 12P/DP) / (T × D) + A_checkpoint / (T × D) + M_overhead   [Eq. 25a]
+```
+
+Where `12P/DP` accounts for optimizer states sharded across DP ranks, and `2P` is the bf16 weights for the local pipeline stage's TP shard.
+
+#### Megatron Activation Recomputation
+
+Megatron supports **selective activation recomputation**, which only recomputes specific modules (e.g., attention core) rather than entire layers. This provides a middle ground between full recomputation and no recomputation:
+
+```
+recompute_granularity=selective, recompute_modules=[core_attn]
+```
+
+This saves the memory-expensive attention softmax activations (`BaS²` per layer) while keeping the cheaper FFN activations cached.
+
+#### Sequence Parallelism (SP)
+
+When TP > 1, Megatron can additionally enable sequence parallelism, which shards the sequence dimension for operations that don't require cross-GPU communication (LayerNorm, dropout). This further reduces activation memory:
+
+```
+A_SP = A_non_parallel / T                                        [Eq. 26]
+```
+
+SP is essentially free when TP is already enabled — it adds no extra communication.
+
+#### GRPO with Megatron: Phase Memory Summary
+
+```
+M_GRPO_megatron = max(
+    (2P + KV_cache) / T + overhead,                    -- rollout (vLLM, TP-sharded)
+    M_ref_megatron,                                    -- ref log-probs (TP+PP sharded)
+    M_actor_megatron,                                  -- actor update (TP+PP+DP)
+    M_weight_sync_megatron                             -- FSDP→vLLM weight sync
+)                                                                [Eq. 27]
+```
+
+The key difference from FSDP-only is that the actor update phase now benefits from TP (activation sharding) and PP (layer sharding), breaking through the FSDP ceiling.
+
+#### Benchmark Parallelism Configurations
+
+The benchmark runner uses a static lookup table to select TP/PP based on model size and available GPUs:
+
+| Model Size | GPUs | Strategy | TP | PP | DP | Rationale |
+|-----------|------|----------|----|----|-----|-----------|
+| 0.5B–7B | 4 | FSDP | 1 | 1 | 4 | Small enough; FSDP is simpler and faster |
+| 14B | 4 | Megatron | 2 | 1 | 2 | Activations tight at TP=1; TP=2 halves them |
+| 14B | 8 | Megatron | 4 | 1 | 2 | More headroom for larger batches |
+| 32B | 4 | Megatron | 4 | 1 | 1 | Full-node TP required |
+| 32B | 8 | Megatron | 4 | 1 | 2 | TP=4 per node, DP across nodes |
+| 72B | 8 | Megatron | 4 | 1 | 2 | Same as 32B |
+| 405B | 32 | Megatron | 4 | 2 | 4 | 126 layers ÷ 2 stages; TP=4 per node |
+
+> **Design choice**: TP degree is deterministic for a given model + hardware, not searched at runtime. Searching would multiply benchmark time by the number of candidates.
+
 ---
 
 ## 8. Summary: Quick Estimation Formulas
@@ -557,9 +744,15 @@ M_SFT ≈ (1 + α) × 4P/N + A(B_micro) + 2×12h² + 2×B_micro×S×V + 0.5 GB
 M_SFT ≈ 2×12h² + A(B_micro) + 2×B_micro×S×V + 0.5 GB
 ```
 
-### GRPO (verl, FSDP, optimizer offload, ref offloaded)
+### SFT (DeepSpeed ZeRO-3, N GPUs, full CPU offload)
 ```
-M_GRPO ≈ max(
+M_SFT ≈ 2×12h² + A(B_micro) + 2×B_micro×S×V + 0.5 GB
+```
+Mathematically equivalent to FSDP full offload (Eq. 10). ZeRO-3 shards params/grads/optimizer across all N GPUs with T=1 (no TP). CPU memory per GPU: `14P/N`.
+
+### GRPO (verl, FSDP backend, optimizer offload, ref offloaded)
+```
+M_GRPO_FSDP ≈ max(
     (2P + KV_cache) / T + 2 GB,                               -- rollout phase
     B_micro × S × h × 2 + 2×B_micro×S×V + 1 GB,              -- ref phase
     (1+α) × 4P/N + A(B_micro) + 2×B_micro×S×V + 0.5 GB,      -- actor phase
@@ -567,19 +760,55 @@ M_GRPO ≈ max(
 )
 ```
 
-> **Key insight**: For large models, the rollout phase (constrained by TP, not FSDP) and the weight sync spike are often the true bottlenecks, not the actor update.
+> **Key insight (FSDP)**: For large models, the rollout phase (constrained by TP, not FSDP) and the weight sync spike are often the true bottlenecks, not the actor update. But the **fundamental FSDP ceiling** is activation memory — it cannot be reduced by adding more GPUs.
+
+### GRPO (verl, Megatron backend, TP+PP+DP)
+```
+M_GRPO_Megatron ≈ max(
+    (2P + KV_cache) / T + 2 GB,                               -- rollout phase (vLLM, TP)
+    M_ref / (T × D) + overhead,                                -- ref phase (TP+PP sharded)
+    (2P + 12P/DP) / (T×D) + A(B_micro)/(T×D) + 0.5 GB,       -- actor phase (TP+PP+dist_opt)
+    weight_sync_overhead                                        -- weight sync
+)
+```
+
+> **Key insight (Megatron)**: TP shards activations by a factor of T, and PP shards layers by a factor of D. This breaks through the FSDP activation ceiling, enabling models 70B+ that couldn't train with FSDP alone.
+
+### When to Use Each Backend
+
+**SFT:**
+
+| Condition | Backend | Reason |
+|-----------|---------|--------|
+| Model ≤ 32B | FSDP + CPU offload | Simple, fast; model states fit with FSDP sharding |
+| Model 72B+ | DeepSpeed ZeRO-3 + CPU offload | Shards everything across all GPUs; mature offload support |
+| Model 405B+ (throughput-critical) | Megatron TP+PP+DP | Best throughput but requires significant setup investment |
+
+> **Note**: FSDP2+TP (combining FSDP with tensor parallelism) is theoretically ideal for 72B+ SFT but is not production-ready as of PyTorch 2.5 due to DTensor/gradient clipping conflicts and missing CPU offload support. See Section 7.7 for details.
+
+**GRPO:**
+
+| Condition | Backend | Reason |
+|-----------|---------|--------|
+| Model ≤ 7B | FSDP | Activations fit easily; FSDP is simpler and faster |
+| Model 14B, tight batch | Megatron TP=2 | Activation headroom needed |
+| Model 32B–72B | Megatron TP=4 | Full-node TP required for actor training activations |
+| Model 405B | Megatron TP=4, PP=2 | Layers must be split across nodes |
 
 ### Rules of Thumb
 
-| Model Size | Min GPUs (SFT, FSDP+offload) | Min GPUs (GRPO, 96GB/GPU) |
-|------------|-------------------------------|---------------------------|
-| 1.5B | 1 | 1 (TP=1) |
-| 7B | 1 | 1–2 (TP=1) |
-| 14B | 2 | 4 (TP=1–2) |
-| 32B | 4 | 8 (TP=2–4) |
-| 70B | 8 | 16 (TP=4–8) |
-| 140B | 16 | 32 (TP=8) |
-| 405B | 48 | 96+ (TP=8) |
+| Model Size | Min GPUs (SFT) | Backend (SFT) | Min GPUs (GRPO) | Backend (GRPO) |
+|------------|----------------|---------------|-----------------|----------------|
+| 1.5B | 1 | FSDP+offload | 1 (TP=1) | FSDP |
+| 7B | 1 | FSDP+offload | 1–2 (TP=1) | FSDP |
+| 14B | 2 | FSDP+offload | 4 (TP=2) | Megatron |
+| 32B | 4 | FSDP+offload | 4 (TP=4) | Megatron |
+| 72B | 8 | DS ZeRO-3+offload | 8 (TP=4) | Megatron |
+| 405B | 32 | DS ZeRO-3+offload | 32 (TP=4, PP=2) | Megatron |
+
+> For GRPO, FSDP cannot shard activations, so models 70B+ hit the activation memory ceiling regardless of GPU count. Megatron TP is required for the actor training phase.
+
+> For SFT, DeepSpeed ZeRO-3 avoids the activation sharding problem by keeping micro-batch size at 1 and offloading all model states to CPU, making it feasible on modest GPU counts.
 
 > These are approximate lower bounds. Actual requirements depend heavily on batch size and sequence length.
 
@@ -594,13 +823,16 @@ M_GRPO ≈ max(
 | L | Number of transformer layers |
 | a | Number of attention heads |
 | V | Vocabulary size |
-| N | Number of GPUs (FSDP sharding) |
-| T | Tensor parallelism degree |
+| N | Number of GPUs (FSDP sharding / total) |
+| T | Tensor parallelism degree (within node) |
+| D | Pipeline parallelism degree (stages) |
+| DP | Data parallelism degree = N / (T × D) |
 | B | Global batch size |
-| B_micro | Micro-batch size per GPU = B / (N × GA) |
+| B_micro | Micro-batch size per GPU = B / (DP × GA) |
 | S | Sequence length (total) |
 | S_p, S_r | Prompt / response length |
 | G | GRPO group size (rollouts per prompt) |
 | GA | Gradient accumulation steps |
 | GC | Gradient checkpointing flag |
 | P_unit | Params in largest FSDP wrapping unit |
+| SP | Sequence parallelism (enabled when T > 1) |

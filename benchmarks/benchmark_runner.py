@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +23,67 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+
+@dataclass
+class ParallelismConfig:
+    """Parallelism configuration for a benchmark run."""
+    strategy: str = "fsdp"  # "fsdp" or "deepspeed"
+    tp: int = 1             # Tensor parallelism degree (SFT: training TP, GRPO: vLLM TP)
+    pp: int = 1             # Pipeline parallelism degree (unused, kept for result schema)
+
+
+# Parallelism configs per training type.
+#
+# GRPO: Always FSDP for actor training. TP field = vLLM TP for generation only.
+# SFT:  FSDP for small models. DeepSpeed ZeRO-3 + CPU offload for 72B+.
+#
+# TP must stay within a node (4 GPUs on GH200).
+GRPO_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
+    # 0.5B–14B: FSDP-only, vLLM TP=1
+    "0.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "1.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "3B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "7B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "14B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    # 32B: FSDP for training, vLLM TP=4 for generation
+    "32B":  {4: ParallelismConfig(strategy="fsdp", tp=4), 8: ParallelismConfig(strategy="fsdp", tp=4)},
+}
+
+SFT_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
+    # 0.5B–14B: FSDP-only, no TP
+    "0.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "1.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "3B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "7B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    "14B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    # 32B: FSDP with offload (no TP needed with enough GPUs)
+    "32B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
+    # 72B+: DeepSpeed ZeRO-3 with full CPU offload (no TP, shards across all GPUs)
+    "72B":  {4: ParallelismConfig(strategy="deepspeed"), 8: ParallelismConfig(strategy="deepspeed")},
+    "180B": {16: ParallelismConfig(strategy="deepspeed"), 32: ParallelismConfig(strategy="deepspeed")},
+}
+
+
+def resolve_parallelism(model_size: str, total_gpus: int, training_type: str = "sft") -> ParallelismConfig:
+    """Resolve the parallelism config for a given model, GPU count, and training type.
+
+    For GRPO: Always FSDP. TP field controls vLLM tensor parallelism for generation.
+    For SFT:  FSDP for small models. DeepSpeed ZeRO-3 for 72B+.
+    """
+    configs = GRPO_CONFIGS if training_type == "grpo" else SFT_CONFIGS
+    model_configs = configs.get(model_size, {})
+
+    config = model_configs.get(total_gpus)
+    if config is not None:
+        return config
+
+    # No exact match — find closest GPU count
+    if model_configs:
+        closest = min(model_configs.keys(), key=lambda g: abs(g - total_gpus))
+        return model_configs[closest]
+
+    return ParallelismConfig(strategy="fsdp")
 
 
 @dataclass
@@ -41,6 +103,11 @@ class BenchmarkResult:
     # Training config
     fsdp_strategy: str = "fsdp2"  # FSDP sharding strategy
     gradient_checkpointing: bool = True  # Memory optimization
+
+    # Parallelism config
+    strategy: str = "fsdp"
+    tp_degree: int = 1      # Tensor parallelism
+    pp_degree: int = 1      # Pipeline parallelism
 
     # GRPO-specific config
     actor_offload: bool = True   # CPU offload for actor
@@ -69,8 +136,7 @@ MODELS = {
     "14B": "Qwen/Qwen2.5-14B",
     "32B": "Qwen/Qwen2.5-32B",
     "72B": "Qwen/Qwen2.5-72B",
-    "120B": "openai/gpt-oss-120b",
-    "235B": "Qwen/Qwen3-235B-A22B",
+    "180B": "tiiuae/falcon-180B",
 }
 
 # Starting batch sizes for binary search (will be halved on OOM)
@@ -82,13 +148,36 @@ INITIAL_BATCH_SIZES = {
     "14B": 4,
     "32B": 4,
     "72B": 4,
-    "120B": 4,
-    "235B": 4,
+    "180B": 4,
 }
 
 # Batch size limits
-MIN_BATCH_SIZE = 4   # verl FSDP2 has issues with batch sizes < 4
+MIN_BATCH_SIZE_SFT = 4
+MIN_BATCH_SIZE_GRPO = 8   # TRL requires batch >= num_generations (default 8)
 MAX_BATCH_SIZE_CAP = 256
+
+
+def cleanup_model_cache(model_name: str):
+    """Delete a model from the HuggingFace cache to free disk space.
+
+    Removes the model directory from $HF_HOME/hub/ (or ~/.cache/huggingface/hub/).
+    The cache directory name uses '--' as separator, e.g. 'models--Qwen--Qwen2.5-32B'.
+    """
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    hub_dir = Path(hf_home) / "hub"
+
+    # HF cache uses 'models--org--name' format
+    cache_dir_name = "models--" + model_name.replace("/", "--")
+    model_cache = hub_dir / cache_dir_name
+
+    if model_cache.exists():
+        size_bytes = sum(f.stat().st_size for f in model_cache.rglob("*") if f.is_file())
+        size_gb = size_bytes / 1e9
+        print(f"Cleaning up cache for {model_name}: {size_gb:.1f} GB at {model_cache}")
+        shutil.rmtree(model_cache)
+        print(f"Deleted {model_cache}")
+    else:
+        print(f"No cache found for {model_name} at {model_cache}")
 
 
 def get_gpu_memory_info() -> dict:
@@ -126,15 +215,17 @@ def find_max_batch_size(
     actor_offload: bool = True,
     ref_offload: bool = True,
     num_nodes: int = 1,
+    parallelism_config: Optional[ParallelismConfig] = None,
 ) -> tuple[int, BenchmarkResult]:
     """
     Binary search to find maximum batch size that fits in memory.
 
     Returns (max_batch_size, benchmark_result)
     """
-    # Batch size must be divisible by total number of GPUs (dp_size)
     total_gpus = num_gpus * num_nodes
-    min_batch_size = max(MIN_BATCH_SIZE, total_gpus)
+    dp_size = total_gpus
+    min_bs = MIN_BATCH_SIZE_GRPO if training_type == "grpo" else MIN_BATCH_SIZE_SFT
+    min_batch_size = max(min_bs, dp_size)
 
     batch_size = max(INITIAL_BATCH_SIZES.get(model_size, 8), min_batch_size)
     last_successful_result = None
@@ -159,6 +250,7 @@ def find_max_batch_size(
             num_nodes=num_nodes,
             actor_offload=actor_offload,
             ref_offload=ref_offload,
+            parallelism_config=parallelism_config,
         )
 
         if result.success:
@@ -219,6 +311,7 @@ def find_max_batch_size(
                     actor_offload=retry_cfg["actor_offload"],
                     ref_offload=ref_offload,
                     gpu_memory_utilization=retry_cfg["gpu_memory_utilization"],
+                    parallelism_config=parallelism_config,
                 )
 
                 if result.success:
@@ -257,11 +350,13 @@ def run_single_benchmark(
     actor_offload: bool = True,
     ref_offload: bool = True,
     gpu_memory_utilization: float = 0.7,
+    parallelism_config: Optional[ParallelismConfig] = None,
 ) -> BenchmarkResult:
     """Run a single benchmark configuration."""
 
     model_name = MODELS[model_size]
     timestamp = datetime.now().isoformat()
+    pc = parallelism_config or ParallelismConfig()
 
     base_result = BenchmarkResult(
         timestamp=timestamp,
@@ -274,6 +369,9 @@ def run_single_benchmark(
         gradient_accumulation=gradient_accumulation,
         sequence_length=sequence_length,
         precision="bf16",
+        strategy=pc.strategy,
+        tp_degree=pc.tp,
+        pp_degree=pc.pp,
         actor_offload=actor_offload,
         ref_offload=ref_offload,
         gpu_memory_utilization=gpu_memory_utilization,
@@ -289,6 +387,11 @@ def run_single_benchmark(
 
     try:
         if training_type == "sft":
+            # Resolve DeepSpeed config path for "deepspeed" strategy
+            ds_config = None
+            if pc.strategy == "deepspeed":
+                ds_config = str(Path(__file__).parent / "configs" / "ds_zero3_offload.json")
+
             result = _run_sft_benchmark(
                 model_name=model_name,
                 batch_size=batch_size,
@@ -298,6 +401,8 @@ def run_single_benchmark(
                 gradient_accumulation=gradient_accumulation,
                 num_nodes=num_nodes,
                 offload=actor_offload,
+                tp_degree=pc.tp,
+                deepspeed_config=ds_config,
             )
         elif training_type == "grpo":
             result = _run_grpo_benchmark(
@@ -310,6 +415,7 @@ def run_single_benchmark(
                 ref_offload=ref_offload,
                 num_nodes=num_nodes,
                 gpu_memory_utilization=gpu_memory_utilization,
+                parallelism_config=pc,
             )
         else:
             raise ValueError(f"Unknown training type: {training_type}")
@@ -345,6 +451,8 @@ def _run_sft_benchmark(
     gradient_accumulation: int = 1,
     num_nodes: int = 1,
     offload: bool = False,
+    tp_degree: int = 1,
+    deepspeed_config: str = None,
 ) -> dict:
     """Run SFT benchmark using the sft_benchmark module."""
     from benchmarks.sft_benchmark import run_sft_benchmark
@@ -358,6 +466,8 @@ def _run_sft_benchmark(
         gradient_accumulation=gradient_accumulation,
         num_nodes=num_nodes,
         offload=offload,
+        tp_degree=tp_degree,
+        deepspeed_config=deepspeed_config,
     )
 
 
@@ -371,6 +481,7 @@ def _run_grpo_benchmark(
     ref_offload: bool = True,
     num_nodes: int = 1,
     gpu_memory_utilization: float = 0.7,
+    parallelism_config: Optional[ParallelismConfig] = None,
 ) -> dict:
     """Run GRPO benchmark using the grpo_benchmark module."""
     from benchmarks.grpo_benchmark import run_grpo_benchmark
@@ -385,6 +496,7 @@ def _run_grpo_benchmark(
         ref_offload=ref_offload,
         num_nodes=num_nodes,
         gpu_memory_utilization=gpu_memory_utilization,
+        parallelism_config=parallelism_config,
     )
 
 
@@ -424,7 +536,6 @@ def print_summary(results: list[BenchmarkResult]):
         print(f"\nConfiguration:")
         print(f"  Hardware: {r.num_gpus} GPUs × {r.num_nodes} node(s)")
         print(f"  Precision: {r.precision}")
-        print(f"  FSDP Strategy: {r.fsdp_strategy}")
         print(f"  Gradient Checkpointing: {'enabled' if r.gradient_checkpointing else 'disabled'}")
         print(f"  Sequence Length: {r.sequence_length}")
 
@@ -442,34 +553,28 @@ def print_summary(results: list[BenchmarkResult]):
         print(f"\n{training_type.upper()} Results:")
 
         if training_type == "grpo":
-            # Show GRPO-specific config
             grpo_results = [r for r in type_results if r.training_type == "grpo"]
             if grpo_results:
                 print(f"  Rollout N: {grpo_results[0].rollout_n} responses per prompt")
-        print("-"*90)
+        print("-"*110)
 
-        if training_type == "grpo":
-            print(f"{'Model':<8} {'GPUs':<5} {'Batch':<6} {'Offload':<12} {'Mem(GB)':<9} {'Tok/s':<10} {'ms/step':<9} {'Status'}")
-            print("-"*90)
+        header = f"{'Model':<8} {'Strategy':<10} {'TP':<4} {'PP':<4} {'GPUs':<5} {'Batch':<6} {'Offload':<12} {'Mem(GB)':<9} {'Tok/s':<10} {'ms/step':<9} {'Status'}"
+        print(header)
+        print("-"*110)
 
-            for r in sorted(type_results, key=lambda x: (x.model_size_b, x.actor_offload)):
-                status = "OK" if r.success else "FAIL"
-                mem = f"{r.peak_memory_gb:.1f}" if r.peak_memory_gb else "-"
-                tps = f"{r.tokens_per_second:.0f}" if r.tokens_per_second else "-"
-                ms = f"{r.time_per_step_ms:.1f}" if r.time_per_step_ms else "-"
+        for r in sorted(type_results, key=lambda x: (x.model_size_b, x.actor_offload)):
+            status = "OK" if r.success else "FAIL"
+            mem = f"{r.peak_memory_gb:.1f}" if r.peak_memory_gb else "-"
+            tps = f"{r.tokens_per_second:.0f}" if r.tokens_per_second else "-"
+            ms = f"{r.time_per_step_ms:.1f}" if r.time_per_step_ms else "-"
+            if training_type == "grpo":
                 offload = "actor+ref" if r.actor_offload else ("ref" if r.ref_offload else "none")
-                print(f"{r.model_size_b}B{'':<5} {r.num_gpus:<5} {r.batch_size:<6} {offload:<12} {mem:<9} {tps:<10} {ms:<9} {status}")
-        else:
-            print(f"{'Model':<8} {'GPUs':<5} {'Batch':<6} {'Offload':<12} {'Mem(GB)':<9} {'Tok/s':<10} {'ms/step':<9} {'Status'}")
-            print("-"*90)
-
-            for r in sorted(type_results, key=lambda x: (x.model_size_b, x.actor_offload)):
-                status = "OK" if r.success else "FAIL"
-                mem = f"{r.peak_memory_gb:.1f}" if r.peak_memory_gb else "-"
-                tps = f"{r.tokens_per_second:.0f}" if r.tokens_per_second else "-"
-                ms = f"{r.time_per_step_ms:.1f}" if r.time_per_step_ms else "-"
+            else:
                 offload = "cpu" if r.actor_offload else "none"
-                print(f"{r.model_size_b}B{'':<5} {r.num_gpus:<5} {r.batch_size:<6} {offload:<12} {mem:<9} {tps:<10} {ms:<9} {status}")
+            strategy = r.strategy
+            tp = str(r.tp_degree)
+            pp = str(r.pp_degree)
+            print(f"{r.model_size_b}B{'':<5} {strategy:<10} {tp:<4} {pp:<4} {r.num_gpus:<5} {r.batch_size:<6} {offload:<12} {mem:<9} {tps:<10} {ms:<9} {status}")
 
 
 
@@ -545,6 +650,19 @@ def main():
         action="store_true",
         help="Disable CPU offloading for reference model (GRPO only)",
     )
+    parser.add_argument(
+        "--cleanup-cache",
+        action="store_true",
+        help="Delete each model from HF cache after benchmarking to free disk space",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=["fsdp", "deepspeed", "auto"],
+        default="auto",
+        help="Parallelism strategy: fsdp (always FSDP, no TP), "
+             "deepspeed (ZeRO-3 + CPU offload), "
+             "auto (use lookup table based on model size and training type). Default: auto",
+    )
 
     args = parser.parse_args()
 
@@ -576,12 +694,14 @@ def main():
             {"actor_offload": actor_offload, "ref_offload": ref_offload, "label": "default"}
         ]
 
+    total_gpus = args.num_gpus * args.num_nodes
+
     print("="*80)
     print("OLIVIA HPC BENCHMARK")
     print("="*80)
     print(f"Models: {model_sizes}")
     print(f"Training types: {training_types}")
-    print(f"GPUs: {args.num_gpus} x {args.num_nodes} nodes")
+    print(f"GPUs: {args.num_gpus} x {args.num_nodes} nodes = {total_gpus} total")
     print(f"Sequence length: {args.sequence_length}")
     print(f"Steps per benchmark: {args.num_steps}")
     if "grpo" in training_types:
@@ -592,28 +712,36 @@ def main():
 
     for model_size in model_sizes:
         for training_type in training_types:
+            # Resolve parallelism per (model, training_type)
+            if args.strategy == "fsdp":
+                pc = ParallelismConfig(strategy="fsdp")
+            elif args.strategy == "deepspeed":
+                pc = ParallelismConfig(strategy="deepspeed")
+            else:
+                pc = resolve_parallelism(model_size, total_gpus, training_type)
+            print(f"\n--- {model_size} {training_type.upper()}: strategy={pc.strategy}, TP={pc.tp}, PP={pc.pp}")
             # For GRPO, test each offload config
             if training_type == "grpo":
                 offload_configs = grpo_offload_configs
             else:
-                # SFT: offload off by default, OOM fallback enables it with FSDP1
-                offload_configs = [{"actor_offload": False, "ref_offload": True, "label": "sft"}]
+                # SFT: always offload (required for large models, negligible impact on small ones)
+                offload_configs = [{"actor_offload": True, "ref_offload": True, "label": "sft_offload"}]
 
             for offload_config in offload_configs:
                 config_label = offload_config["label"]
-                print(f"\n>>> Benchmarking {model_size} with {training_type.upper()} ({config_label})")
+                print(f"\n>>> Benchmarking {model_size} with {training_type.upper()} ({config_label}, {pc.strategy})")
 
                 if args.find_max_batch:
-                    # Step 1: Find maximum batch size
                     max_batch, max_result = find_max_batch_size(
                         model_size=model_size,
                         training_type=training_type,
                         num_gpus=args.num_gpus,
                         sequence_length=args.sequence_length,
-                        num_steps=min(args.num_steps, 10),  # Fewer steps for max search
+                        num_steps=min(args.num_steps, 10),
                         actor_offload=offload_config["actor_offload"],
                         ref_offload=offload_config["ref_offload"],
                         num_nodes=args.num_nodes,
+                        parallelism_config=pc,
                     )
                     print(f"Max batch size for {model_size} ({training_type}, {config_label}): {max_batch}")
                     results.append(max_result)
@@ -629,8 +757,13 @@ def main():
                         num_nodes=args.num_nodes,
                         actor_offload=offload_config["actor_offload"],
                         ref_offload=offload_config["ref_offload"],
+                        parallelism_config=pc,
                     )
                     results.append(result)
+
+        # Clean up model cache after all training types are done for this model
+        if args.cleanup_cache:
+            cleanup_model_cache(MODELS[model_size])
 
     # Save and print results
     if results:

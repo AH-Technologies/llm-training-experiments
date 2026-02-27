@@ -1,17 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=full-benchmark
+#SBATCH --job-name=sft-tp-multinode
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --time=24:00:00
-#SBATCH --nodes=1
-#SBATCH --gpus=4
+#SBATCH --time=12:00:00
+#SBATCH --nodes=2
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/full-benchmark-%j.out
-#SBATCH --error=benchmarks/results/full-benchmark-%j.err
+#SBATCH --output=benchmarks/results/sft-tp-multinode-%j.out
+#SBATCH --error=benchmarks/results/sft-tp-multinode-%j.err
 
-# Full benchmark suite - tests all model sizes with both SFT and GRPO
-# This will take several hours to complete
+# Multi-node SFT benchmark with FSDP2+TP for 72B+ models
+# Uses TRL SFTTrainer with Accelerate ParallelismConfig (TP=4)
+# 2 nodes x 4 GPUs = 8 GPUs total, TP=4 within node, DP=2 across nodes
 
 set -x
 
@@ -29,16 +30,21 @@ export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export WANDB_MODE=disabled
 export PYTHONUNBUFFERED=1
 
-echo "=== Full Benchmark Suite ==="
-echo "Start time: $(date)"
-nvidia-smi --query-gpu=name,memory.total --format=csv
+# Get master node info for distributed training
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_PORT=29500
+
+echo "=== SFT TP Multi-Node Benchmark ==="
+echo "Nodes: $SLURM_JOB_NODELIST"
+echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "GPUs per node: 4"
 echo ""
 
-# Run full benchmark: binary search for max batch size per model
 python -m benchmarks.benchmark_runner \
-    --models 0.5B 1.5B 3B 7B 14B 32B 72B \
-    --training-types sft grpo \
+    --models 72B \
+    --training-types sft \
     --num-gpus 4 \
+    --num-nodes 2 \
     --sequence-length 2048 \
     --num-steps 10 \
     --find-max-batch \
@@ -53,4 +59,4 @@ fi
 
 echo ""
 echo "End time: $(date)"
-echo "=== Full Benchmark Complete ==="
+echo "=== SFT TP Multi-Node Benchmark Complete ==="

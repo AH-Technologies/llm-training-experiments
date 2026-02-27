@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-SFT benchmark module using TRL's SFTTrainer with FSDP sharding.
+SFT benchmark module using TRL's SFTTrainer.
 
 Runs SFT training via torchrun + TRL to measure throughput and memory usage.
 Uses OpenMathInstruct-2 dataset for realistic throughput measurements.
+
+Supports two backends:
+- FSDP1 (default): for 0.5B-14B models
+- DeepSpeed ZeRO-3 (deepspeed_config): for 72B+ models with full CPU offload
 
 Throughput is calculated as TRAINED tokens/sec (response tokens only),
 not total processed tokens, for accurate comparison.
@@ -50,6 +54,8 @@ def run_sft_benchmark(
     val_file: str = None,
     num_nodes: int = 1,
     offload: bool = False,
+    tp_degree: int = 1,
+    deepspeed_config: str = None,
 ) -> dict:
     """
     Run SFT benchmark via TRL's SFTTrainer with FSDP and return metrics.
@@ -72,9 +78,11 @@ def run_sft_benchmark(
     train_file = train_file or str(project_dir / DEFAULT_TRAIN_FILE)
 
     # Calculate micro batch size (account for all GPUs across nodes)
+    # DeepSpeed ZeRO-3: all GPUs are DP (no TP), same as FSDP with tp=1
     # Cap at 8 to avoid activation memory OOM — excess is handled via gradient accumulation
     total_gpus = num_gpus * num_nodes
-    micro_batch_size = min(8, max(1, batch_size // (total_gpus * gradient_accumulation)))
+    dp_size = total_gpus if deepspeed_config else total_gpus // tp_degree
+    micro_batch_size = min(8, max(1, batch_size // (dp_size * gradient_accumulation)))
 
     # Get multi-node settings from environment (set by SLURM)
     master_addr = os.environ.get("MASTER_ADDR", "localhost")
@@ -124,7 +132,9 @@ def run_sft_benchmark(
             "--metrics-file", str(metrics_file),
             "--output-dir", str(benchmark_tmpdir / "output"),
         ]
-        if offload:
+        if deepspeed_config:
+            cmd += ["--deepspeed", deepspeed_config]
+        elif offload:
             cmd.append("--offload")
 
         env = os.environ.copy()
