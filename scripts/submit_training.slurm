@@ -1,17 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=rlvr-grokking
-#SBATCH --account=share-ie-idi
+#SBATCH --account=nn12068k
 #SBATCH --time=46:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=h100:4
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=16G
-#SBATCH --partition=GPUQ
+#SBATCH --partition=accel
 #SBATCH --output=logs/slurm-%j.out
 #SBATCH --error=logs/slurm-%j.err
 
-# RLVR GRPO Training on IDUN HPC (H100)
+# RLVR GRPO Training (H200)
 #
 # Usage:
 #   sbatch scripts/submit_training.slurm pi13_math500
@@ -19,7 +19,6 @@
 #   sbatch scripts/submit_training.slurm ber
 #   sbatch scripts/submit_training.slurm ber MULTI_PROMPT_VAL=1
 #   sbatch scripts/submit_training.slurm astar_sft
-#   sbatch --gpus-per-node=h100:8 scripts/submit_training.slurm pi13_math500
 
 set -e
 
@@ -42,9 +41,15 @@ mkdir -p logs checkpoints data
 # Load modules - Python only (our venv has PyTorch/vLLM)
 module load Python/3.12.3-GCCcore-13.3.0
 
-# Activate virtual environment
-PROJECT_DIR=/cluster/home/alexaau/llm-training-experiments
-source $PROJECT_DIR/venv/bin/activate
+# Project directory
+PROJECT_DIR=/cluster/projects/nn12068k/alexaau/llm-training-experiments
+
+# Activate virtual environment (if it exists)
+if [ -d "$PROJECT_DIR/venv" ]; then
+    source $PROJECT_DIR/venv/bin/activate
+elif [ -d "$HOME/venv" ]; then
+    source $HOME/venv/bin/activate
+fi
 
 # Load .env file (contains WANDB_API_KEY, etc.)
 if [ -f "$PROJECT_DIR/.env" ]; then
@@ -54,10 +59,9 @@ if [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 # Environment variables
-# Reuse shared HuggingFace cache (models already downloaded)
-export HF_HOME=/cluster/projects/itea_lille-idi-epic-studenter/ah-technologies/.cache/huggingface
+export HF_HOME=$HOME/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
-export HF_DATASETS_CACHE=$PROJECT_DIR/.cache/datasets_$(whoami)
+export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
 export HF_TOKEN=${HF_TOKEN:-""}
 export TOKENIZERS_PARALLELISM=false
@@ -71,7 +75,9 @@ export NCCL_IB_DISABLE=0
 export VLLM_USE_V1=1
 
 # Tiktoken encoding files for offline use (openai_harmony/vLLM needs these)
-export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
+if [ -d "$PROJECT_DIR/tiktoken_encodings" ]; then
+    export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
+fi
 
 # Verify environment
 echo ""
