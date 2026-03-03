@@ -51,7 +51,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 from ..rewards.deepscaler_reward import compute_score as grade_solution
-from .prompts import STUDENT1_SYSTEM, STUDENT2_PROMPT, TEACHER_PROMPT
+from .prompts import TEACHER_PROMPT_TEMPLATE
 from .rewards import compute_self_teach_rewards
 
 
@@ -73,6 +73,9 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
     def __init__(self, *args, self_teach_config: Optional[SelfTeachConfig] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.self_teach_config = self_teach_config or SelfTeachConfig()
+        # Derive A2 prompt budget from configured max_prompt_length so prompts
+        # fit within the padding target used by the agent loop.
+        self.max_a2_prompt_tokens = self.config.data.max_prompt_length
         if self.self_teach_config.enabled:
             if self.config.reward_model.get("launch_reward_fn_async", False):
                 raise ValueError(
@@ -84,7 +87,50 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _build_gen_batch(self, raw_prompts: list, temperature: float, global_steps: int) -> DataProto:
+    # Token budget for the A2 prompt — set dynamically in __init__ from
+    # config.data.max_prompt_length so prompts are padded consistently.
+
+    def _truncate_for_a2(self, a1_text: str, f_text: str, question: str) -> tuple[str, str]:
+        """Truncate A1 and F texts so the A2 prompt fits within context.
+
+        Fixed parts: question plus chat template overhead.
+        The remaining budget is split evenly between A1 and F.
+        """
+        fixed_tokens = len(self.tokenizer.encode(
+            question,
+            add_special_tokens=False,
+        )) + 50  # chat template overhead
+
+        available = self.max_a2_prompt_tokens - fixed_tokens
+        per_turn = available // 2
+
+        a1_ids = self.tokenizer.encode(a1_text, add_special_tokens=False)
+        f_ids = self.tokenizer.encode(f_text, add_special_tokens=False)
+
+        if len(a1_ids) + len(f_ids) <= available:
+            return a1_text, f_text
+
+        # Truncate whichever is over budget, giving slack to the other
+        if len(a1_ids) <= per_turn:
+            f_ids = f_ids[:available - len(a1_ids)]
+        elif len(f_ids) <= per_turn:
+            a1_ids = a1_ids[:available - len(f_ids)]
+        else:
+            a1_ids = a1_ids[:per_turn]
+            f_ids = f_ids[:per_turn]
+
+        a1_out = self.tokenizer.decode(a1_ids, skip_special_tokens=True)
+        f_out = self.tokenizer.decode(f_ids, skip_special_tokens=True)
+        return a1_out, f_out
+
+    def _build_gen_batch(
+        self,
+        raw_prompts: list,
+        temperature: float,
+        global_steps: int,
+        data_sources: list[str] | None = None,
+        ground_truths: list[str] | None = None,
+    ) -> DataProto:
         """Build a DataProto for generation from raw prompt message lists.
 
         The agent loop reads raw_prompt from non_tensor_batch and handles
@@ -95,14 +141,23 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 [[{"role": "system", ...}, {"role": "user", ...}], ...]
             temperature: Sampling temperature.
             global_steps: Current training step (for tracing).
+            data_sources: Per-entry data source labels (required by reward loop).
+            ground_truths: Per-entry ground truth answers (required by reward loop).
         """
         n = len(raw_prompts)
+        non_tensors = {
+            "raw_prompt": np.array(raw_prompts, dtype=object),
+        }
+        if data_sources is not None:
+            non_tensors["data_source"] = np.array(data_sources, dtype=object)
+        if ground_truths is not None:
+            non_tensors["reward_model"] = np.array(
+                [{"ground_truth": gt} for gt in ground_truths], dtype=object
+            )
         return DataProto.from_dict(
             # Dummy tensor so DataProto.batch is not None (required for chunk/len)
             tensors={"dummy_tensor": torch.zeros(n, dtype=torch.uint8)},
-            non_tensors={
-                "raw_prompt": np.array(raw_prompts, dtype=object),
-            },
+            non_tensors=non_tensors,
             meta_info={
                 "temperature": temperature,
                 "global_steps": global_steps,
@@ -251,6 +306,64 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         except ImportError:
             pass
 
+    def _log_sample_table(
+        self,
+        question_texts: list[str],
+        a1_texts: list[str],
+        a1_correct: list[bool],
+        f_texts: list[str],
+        a2_texts: list[str],
+        a2_correct: list[bool],
+        rewards: list[float],
+        ground_truths: list[str],
+        n: int,
+        num_samples: int = 3,
+    ):
+        """Log a W&B table with sample prompts/responses for inspection.
+
+        question_texts, a1_texts, a1_correct, f_texts, ground_truths are per-prompt (length bs).
+        a2_texts, a2_correct, rewards are per-rollout (length bs*n).
+        """
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+        except ImportError:
+            return
+
+        table = wandb.Table(
+            columns=[
+                "teacher_prompt", "a2_prompt",
+                "question", "a1", "a1_correct",
+                "feedback", "a2", "a2_correct", "reward",
+            ],
+        )
+        # Log up to num_samples prompts, using the first rollout (j=0) for a2
+        for i in range(min(num_samples, len(question_texts))):
+            teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
+                question=question_texts[i],
+                student_attempt=a1_texts[i],
+                ground_truth=ground_truths[i],
+            )
+            a2_prompt = (
+                f"[USER] {question_texts[i]}\n\n"
+                f"[ASSISTANT] {a1_texts[i]}\n\n"
+                f"[USER] {f_texts[i]}"
+            )
+            table.add_data(
+                teacher_prompt,
+                a2_prompt,
+                question_texts[i],
+                a1_texts[i],
+                a1_correct[i],
+                f_texts[i],
+                a2_texts[i * n],
+                a2_correct[i * n],
+                rewards[i * n],
+            )
+        wandb.log({"self_teach/samples": table}, step=self.global_steps)
+
     # ------------------------------------------------------------------
     # fit() override — 2-phase generation flow
     # ------------------------------------------------------------------
@@ -357,7 +470,10 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     # ==========================================================
                     with marked_timer("gen_a1", timing_raw, color="red"):
                         a1_raw_prompts = list(batch.non_tensor_batch["raw_prompt"])
-                        a1_gen_batch = self._build_gen_batch(a1_raw_prompts, temperature, self.global_steps)
+                        a1_gen_batch = self._build_gen_batch(
+                            a1_raw_prompts, temperature, self.global_steps,
+                            data_sources=data_sources, ground_truths=ground_truths,
+                        )
                         a1_output = self.async_rollout_manager.generate_sequences(a1_gen_batch)
                         timing_raw.update(a1_output.meta_info.get("timing", {}))
                         a1_output.meta_info.pop("timing", None)
@@ -382,27 +498,30 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     with marked_timer("gen_f", timing_raw, color="yellow"):
                         teacher_messages = []
                         for i in range(bs):
+                            teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
+                                question=question_texts[i],
+                                student_attempt=a1_texts[i],
+                                ground_truth=ground_truths[i],
+                            )
                             msgs = [
-                                {"role": "system", "content": STUDENT1_SYSTEM},
-                                {"role": "user", "content": question_texts[i]},
-                                {"role": "assistant", "content": a1_texts[i]},
-                                {
-                                    "role": "user",
-                                    "content": TEACHER_PROMPT.format(
-                                        question=question_texts[i],
-                                        student_answer=a1_texts[i],
-                                    ),
-                                },
+                                {"role": "user", "content": teacher_prompt},
                             ]
                             teacher_messages.append(msgs)
 
                         # Repeat each prompt n times (interleaved)
                         f_raw_prompts = []
-                        for msgs in teacher_messages:
+                        f_data_sources = []
+                        f_ground_truths = []
+                        for i, msgs in enumerate(teacher_messages):
                             for _ in range(n):
                                 f_raw_prompts.append(msgs)
+                                f_data_sources.append(data_sources[i])
+                                f_ground_truths.append(ground_truths[i])
 
-                        f_gen_batch = self._build_gen_batch(f_raw_prompts, temperature, self.global_steps)
+                        f_gen_batch = self._build_gen_batch(
+                            f_raw_prompts, temperature, self.global_steps,
+                            data_sources=f_data_sources, ground_truths=f_ground_truths,
+                        )
                         f_output = self.async_rollout_manager.generate_sequences(f_gen_batch)
                         timing_raw.update(f_output.meta_info.get("timing", {}))
                         f_output.meta_info.pop("timing", None)
@@ -417,27 +536,21 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         s2_grading_messages = []
                         for idx in range(bs * n):
                             i = idx // n  # prompt index
+                            a1_t, f_t = self._truncate_for_a2(
+                                a1_texts[i], f_texts[idx], question_texts[i]
+                            )
                             msgs = [
-                                {"role": "system", "content": STUDENT1_SYSTEM},
                                 {"role": "user", "content": question_texts[i]},
-                                {"role": "assistant", "content": a1_texts[i]},
-                                {
-                                    "role": "user",
-                                    "content": TEACHER_PROMPT.format(
-                                        question=question_texts[i],
-                                        student_answer=a1_texts[i],
-                                    ),
-                                },
-                                {"role": "assistant", "content": f_texts[idx]},
-                                {
-                                    "role": "user",
-                                    "content": STUDENT2_PROMPT.format(feedback=f_texts[idx]),
-                                },
+                                {"role": "assistant", "content": a1_t},
+                                {"role": "user", "content": f_t},
                             ]
                             s2_grading_messages.append(msgs)
 
+                        a2_grading_ds = [data_sources[idx // n] for idx in range(bs * n)]
+                        a2_grading_gt = [ground_truths[idx // n] for idx in range(bs * n)]
                         a2_grading_gen_batch = self._build_gen_batch(
-                            s2_grading_messages, temperature, self.global_steps
+                            s2_grading_messages, temperature, self.global_steps,
+                            data_sources=a2_grading_ds, ground_truths=a2_grading_gt,
                         )
                         a2_grading_output = self.async_rollout_manager.generate_sequences(
                             a2_grading_gen_batch
@@ -473,36 +586,34 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         selected_f_texts = [f_texts[i * n] for i in range(bs)]
 
                         s2_training_messages = []
+                        truncated_a1 = []
+                        truncated_f = []
                         for i in range(bs):
+                            a1_t, f_t = self._truncate_for_a2(
+                                a1_texts[i], selected_f_texts[i], question_texts[i]
+                            )
+                            truncated_a1.append(a1_t)
+                            truncated_f.append(f_t)
                             msgs = [
-                                {"role": "system", "content": STUDENT1_SYSTEM},
                                 {"role": "user", "content": question_texts[i]},
-                                {"role": "assistant", "content": a1_texts[i]},
-                                {
-                                    "role": "user",
-                                    "content": TEACHER_PROMPT.format(
-                                        question=question_texts[i],
-                                        student_answer=a1_texts[i],
-                                    ),
-                                },
-                                {"role": "assistant", "content": selected_f_texts[i]},
-                                {
-                                    "role": "user",
-                                    "content": STUDENT2_PROMPT.format(
-                                        feedback=selected_f_texts[i]
-                                    ),
-                                },
+                                {"role": "assistant", "content": a1_t},
+                                {"role": "user", "content": f_t},
                             ]
                             s2_training_messages.append(msgs)
 
                         # Repeat each prompt n times (interleaved)
                         s2_raw_prompts = []
-                        for msgs in s2_training_messages:
+                        s2_data_sources = []
+                        s2_ground_truths = []
+                        for i, msgs in enumerate(s2_training_messages):
                             for _ in range(n):
                                 s2_raw_prompts.append(msgs)
+                                s2_data_sources.append(data_sources[i])
+                                s2_ground_truths.append(ground_truths[i])
 
                         a2_training_gen_batch = self._build_gen_batch(
-                            s2_raw_prompts, temperature, self.global_steps
+                            s2_raw_prompts, temperature, self.global_steps,
+                            data_sources=s2_data_sources, ground_truths=s2_ground_truths,
                         )
                         a2_training_output = self.async_rollout_manager.generate_sequences(
                             a2_training_gen_batch
@@ -554,6 +665,22 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "student2_mean_reward": sum(student2_rewards) / len(student2_rewards),
                         }
                         self._log_self_teach_metrics(self_teach_metrics, bs * n)
+
+                        test_freq = self.config.trainer.test_freq
+                        if test_freq > 0 and (
+                            is_last_step or self.global_steps % test_freq == 0
+                        ):
+                            self._log_sample_table(
+                                question_texts=question_texts,
+                                a1_texts=truncated_a1,
+                                a1_correct=a1_correct,
+                                f_texts=truncated_f,
+                                a2_texts=a2_training_texts,
+                                a2_correct=a2_training_correct,
+                                rewards=student2_rewards,
+                                ground_truths=ground_truths,
+                                n=n,
+                            )
 
                         # Build teacher entries from step 2 generation output
                         teacher_entries = []

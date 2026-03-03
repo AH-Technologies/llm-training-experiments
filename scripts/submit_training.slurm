@@ -38,7 +38,8 @@ echo "=========================================="
 # Create directories
 mkdir -p logs checkpoints data
 
-# Load modules - Python only (our venv has PyTorch/vLLM)
+# Load modules - NRIS/GPU required on ARM GPU nodes, then Python
+module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Project directory
