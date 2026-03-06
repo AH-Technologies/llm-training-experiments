@@ -20,7 +20,9 @@ for the teacher's quality, since all n copies now share the same context.
 Based on verl v0.2+ RayPPOTrainer with AgentLoop-based generation.
 """
 
+import json
 import os
+import re
 import socket
 import uuid
 from dataclasses import dataclass
@@ -50,9 +52,14 @@ from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
-from ..rewards.deepscaler_reward import compute_score as grade_solution
+from src.rlvr_grokking.rewards.deepscaler_reward import compute_score as grade_solution
 from .prompts import TEACHER_PROMPT_TEMPLATE
 from .rewards import compute_self_teach_rewards
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks from model output."""
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
 
 
 @dataclass
@@ -278,13 +285,16 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         )
         t_mean_reward = metrics_dict.get("teacher_mean_reward", 0.0)
         s2_mean_reward = metrics_dict.get("student2_mean_reward", 0.0)
+        t_leak_count = metrics_dict.get("teacher_leak_count", 0)
+        t_leak_rate = t_leak_count / max(total, 1)
 
         print(
             f"[SelfTeach step {self.global_steps}] "
             f"a1_acc={a1_acc:.3f}, a2_acc={a2_acc:.3f}, "
             f"improve={imp_rate:.3f}, regress={reg_rate:.3f}, "
             f"grading_a2_acc={t_grading_a2_acc:.3f}, "
-            f"teacher_reward={t_mean_reward:.3f}, student2_reward={s2_mean_reward:.3f}"
+            f"teacher_reward={t_mean_reward:.3f}, student2_reward={s2_mean_reward:.3f}, "
+            f"teacher_leak_rate={t_leak_rate:.3f}"
         )
 
         try:
@@ -298,6 +308,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         "self_teach/improvement_rate": imp_rate,
                         "self_teach/regression_rate": reg_rate,
                         "self_teach/teacher_grading_a2_accuracy": t_grading_a2_acc,
+                        "self_teach/teacher_leak_rate": t_leak_rate,
                         "self_teach/phase1_teacher_mean_reward": t_mean_reward,
                         "self_teach/phase2_student2_mean_reward": s2_mean_reward,
                     },
@@ -314,7 +325,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         f_texts: list[str],
         a2_texts: list[str],
         a2_correct: list[bool],
-        rewards: list[float],
+        student_rewards: list[float],
+        teacher_rewards: list[float],
         ground_truths: list[str],
         n: int,
         num_samples: int = 3,
@@ -322,7 +334,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         """Log a W&B table with sample prompts/responses for inspection.
 
         question_texts, a1_texts, a1_correct, f_texts, ground_truths are per-prompt (length bs).
-        a2_texts, a2_correct, rewards are per-rollout (length bs*n).
+        a2_texts, a2_correct, student_rewards, teacher_rewards are per-rollout (length bs*n).
         """
         try:
             import wandb
@@ -335,8 +347,9 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         table = wandb.Table(
             columns=[
                 "teacher_prompt", "a2_prompt",
-                "question", "a1", "a1_correct",
-                "feedback", "a2", "a2_correct", "reward",
+                "question", "ground_truth", "a1", "a1_correct",
+                "feedback", "a2", "a2_correct",
+                "student_reward", "teacher_reward",
             ],
         )
         # Log up to num_samples prompts, using the first rollout (j=0) for a2
@@ -355,14 +368,64 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 teacher_prompt,
                 a2_prompt,
                 question_texts[i],
+                ground_truths[i],
                 a1_texts[i],
                 a1_correct[i],
                 f_texts[i],
                 a2_texts[i * n],
                 a2_correct[i * n],
-                rewards[i * n],
+                student_rewards[i * n],
+                teacher_rewards[i * n],
             )
         wandb.log({"self_teach/samples": table}, step=self.global_steps)
+
+    def _log_teacher_jsonl(
+        self,
+        question_texts: list[str],
+        a1_texts: list[str],
+        a1_correct: list[bool],
+        ground_truths: list[str],
+        f_texts: list[str],
+        a2_grading_texts: list[str],
+        a2_grading_correct: list[bool],
+        teacher_rewards: list[float],
+        n: int,
+        step: int,
+    ):
+        """Append one JSONL record per teacher sample for reward-hacking analysis."""
+        if not hasattr(self, "_teacher_log_path"):
+            from datetime import datetime
+            log_dir = os.path.join(
+                self.config.trainer.default_local_dir, "teacher_logs"
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._teacher_log_path = os.path.join(log_dir, f"teacher_log_{ts}.jsonl")
+        log_path = self._teacher_log_path
+
+        with open(log_path, "a") as f:
+            for idx in range(len(f_texts)):
+                i = idx // n  # prompt index
+                teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
+                    question=question_texts[i],
+                    student_attempt=a1_texts[i],
+                    ground_truth=ground_truths[i],
+                )
+                record = {
+                    "step": step,
+                    "prompt_idx": i,
+                    "rollout_idx": idx % n,
+                    "question": question_texts[i],
+                    "ground_truth": ground_truths[i],
+                    "a1_text": a1_texts[i],
+                    "a1_correct": a1_correct[i],
+                    "teacher_prompt": teacher_prompt,
+                    "teacher_response": f_texts[idx],
+                    "a2_grading_text": a2_grading_texts[idx],
+                    "a2_grading_correct": a2_grading_correct[idx],
+                    "teacher_reward": teacher_rewards[idx],
+                }
+                f.write(json.dumps(record) + "\n")
 
     # ------------------------------------------------------------------
     # fit() override — 2-phase generation flow
@@ -485,10 +548,13 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     for i in range(bs):
                         score = grade_solution(
                             data_source=data_sources[i],
-                            solution_str=a1_texts[i],
+                            solution_str=strip_think_blocks(a1_texts[i]),
                             ground_truth=ground_truths[i],
                         )
                         a1_correct.append(score >= 0.5)
+
+                    # Strip thinking from A₁ for use in all downstream prompts
+                    a1_texts_clean = [strip_think_blocks(t) for t in a1_texts]
 
                     # ==========================================================
                     # Step 2: Generate F (teacher feedback) — bs*n entries
@@ -500,7 +566,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         for i in range(bs):
                             teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
                                 question=question_texts[i],
-                                student_attempt=a1_texts[i],
+                                student_attempt=a1_texts_clean[i],
                                 ground_truth=ground_truths[i],
                             )
                             msgs = [
@@ -537,7 +603,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         for idx in range(bs * n):
                             i = idx // n  # prompt index
                             a1_t, f_t = self._truncate_for_a2(
-                                a1_texts[i], f_texts[idx], question_texts[i]
+                                a1_texts_clean[i], strip_think_blocks(f_texts[idx]), question_texts[i]
                             )
                             msgs = [
                                 {"role": "user", "content": question_texts[i]},
@@ -562,19 +628,43 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
 
                     # Grade A₂ → compute teacher rewards
                     teacher_rewards = []
+                    a2_grading_correct = []
                     a2_grading_correct_count = 0
                     for idx in range(bs * n):
                         i = idx // n
                         score = grade_solution(
                             data_source=data_sources[i],
-                            solution_str=a2_grading_texts[idx],
+                            solution_str=strip_think_blocks(a2_grading_texts[idx]),
                             ground_truth=ground_truths[i],
                         )
                         a2_correct_flag = score >= 0.5
+                        a2_grading_correct.append(a2_correct_flag)
                         if a2_correct_flag:
                             a2_grading_correct_count += 1
                         t_reward, _ = compute_self_teach_rewards(a1_correct[i], a2_correct_flag)
                         teacher_rewards.append(t_reward)
+
+                    # Penalize teacher for leaking answer (reward hacking detection)
+                    teacher_leak_count = 0
+                    for idx in range(bs * n):
+                        f_visible = strip_think_blocks(f_texts[idx])
+                        if "\\boxed{" in f_visible:
+                            teacher_rewards[idx] = -1.0
+                            teacher_leak_count += 1
+
+                    # Log all teacher prompt-response pairs for reward-hacking analysis
+                    self._log_teacher_jsonl(
+                        question_texts=question_texts,
+                        a1_texts=a1_texts_clean,
+                        a1_correct=a1_correct,
+                        ground_truths=ground_truths,
+                        f_texts=f_texts,
+                        a2_grading_texts=a2_grading_texts,
+                        a2_grading_correct=a2_grading_correct,
+                        teacher_rewards=teacher_rewards,
+                        n=n,
+                        step=self.global_steps,
+                    )
 
                     # ==========================================================
                     # Step 4: Generate A₂ for student₂ training — bs*n entries
@@ -590,7 +680,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         truncated_f = []
                         for i in range(bs):
                             a1_t, f_t = self._truncate_for_a2(
-                                a1_texts[i], selected_f_texts[i], question_texts[i]
+                                a1_texts_clean[i], strip_think_blocks(selected_f_texts[i]), question_texts[i]
                             )
                             truncated_a1.append(a1_t)
                             truncated_f.append(f_t)
@@ -630,7 +720,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         i = idx // n
                         score = grade_solution(
                             data_source=data_sources[i],
-                            solution_str=a2_training_texts[idx],
+                            solution_str=strip_think_blocks(a2_training_texts[idx]),
                             ground_truth=ground_truths[i],
                         )
                         a2_correct_flag = score >= 0.5
@@ -661,6 +751,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "regression_count": regression_count,
                             "teacher_grading_a2_correct_count": a2_grading_correct_count,
                             "teacher_grading_total": bs * n,
+                            "teacher_leak_count": teacher_leak_count,
                             "teacher_mean_reward": sum(teacher_rewards) / len(teacher_rewards),
                             "student2_mean_reward": sum(student2_rewards) / len(student2_rewards),
                         }
@@ -677,7 +768,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 f_texts=truncated_f,
                                 a2_texts=a2_training_texts,
                                 a2_correct=a2_training_correct,
-                                rewards=student2_rewards,
+                                student_rewards=student2_rewards,
+                                teacher_rewards=teacher_rewards,
                                 ground_truths=ground_truths,
                                 n=n,
                             )

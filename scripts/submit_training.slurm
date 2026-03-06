@@ -60,7 +60,7 @@ if [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 # Environment variables
-export HF_HOME=$HOME/.cache/huggingface
+export HF_HOME=/cluster/projects/nn12068k/alexaau/llm-training-experiments/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
@@ -203,20 +203,16 @@ elif [ "$TASK" == "astar_sft" ]; then
 
     TRAIN_SCRIPT="scripts/run_sft_astar.sh"
 elif [ "$TASK" == "self_teach" ]; then
-    # Self-Teach: Student-Teacher self-play GRPO
+    # Self-Teach: Student-Teacher self-play GRPO on s1K verifiable
     # 3-turn pipeline with trajectory splitting into separate GRPO groups
-    echo "Regenerating π13 dataset with 128 duplicates..."
-    python scripts/prepare_pi13_data.py --output-dir ./data --copies 128
-    if [ ! -f "data/math500.parquet" ]; then
-        echo "ERROR: Math500 data file must be present in ./data/"
+    if [ ! -f "data/s1K/s1k_train.parquet" ] || [ ! -f "data/s1K/s1k_test.parquet" ]; then
+        echo "ERROR: s1K split files not found. Run: python3.12 data/s1K/split_train_test.py"
         exit 1
     fi
 
-    # Prepare self-teach data (adds interaction_kwargs)
-    echo "Preparing self-teach data..."
-    python scripts/prepare_self_teach_data.py \
-        --input data/pi13_r128.parquet \
-        --output data/pi13_r128_self_teach.parquet
+    # Convert s1K to verl format with interaction_kwargs
+    echo "Preparing s1K data for self-teach..."
+    python scripts/prepare_s1k_self_teach.py
 
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 else

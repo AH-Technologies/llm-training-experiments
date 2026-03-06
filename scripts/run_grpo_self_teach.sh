@@ -12,29 +12,30 @@ set -x
 
 unset ROCR_VISIBLE_DEVICES
 
-MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
+MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 DATA_DIR=${DATA_DIR:-"./data"}
-TRAIN_FILE="${DATA_DIR}/pi13_r128_self_teach.parquet"
-VAL_FILE="${DATA_DIR}/math500.parquet"
+TRAIN_FILE="${DATA_DIR}/s1K/s1k_train_verl.parquet"
+VAL_FILE="${DATA_DIR}/s1K/s1k_test_verl.parquet"
 
 PROJECT_DIR=$(cd "$(dirname "$0")/.."; pwd)
 
-python3 -m src.rlvr_grokking.self_teach.main \
+python3 -m src.self_teach.main \
     algorithm.adv_estimator=grpo \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${VAL_FILE} \
-    data.train_batch_size=128 \
+    data.train_batch_size=32 \
     data.val_batch_size=500 \
     data.max_prompt_length=3072 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=${MODEL} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=4e-6 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000 \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -62,7 +63,7 @@ python3 -m src.rlvr_grokking.self_teach.main \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
-    trainer.experiment_name='self_teach_pi13' \
+    trainer.experiment_name='self_teach_s1k_qwen3' \
     trainer.n_gpus_per_node=${SLURM_GPUS_ON_NODE:-4} \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

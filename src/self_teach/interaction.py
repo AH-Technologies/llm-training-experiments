@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from verl.interactions.base import BaseInteraction
 
-from ..rewards.deepscaler_reward import compute_score
+from src.rlvr_grokking.rewards.deepscaler_reward import compute_score
 from .prompts import TEACHER_PROMPT, STUDENT2_PROMPT
 from .rewards import compute_self_teach_rewards
 

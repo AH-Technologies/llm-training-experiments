@@ -60,7 +60,7 @@ def patch_model_config(model_name: str, cache_dir: str = None):
     return patched
 
 if __name__ == "__main__":
-    model_name = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen2.5-Math-1.5B"
+    model_name = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-4B"
     cache_dir = os.environ.get("HF_HOME")
 
     print(f"Patching model config for: {model_name}")
