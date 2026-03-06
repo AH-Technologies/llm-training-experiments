@@ -12,7 +12,7 @@ Benchmark suite for measuring model training capacity and throughput on the Oliv
 
 Olivia HPC `accel` partition:
 - **76 nodes** × 4 GH200 GPUs = 304 total GPUs
-- **Per GPU**: 120GB HBM3 memory
+- **Per GPU**: 96GB usable HBM3 memory (GH200 superchip)
 - **Per node**: 288 CPUs, ~808GB RAM
 
 ## Quick Start
@@ -27,20 +27,53 @@ This downloads [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenM
 
 ### 2. Run Benchmarks
 
-**Test single model:**
+The benchmark suite is split by strategy and scale:
+
+**FSDP (small models, 1 node):**
 ```bash
-sbatch benchmarks/scripts/submit_benchmark.slurm --models 1.5B --training-types sft
+sbatch benchmarks/scripts/sft_fsdp_singlenode.slurm    # SFT: 0.5B, 1.5B, 3B, 7B
+sbatch benchmarks/scripts/grpo_fsdp_singlenode.slurm   # GRPO: 0.5B, 1.5B, 3B
 ```
 
-**Find optimal batch size:**
+**Megatron (mid/large models):**
 ```bash
-sbatch benchmarks/scripts/submit_benchmark.slurm --models 7B --training-types sft grpo --find-optimal
+# Single node (4 GPUs)
+sbatch benchmarks/scripts/sft_megatron_singlenode.slurm    # SFT: 14B, 32B
+sbatch benchmarks/scripts/grpo_megatron_singlenode.slurm   # GRPO: 7B, 14B, 32B
+
+# 2 nodes (8 GPUs)
+sbatch benchmarks/scripts/sft_megatron_2node.slurm         # SFT: 32B
+sbatch benchmarks/scripts/grpo_megatron_2node.slurm        # GRPO: 32B
+
+# 4 nodes (16 GPUs)
+sbatch benchmarks/scripts/sft_megatron_72b_4node.slurm     # SFT: 72B
+sbatch benchmarks/scripts/grpo_megatron_4node.slurm        # GRPO: 72B
 ```
 
-**Full benchmark suite:**
-```bash
-sbatch benchmarks/scripts/submit_full_benchmark.slurm
-```
+## Strategies
+
+| Strategy | Backend | Used For |
+|----------|---------|----------|
+| `auto` (default) | torchtune FSDP2+TP (SFT), FSDP (GRPO) | Small models (≤7B SFT, ≤3B GRPO) |
+| `megatron` | Megatron-LM TP+PP via verl | Mid/large models (14B+ SFT, 7B+ GRPO) |
+| `deepspeed` | TRL ZeRO-3 + CPU offload | Legacy fallback |
+
+## Parallelism Configs
+
+### Megatron SFT (TP+PP)
+| Model | 4 GPUs (1 node) | 8 GPUs (2 nodes) | 16 GPUs (4 nodes) |
+|-------|-----------------|-------------------|---------------------|
+| 14B   | TP=2, DP=2      | TP=4, DP=2        | —                   |
+| 32B   | TP=4            | TP=4, DP=2        | —                   |
+| 72B   | —               | TP=4, PP=2        | TP=4, PP=4          |
+
+### Megatron GRPO (TP+PP)
+| Model | 4 GPUs (1 node) | 8 GPUs (2 nodes) | 16 GPUs (4 nodes) |
+|-------|-----------------|-------------------|---------------------|
+| 7B    | TP=2, DP=2      | TP=4, DP=2        | —                   |
+| 14B   | TP=4            | TP=4, DP=2        | —                   |
+| 32B   | TP=4            | TP=4, DP=2        | —                   |
+| 72B   | —               | TP=4, PP=2        | TP=4, PP=2, DP=2    |
 
 ## Datasets
 
@@ -101,19 +134,19 @@ Example:
 python -m benchmarks.benchmark_runner [OPTIONS]
 
 Options:
-  --models              Model sizes: 0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B, 120B, 235B, or "all"
+  --models              Model sizes: 0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B, or "all"
   --training-types      Training methods: sft, grpo, or "all"
   --num-gpus            GPUs per node (default: 4)
   --num-nodes           Number of nodes (default: 1)
   --sequence-length     Token sequence length (default: 2048)
   --num-steps           Training steps per benchmark (default: 50)
-  --find-optimal        Find max batch size, then test range for optimal throughput
-  --find-max-batch      Only find max batch size (no throughput sweep)
+  --strategy            auto, torchtune, megatron, or deepspeed (default: auto)
+  --find-max-batch      Find max batch size via binary search
   --output-dir          Results directory (default: benchmarks/results)
 
 GRPO-specific options:
   --grpo-test-both-offload  Test both with and without CPU offloading
-  --actor-offload           Enable CPU offloading for actor model
+  --no-offload              Disable CPU offloading for actor model
   --no-ref-offload          Disable CPU offloading for reference model
 ```
 
@@ -129,47 +162,51 @@ GRPO requires both an actor model (trainable) and a reference model (frozen for 
 
 **Recommendation**: Start with default (`ref` offload). Use `--grpo-test-both-offload` to compare.
 
-## Expected Results
-
-Example output for supervisor's report:
-
-```
-Hardware: 4x GH200 120GB (1 node)
-Dataset: OpenMathInstruct-2 (SFT), MATH500 (GRPO)
-Sequence length: 2048
-
-=== Maximum Model Size ===
-| Method | Max Model | Notes |
-|--------|-----------|-------|
-| SFT    | 32B       | Single node |
-| GRPO   | 14B       | Actor + Ref + vLLM overhead |
-
-=== Optimal Throughput (7B model) ===
-| Method | Optimal Batch | Trained Tok/s |
-|--------|---------------|---------------|
-| SFT    | 32            | 12,500        |
-| GRPO   | 8             | 3,200         |
-
-=== Scaling ===
-| Model | SFT Tok/s | GRPO Tok/s | GRPO/SFT |
-|-------|-----------|------------|----------|
-| 1.5B  | 35,000    | 8,500      | 0.24x    |
-| 7B    | 12,500    | 3,200      | 0.26x    |
-| 14B   | 6,800     | 1,500      | 0.22x    |
-```
-
 ## Files
 
 ```
 benchmarks/
 ├── benchmark_runner.py          # Main orchestrator
-├── sft_benchmark.py             # SFT via verl fsdp_sft_trainer
+├── sft_benchmark.py             # SFT (torchtune FSDP2 + Megatron backends)
+├── sft_torchtune_worker.py      # torchtune FSDP2+TP worker
 ├── grpo_benchmark.py            # GRPO via verl main_ppo
+├── gpu_monitor.py               # Peak GPU memory tracking
+├── simple_reward.py             # Dummy reward function for GRPO benchmarks
+├── estimate_memory_v2.py        # Memory estimation formulas & plots
+├── estimate_nodes_v2.py         # Minimum node estimation & plots
 ├── prepare_benchmark_data.py    # Download & analyze datasets
+├── MEMORY_ESTIMATION_METHOD.md  # Detailed methodology documentation
+├── configs/
+│   └── ds_zero3_offload.json    # DeepSpeed ZeRO-3 config
 ├── scripts/
 │   ├── download_benchmark_data.slurm
-│   ├── submit_benchmark.slurm
-│   ├── submit_full_benchmark.slurm
-│   └── submit_multinode.slurm
+│   ├── sft_fsdp_singlenode.slurm        # FSDP SFT: 0.5B–7B, 1 node
+│   ├── grpo_fsdp_singlenode.slurm       # FSDP GRPO: 0.5B–3B, 1 node
+│   ├── sft_megatron_singlenode.slurm    # Megatron SFT: 14B, 32B, 1 node
+│   ├── sft_megatron_2node.slurm         # Megatron SFT: 32B, 2 nodes
+│   ├── sft_megatron_72b_4node.slurm     # Megatron SFT: 72B, 4 nodes
+│   ├── grpo_megatron_singlenode.slurm   # Megatron GRPO: 7B–32B, 1 node
+│   ├── grpo_megatron_2node.slurm        # Megatron GRPO: 32B, 2 nodes
+│   └── grpo_megatron_4node.slurm        # Megatron GRPO: 72B, 4 nodes
 └── results/                     # CSV/JSON output
 ```
+
+## Memory & Node Estimation
+
+Analytical memory estimators for planning training runs without GPU access:
+
+```bash
+# Estimate memory for N GPUs (generates SFT + GRPO plots)
+srun ... python -m benchmarks.estimate_memory_v2 --num-gpus 16
+
+# Find minimum nodes needed for each model size
+srun ... python -m benchmarks.estimate_nodes_v2
+```
+
+Key features:
+- **Megatron TP+PP**: TP capped at gpus_per_node (4), PP searched automatically across nodes
+- **Three SFT offload modes**: No offload, optimizer offload, full offload
+- **GRPO phase-based**: Estimates rollout, ref, actor, and weight sync phases
+- **CPU memory tracking**: Per-node CPU with OS baseline, loading peak, process overhead
+
+See [MEMORY_ESTIMATION_METHOD.md](MEMORY_ESTIMATION_METHOD.md) for detailed formulas.

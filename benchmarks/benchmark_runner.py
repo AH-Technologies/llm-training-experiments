@@ -28,9 +28,10 @@ import torch
 @dataclass
 class ParallelismConfig:
     """Parallelism configuration for a benchmark run."""
-    strategy: str = "fsdp"  # "fsdp" or "deepspeed"
-    tp: int = 1             # Tensor parallelism degree (SFT: training TP, GRPO: vLLM TP)
-    pp: int = 1             # Pipeline parallelism degree (unused, kept for result schema)
+    strategy: str = "fsdp"      # "fsdp", "deepspeed", "torchtune", or "megatron"
+    tp: int = 1                  # Tensor parallelism degree (SFT: training TP, GRPO: vLLM/Megatron TP)
+    pp: int = 1                  # Pipeline parallelism degree (Megatron PP)
+    cpu_offload: bool = False    # Offload optimizer states to CPU (torchtune FSDP2 only)
 
 
 # Parallelism configs per training type.
@@ -51,27 +52,81 @@ GRPO_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
 }
 
 SFT_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
-    # 0.5B–14B: FSDP-only, no TP
-    "0.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    "1.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    "3B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    "7B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    "14B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    # 32B: FSDP with offload (no TP needed with enough GPUs)
-    "32B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    # 72B+: DeepSpeed ZeRO-3 with full CPU offload (no TP, shards across all GPUs)
-    "72B":  {4: ParallelismConfig(strategy="deepspeed"), 8: ParallelismConfig(strategy="deepspeed")},
-    "180B": {16: ParallelismConfig(strategy="deepspeed"), 32: ParallelismConfig(strategy="deepspeed")},
+    # torchtune FSDP2+TP: unified strategy for all model sizes.
+    # GPU count is minimum feasible: FSDP2 states = 16P/N bytes per GPU (no CPU offload).
+    # TP shards activations within a node (T ≤ gpus_per_node = 4).
+    #
+    # Memory estimates (16P/N + ~activations/T):
+    #   0.5B–14B: 4 GPUs, T=1  (states: 2–56 GB → fits in 120 GB)
+    #   32B: 8 GPUs, T=2       (states: 64 GB + act/2 → fits)
+    #   72B: 8 GPUs, T=4, cpu_offload=True  (optimizer on CPU; GPU: act/4 + 18+18 GB)
+    #        16 GPUs, T=4                   (states: 72 GB GPU → fits at 120 GB)
+    #   180B: 64 GPUs, T=4     (states: 45 GB + act/4 → fits)
+    #
+    # Checkpoint loading uses _load_from_rank0_broadcast (broadcast + local chunk)
+    # instead of torchtune's distribute_tensor (NCCL scatter), which failed for 2D
+    # FSDP2+TP DTensors in torchtune 0.6.x without torch.distributed.checkpoint.
+    "0.5B": {4:  ParallelismConfig(strategy="torchtune", tp=1),
+             8:  ParallelismConfig(strategy="torchtune", tp=1)},
+    "1.5B": {4:  ParallelismConfig(strategy="torchtune", tp=1),
+             8:  ParallelismConfig(strategy="torchtune", tp=1)},
+    "3B":   {4:  ParallelismConfig(strategy="torchtune", tp=1),
+             8:  ParallelismConfig(strategy="torchtune", tp=1)},
+    "7B":   {4:  ParallelismConfig(strategy="torchtune", tp=1),
+             8:  ParallelismConfig(strategy="torchtune", tp=1)},
+    "14B":  {4:  ParallelismConfig(strategy="torchtune", tp=1),
+             8:  ParallelismConfig(strategy="torchtune", tp=2)},
+    "32B":  {8:  ParallelismConfig(strategy="torchtune", tp=2),
+             16: ParallelismConfig(strategy="torchtune", tp=2)},
+    "72B":  {8:  ParallelismConfig(strategy="torchtune", tp=4, cpu_offload=True),   # 2 nodes, TP=4 + CPU offload
+             16: ParallelismConfig(strategy="torchtune", tp=4),                     # 4 nodes, GPU-only
+             32: ParallelismConfig(strategy="torchtune", tp=4)},
+    "180B": {64: ParallelismConfig(strategy="torchtune", tp=4)},
+}
+
+# Megatron-LM GRPO configs: TP+PP parallelism via megatron-core.
+# TP must divide num_attention_heads and stay within a node (max 4 on GH200).
+# Qwen2.5 heads: 0.5B=14, 1.5B=12, 3B=16, 7B=28, 14B=40, 32B=40, 72B=64
+MEGATRON_GRPO_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
+    "0.5B": {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=1)},
+    "1.5B": {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=1)},
+    "3B":   {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=2)},
+    "7B":   {4: ParallelismConfig(strategy="megatron", tp=2), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "14B":  {4: ParallelismConfig(strategy="megatron", tp=4), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "32B":  {4: ParallelismConfig(strategy="megatron", tp=4), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "72B":  {8: ParallelismConfig(strategy="megatron", tp=4, pp=2), 16: ParallelismConfig(strategy="megatron", tp=4, pp=2)},
+}
+
+# Megatron-LM SFT configs: TP+PP parallelism via megatron-core + mbridge.
+# Same TP constraints as GRPO: TP must divide num_attention_heads, stay within node.
+MEGATRON_SFT_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
+    "0.5B": {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=1)},
+    "1.5B": {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=1)},
+    "3B":   {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=2)},
+    "7B":   {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "14B":  {4: ParallelismConfig(strategy="megatron", tp=2), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "32B":  {4: ParallelismConfig(strategy="megatron", tp=4), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "72B":  {8: ParallelismConfig(strategy="megatron", tp=4, pp=2), 16: ParallelismConfig(strategy="megatron", tp=4, pp=4)},
 }
 
 
-def resolve_parallelism(model_size: str, total_gpus: int, training_type: str = "sft") -> ParallelismConfig:
+def resolve_parallelism(model_size: str, total_gpus: int, training_type: str = "sft",
+                        strategy: str = "auto") -> ParallelismConfig:
     """Resolve the parallelism config for a given model, GPU count, and training type.
 
-    For GRPO: Always FSDP. TP field controls vLLM tensor parallelism for generation.
-    For SFT:  FSDP for small models. DeepSpeed ZeRO-3 for 72B+.
+    For GRPO (auto): FSDP. TP field controls vLLM tensor parallelism for generation.
+    For GRPO (megatron): Megatron-LM with TP+PP parallelism.
+    For SFT (auto): torchtune FSDP2+TP for all model sizes.
+    For SFT (megatron): Megatron-LM with TP+PP parallelism via mbridge.
     """
-    configs = GRPO_CONFIGS if training_type == "grpo" else SFT_CONFIGS
+    if strategy == "megatron" and training_type == "grpo":
+        configs = MEGATRON_GRPO_CONFIGS
+    elif strategy == "megatron" and training_type == "sft":
+        configs = MEGATRON_SFT_CONFIGS
+    elif training_type == "grpo":
+        configs = GRPO_CONFIGS
+    else:
+        configs = SFT_CONFIGS
     model_configs = configs.get(model_size, {})
 
     config = model_configs.get(total_gpus)
@@ -387,23 +442,50 @@ def run_single_benchmark(
 
     try:
         if training_type == "sft":
-            # Resolve DeepSpeed config path for "deepspeed" strategy
-            ds_config = None
-            if pc.strategy == "deepspeed":
-                ds_config = str(Path(__file__).parent / "configs" / "ds_zero3_offload.json")
+            if pc.strategy == "megatron":
+                result = _run_sft_megatron_benchmark(
+                    model_name=model_name,
+                    batch_size=batch_size,
+                    num_gpus=num_gpus,
+                    sequence_length=sequence_length,
+                    num_steps=num_steps,
+                    gradient_accumulation=gradient_accumulation,
+                    num_nodes=num_nodes,
+                    tp_degree=pc.tp,
+                    pp_degree=pc.pp,
+                    param_offload=actor_offload,
+                    optimizer_offload=actor_offload,
+                )
+            elif pc.strategy == "torchtune":
+                result = _run_sft_torchtune_benchmark(
+                    model_name=model_name,
+                    batch_size=batch_size,
+                    num_gpus=num_gpus,
+                    sequence_length=sequence_length,
+                    num_steps=num_steps,
+                    gradient_accumulation=gradient_accumulation,
+                    num_nodes=num_nodes,
+                    tp_degree=pc.tp,
+                    cpu_offload=pc.cpu_offload,
+                )
+            else:
+                # Legacy TRL path (fsdp / deepspeed)
+                ds_config = None
+                if pc.strategy == "deepspeed":
+                    ds_config = str(Path(__file__).parent / "configs" / "ds_zero3_offload.json")
 
-            result = _run_sft_benchmark(
-                model_name=model_name,
-                batch_size=batch_size,
-                num_gpus=num_gpus,
-                sequence_length=sequence_length,
-                num_steps=num_steps,
-                gradient_accumulation=gradient_accumulation,
-                num_nodes=num_nodes,
-                offload=actor_offload,
-                tp_degree=pc.tp,
-                deepspeed_config=ds_config,
-            )
+                result = _run_sft_benchmark(
+                    model_name=model_name,
+                    batch_size=batch_size,
+                    num_gpus=num_gpus,
+                    sequence_length=sequence_length,
+                    num_steps=num_steps,
+                    gradient_accumulation=gradient_accumulation,
+                    num_nodes=num_nodes,
+                    offload=actor_offload,
+                    tp_degree=pc.tp,
+                    deepspeed_config=ds_config,
+                )
         elif training_type == "grpo":
             result = _run_grpo_benchmark(
                 model_name=model_name,
@@ -471,6 +553,64 @@ def _run_sft_benchmark(
     )
 
 
+def _run_sft_megatron_benchmark(
+    model_name: str,
+    batch_size: int,
+    num_gpus: int,
+    sequence_length: int,
+    num_steps: int,
+    gradient_accumulation: int = 1,
+    num_nodes: int = 1,
+    tp_degree: int = 1,
+    pp_degree: int = 1,
+    param_offload: bool = True,
+    optimizer_offload: bool = True,
+) -> dict:
+    """Run SFT benchmark via verl Megatron engine + mbridge."""
+    from benchmarks.sft_benchmark import run_sft_megatron_benchmark
+
+    return run_sft_megatron_benchmark(
+        model_name=model_name,
+        batch_size=batch_size,
+        num_gpus=num_gpus,
+        sequence_length=sequence_length,
+        num_steps=num_steps,
+        gradient_accumulation=gradient_accumulation,
+        num_nodes=num_nodes,
+        tp_degree=tp_degree,
+        pp_degree=pp_degree,
+        param_offload=param_offload,
+        optimizer_offload=optimizer_offload,
+    )
+
+
+def _run_sft_torchtune_benchmark(
+    model_name: str,
+    batch_size: int,
+    num_gpus: int,
+    sequence_length: int,
+    num_steps: int,
+    gradient_accumulation: int = 1,
+    num_nodes: int = 1,
+    tp_degree: int = 1,
+    cpu_offload: bool = False,
+) -> dict:
+    """Run SFT benchmark via torchtune FSDP2+TP."""
+    from benchmarks.sft_benchmark import run_sft_torchtune_benchmark
+
+    return run_sft_torchtune_benchmark(
+        model_name=model_name,
+        batch_size=batch_size,
+        num_gpus=num_gpus,
+        sequence_length=sequence_length,
+        num_steps=num_steps,
+        gradient_accumulation=gradient_accumulation,
+        num_nodes=num_nodes,
+        tp_degree=tp_degree,
+        cpu_offload=cpu_offload,
+    )
+
+
 def _run_grpo_benchmark(
     model_name: str,
     batch_size: int,
@@ -500,14 +640,15 @@ def _run_grpo_benchmark(
     )
 
 
-def save_results(results: list[BenchmarkResult], output_dir: Path):
+def save_results(results: list[BenchmarkResult], output_dir: Path, tag: str = ""):
     """Save benchmark results to CSV and JSON."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{tag}" if tag else ""
 
     # Save as CSV
-    csv_path = output_dir / f"benchmark_results_{timestamp}.csv"
+    csv_path = output_dir / f"benchmark_results_{timestamp}{suffix}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=asdict(results[0]).keys())
         writer.writeheader()
@@ -516,12 +657,22 @@ def save_results(results: list[BenchmarkResult], output_dir: Path):
     print(f"Results saved to {csv_path}")
 
     # Save as JSON
-    json_path = output_dir / f"benchmark_results_{timestamp}.json"
+    json_path = output_dir / f"benchmark_results_{timestamp}{suffix}.json"
     with open(json_path, "w") as f:
         json.dump([asdict(r) for r in results], f, indent=2)
     print(f"Results saved to {json_path}")
 
     return csv_path, json_path
+
+
+def save_results_incremental(results: list[BenchmarkResult], output_dir: Path, tag: str = ""):
+    """Save intermediate results to a stable file that gets updated after each model."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{tag}" if tag else ""
+    json_path = output_dir / f"benchmark_results_incremental{suffix}.json"
+    with open(json_path, "w") as f:
+        json.dump([asdict(r) for r in results], f, indent=2)
+    print(f"Incremental results saved to {json_path} ({len(results)} entries)")
 
 
 def print_summary(results: list[BenchmarkResult]):
@@ -657,11 +808,13 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["fsdp", "deepspeed", "auto"],
+        choices=["deepspeed", "torchtune", "megatron", "auto"],
         default="auto",
-        help="Parallelism strategy: fsdp (always FSDP, no TP), "
-             "deepspeed (ZeRO-3 + CPU offload), "
-             "auto (use lookup table based on model size and training type). Default: auto",
+        help="Parallelism strategy: "
+             "torchtune (FSDP2+TP, unified SFT for all model sizes — default for SFT), "
+             "deepspeed (TRL ZeRO-3 + CPU offload), "
+             "megatron (Megatron-LM TP+PP), "
+             "auto (use lookup table). Default: auto",
     )
 
     args = parser.parse_args()
@@ -695,6 +848,7 @@ def main():
         ]
 
     total_gpus = args.num_gpus * args.num_nodes
+    incremental_tag = f"{args.strategy}_{'_'.join(training_types)}_{args.num_nodes}n"
 
     print("="*80)
     print("OLIVIA HPC BENCHMARK")
@@ -717,6 +871,12 @@ def main():
                 pc = ParallelismConfig(strategy="fsdp")
             elif args.strategy == "deepspeed":
                 pc = ParallelismConfig(strategy="deepspeed")
+            elif args.strategy == "torchtune":
+                # Use lookup table for TP degree but force torchtune strategy
+                pc = resolve_parallelism(model_size, total_gpus, training_type)
+                pc = ParallelismConfig(strategy="torchtune", tp=pc.tp)
+            elif args.strategy == "megatron":
+                pc = resolve_parallelism(model_size, total_gpus, training_type, strategy="megatron")
             else:
                 pc = resolve_parallelism(model_size, total_gpus, training_type)
             print(f"\n--- {model_size} {training_type.upper()}: strategy={pc.strategy}, TP={pc.tp}, PP={pc.pp}")
@@ -764,6 +924,10 @@ def main():
         # Clean up model cache after all training types are done for this model
         if args.cleanup_cache:
             cleanup_model_cache(MODELS[model_size])
+
+        # Save incrementally so results survive crashes
+        if results:
+            save_results_incremental(results, args.output_dir, tag=incremental_tag)
 
     # Save and print results
     if results:

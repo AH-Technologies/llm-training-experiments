@@ -152,7 +152,7 @@ def run_grpo_benchmark(
     ref_offload: bool = True,  # CPU offload for reference model (always True by default)
     num_nodes: int = 1,
     gpu_memory_utilization: float = 0.7,  # vLLM GPU memory fraction for KV cache
-    parallelism_config=None,  # Accepted for API compat, GRPO always uses FSDP via verl
+    parallelism_config=None,  # ParallelismConfig: strategy="fsdp" or "megatron"
 ) -> dict:
     """
     Run GRPO benchmark via verl and return metrics.
@@ -204,8 +204,18 @@ def run_grpo_benchmark(
         total_gpus = num_gpus * num_nodes
         ppo_max_token_len_per_gpu = max(16000, batch_size * sequence_length // total_gpus)
 
-        cmd = [
-            "python3", "-m", "verl.trainer.main_ppo",
+        # Determine strategy from parallelism config
+        pc = parallelism_config
+        use_megatron = pc is not None and pc.strategy == "megatron"
+
+        cmd = ["python3", "-m", "verl.trainer.main_ppo"]
+
+        # Use Megatron-specific Hydra config when strategy is megatron
+        if use_megatron:
+            cmd.append("--config-name=ppo_megatron_trainer")
+
+        # Common config (shared between FSDP and Megatron)
+        cmd += [
             "algorithm.adv_estimator=grpo",
             f"data.train_files={train_file}",
             f"data.val_files={val_file}",
@@ -216,43 +226,82 @@ def run_grpo_benchmark(
             "data.filter_overlong_prompts=True",
             "data.truncation=error",
             f"actor_rollout_ref.model.path={model_name}",
-            "actor_rollout_ref.model.use_remove_padding=True",
-            "actor_rollout_ref.model.enable_gradient_checkpointing=True",
             "actor_rollout_ref.actor.optim.lr=1e-6",
             f"actor_rollout_ref.actor.ppo_mini_batch_size={batch_size}",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",
             f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={ppo_max_token_len_per_gpu}",
             "actor_rollout_ref.actor.use_kl_loss=True",
             "actor_rollout_ref.actor.kl_loss_coef=0.001",
-            f"actor_rollout_ref.actor.fsdp_config.param_offload={str(actor_offload)}",
-            f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={str(actor_offload)}",
             "actor_rollout_ref.rollout.name=vllm",
             f"actor_rollout_ref.rollout.n={rollout_n}",
             f"actor_rollout_ref.rollout.temperature={temperature}",
-            "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={gpu_memory_utilization}",
             f"actor_rollout_ref.rollout.max_model_len={sequence_length}",
             "actor_rollout_ref.rollout.enable_chunked_prefill=True",
             "actor_rollout_ref.rollout.enforce_eager=True",
-            f"actor_rollout_ref.ref.fsdp_config.param_offload={str(ref_offload)}",
             "algorithm.kl_ctrl.kl_coef=0.001",
             "algorithm.use_kl_in_reward=False",
-            # Use simple reward for benchmarking
             f"custom_reward_function.path={project_dir}/benchmarks/simple_reward.py",
             "custom_reward_function.name=compute_score",
             "trainer.critic_warmup=0",
             'trainer.logger=["console"]',
             "trainer.project_name=benchmark",
-            "trainer.experiment_name=grpo_benchmark",
             f"trainer.n_gpus_per_node={num_gpus}",
             f"trainer.nnodes={num_nodes}",
-            "trainer.save_freq=-1",  # Don't save checkpoints
+            "trainer.save_freq=-1",
             f"trainer.default_local_dir={tmpdir}/checkpoints",
             "trainer.val_before_train=False",
             "trainer.test_freq=9999",
             f"trainer.total_epochs={num_steps}",
             f"trainer.total_training_steps={num_steps}",
         ]
+
+        # Strategy-specific config
+        if use_megatron:
+            tp = pc.tp if pc else 1
+            pp = pc.pp if pc else 1
+            # Megatron ref requires log_prob_micro_batch_size_per_gpu to be set explicitly
+            ref_micro_bs = max(1, batch_size // total_gpus)
+            cmd += [
+                f"trainer.experiment_name=grpo_megatron_bench",
+                # Megatron actor parallelism
+                f"actor_rollout_ref.actor.megatron.tensor_model_parallel_size={tp}",
+                f"actor_rollout_ref.actor.megatron.pipeline_model_parallel_size={pp}",
+                # Sequence parallel requires Apex FusedLayerNorm or Transformer Engine
+                # (neither installed). Disabled in config_converter.py line 85 patch.
+                # Also set engine config level for consistency.
+                "actor_rollout_ref.actor.megatron.sequence_parallel=False",
+                "actor_rollout_ref.ref.megatron.sequence_parallel=False",
+                "critic.megatron.sequence_parallel=False",
+                # use_remove_padding=True (sequence packing) requires flash-attn package
+                # for megatron's flash attention backend (DotProductAttention doesn't support it)
+                f"actor_rollout_ref.actor.megatron.param_offload={str(actor_offload)}",
+                f"actor_rollout_ref.actor.megatron.optimizer_offload={str(actor_offload)}",
+                # Rollout TP should match actor TP for hybrid engine weight sync
+                f"actor_rollout_ref.rollout.tensor_model_parallel_size={tp}",
+                f"actor_rollout_ref.ref.megatron.param_offload={str(ref_offload)}",
+                # Required for Megatron ref worker (asserts non-None)
+                f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={ref_micro_bs}",
+            ]
+        else:
+            cmd += [
+                f"trainer.experiment_name=grpo_benchmark",
+                "actor_rollout_ref.model.use_remove_padding=True",
+                "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+                f"actor_rollout_ref.actor.fsdp_config.param_offload={str(actor_offload)}",
+                f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={str(actor_offload)}",
+                "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+                f"actor_rollout_ref.ref.fsdp_config.param_offload={str(ref_offload)}",
+            ]
+
+        # For multi-node: connect to pre-existing Ray cluster if RAY_ADDRESS is set.
+        # When connecting to existing cluster, do NOT pass num_cpus/num_gpus (Ray rejects it).
+        ray_address = os.environ.get("RAY_ADDRESS")
+        if ray_address:
+            cmd.append(f"+ray_kwargs.ray_init.address={ray_address}")
+        elif num_nodes == 1:
+            # Single-node: set num_cpus to avoid SLURM CPU sharing conflicts
+            cmd.append(f"ray_kwargs.ray_init.num_cpus={os.cpu_count() or 72}")
 
         # Set up file logger path
         file_logger_path = tmpdir / "grpo_metrics.jsonl"
@@ -262,9 +311,12 @@ def run_grpo_benchmark(
 
         env = os.environ.copy()
         env["VERL_FILE_LOGGER_PATH"] = str(file_logger_path)
+        env["HYDRA_FULL_ERROR"] = "1"
         # Remove ROCR_VISIBLE_DEVICES to prevent conflict with CUDA_VISIBLE_DEVICES
         # that Ray sets for workers. verl raises ValueError if both are set.
+        # Must also unset in current process so Ray workers on other nodes inherit clean env.
         env.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
 
         try:
             with GPUMemoryMonitor(poll_interval=1.0) as gpu_monitor:
@@ -297,7 +349,14 @@ def run_grpo_benchmark(
                             oom_detail = line.strip()
                             break
                     raise torch.cuda.OutOfMemoryError(f"CUDA OOM: {oom_detail or combined_output[-1000:]}")
-                raise RuntimeError(f"GRPO failed: {result.stderr[-1000:]}")
+                # Extract meaningful error from combined output (stderr may be huge with set -x)
+                error_lines = []
+                for line in combined_output.splitlines():
+                    lower = line.lower()
+                    if any(k in lower for k in ["error", "traceback", "assert", "exception", "raise "]):
+                        error_lines.append(line.strip())
+                error_summary = "\n".join(error_lines[-20:]) if error_lines else combined_output[-2000:]
+                raise RuntimeError(f"GRPO failed:\n{error_summary}")
 
             # Three-tier metric extraction:
             # 1. File logger JSONL (most reliable)
