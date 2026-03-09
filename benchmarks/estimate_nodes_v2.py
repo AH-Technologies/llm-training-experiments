@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 
-from benchmarks.estimate_memory import (
+from benchmarks.estimate_memory_v2 import (
     GPUS_PER_NODE,
     REFERENCE_MODELS,
     ModelArch,

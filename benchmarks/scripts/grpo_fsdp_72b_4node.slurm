@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=meg-grpo-4n
+#SBATCH --job-name=fsdp-grpo-72b
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=04:00:00
@@ -7,11 +7,11 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/megatron-grpo-4node-%j.out
-#SBATCH --error=benchmarks/results/megatron-grpo-4node-%j.err
+#SBATCH --output=benchmarks/results/fsdp-grpo-72b-4node-%j.out
+#SBATCH --error=benchmarks/results/fsdp-grpo-72b-4node-%j.err
 
-# Megatron-LM GRPO benchmark for Qwen2.5-72B on 4 nodes (16 GPUs)
-# TP=4, PP=2, DP=2
+# PyTorch FSDP GRPO benchmark: Qwen2.5-72B on 4 nodes (16 GPUs)
+# FSDP for training, vLLM for generation
 # Uses Ray cluster across SLURM nodes for verl multi-node coordination.
 
 set -x
@@ -41,6 +41,7 @@ export NCCL_CUMEM_HOST_ENABLE=0
 export NCCL_CUMEM_ENABLE=0
 # NOTE: Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
 # vLLM's memory pool is incompatible with expandable segments.
+# See https://github.com/pytorch/pytorch/issues/147851
 export NCCL_CROSS_NIC=1
 # Disable Slingshot eager messages — prevents NCCL hangs (CSCS/Isambard docs)
 export FI_CXI_RDZV_GET_MIN=0
@@ -74,13 +75,11 @@ HEAD_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname -i | awk '{print $1
 RAY_PORT=6379
 RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}"
 
-echo "=== Megatron GRPO 72B - 4 Nodes (16 GPUs) ==="
+echo "=== FSDP GRPO 72B - 4 Nodes (16 GPUs) ==="
 echo "Start: $(date)"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "Head node: $HEAD_NODE ($HEAD_IP)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
-
-python -c "import megatron.core; print(f'megatron-core {megatron.core.__version__}')"
 
 # ---- Clean stale Ray state on all nodes ----
 srun --nodes=$SLURM_JOB_NUM_NODES --ntasks=$SLURM_JOB_NUM_NODES \
@@ -116,7 +115,7 @@ sleep 30
 
 # Verify Ray cluster sees all nodes and GPUs
 echo "Ray cluster status (expecting 4 nodes, 16 GPUs):"
-ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed"
+ray status --address="$HEAD_IP:$RAY_PORT"
 python -c "
 import ray
 ray.init(address='$HEAD_IP:$RAY_PORT')
@@ -149,7 +148,7 @@ python -m benchmarks.benchmark_runner \
     --sequence-length 2048 \
     --num-steps 5 \
     --find-max-batch \
-    --strategy megatron \
+    --strategy auto \
     --output-dir benchmarks/results
 
 # Cleanup

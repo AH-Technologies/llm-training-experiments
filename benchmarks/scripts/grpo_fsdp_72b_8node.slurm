@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=meg-grpo-4n
+#SBATCH --job-name=fsdp-grpo-72b-8n
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=04:00:00
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/megatron-grpo-4node-%j.out
-#SBATCH --error=benchmarks/results/megatron-grpo-4node-%j.err
+#SBATCH --output=benchmarks/results/fsdp-grpo-72b-8node-%j.out
+#SBATCH --error=benchmarks/results/fsdp-grpo-72b-8node-%j.err
 
-# Megatron-LM GRPO benchmark for Qwen2.5-72B on 4 nodes (16 GPUs)
-# TP=4, PP=2, DP=2
-# Uses Ray cluster across SLURM nodes for verl multi-node coordination.
+# PyTorch FSDP GRPO benchmark: Qwen2.5-72B on 8 nodes (32 GPUs)
+# 4-node attempt OOM'd (vLLM had no room for KV cache at gpu_mem=0.4).
+# With 8 nodes, DP=8 (TP=4) halves per-GPU FSDP footprint, giving vLLM more room.
 
 set -x
 
@@ -42,7 +42,7 @@ export NCCL_CUMEM_ENABLE=0
 # NOTE: Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
 # vLLM's memory pool is incompatible with expandable segments.
 export NCCL_CROSS_NIC=1
-# Disable Slingshot eager messages — prevents NCCL hangs (CSCS/Isambard docs)
+# Disable Slingshot eager messages — prevents NCCL hangs
 export FI_CXI_RDZV_GET_MIN=0
 export FI_CXI_RDZV_THRESHOLD=0
 export FI_CXI_RDZV_EAGER_SIZE=0
@@ -66,21 +66,16 @@ export LD_LIBRARY_PATH=${MATH_LIBS}:${LD_LIBRARY_PATH}
 unset ROCR_VISIBLE_DEVICES
 
 # Multi-node Ray cluster setup
-# NOTE: Slingshot VNI/SVC_ID credentials are inherited automatically within
-# a single srun step. Do NOT capture them separately — each srun step gets
-# its own credentials, so cross-step credential sharing causes CXI errors.
 HEAD_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 HEAD_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname -i | awk '{print $1}')
 RAY_PORT=6379
 RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}"
 
-echo "=== Megatron GRPO 72B - 4 Nodes (16 GPUs) ==="
+echo "=== FSDP GRPO 72B - 8 Nodes (32 GPUs) ==="
 echo "Start: $(date)"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "Head node: $HEAD_NODE ($HEAD_IP)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
-
-python -c "import megatron.core; print(f'megatron-core {megatron.core.__version__}')"
 
 # ---- Clean stale Ray state on all nodes ----
 srun --nodes=$SLURM_JOB_NUM_NODES --ntasks=$SLURM_JOB_NUM_NODES \
@@ -88,10 +83,6 @@ srun --nodes=$SLURM_JOB_NUM_NODES --ntasks=$SLURM_JOB_NUM_NODES \
 sleep 5
 
 # ---- Start Ray cluster in a SINGLE srun step ----
-# Critical: all Ray processes must share the same srun step so they get
-# identical Slingshot VNI/SVC_ID credentials. Separate srun steps get
-# different CXI service allocations, causing NCCL "Invalid resource domain"
-# errors when actors try cross-node communication.
 echo "Starting Ray cluster (all nodes in single srun step)..."
 srun --nodes=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 --export=ALL \
     bash -c "
@@ -115,8 +106,8 @@ RAY_PIDS=$!
 sleep 30
 
 # Verify Ray cluster sees all nodes and GPUs
-echo "Ray cluster status (expecting 4 nodes, 16 GPUs):"
-ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed"
+echo "Ray cluster status (expecting 8 nodes, 32 GPUs):"
+ray status --address="$HEAD_IP:$RAY_PORT"
 python -c "
 import ray
 ray.init(address='$HEAD_IP:$RAY_PORT')
@@ -125,8 +116,8 @@ print(f'Cluster resources: {resources}')
 num_gpus = resources.get('GPU', 0)
 num_cpus = resources.get('CPU', 0)
 print(f'Total GPUs: {num_gpus}, Total CPUs: {num_cpus}')
-if num_gpus < 16:
-    print(f'WARNING: Expected 16 GPUs but only found {num_gpus}!')
+if num_gpus < 32:
+    print(f'WARNING: Expected 32 GPUs but only found {num_gpus}!')
 ray.shutdown()
 "
 
@@ -145,11 +136,11 @@ python -m benchmarks.benchmark_runner \
     --models 72B \
     --training-types grpo \
     --num-gpus 4 \
-    --num-nodes 4 \
+    --num-nodes 8 \
     --sequence-length 2048 \
     --num-steps 5 \
     --find-max-batch \
-    --strategy megatron \
+    --strategy auto \
     --output-dir benchmarks/results
 
 # Cleanup

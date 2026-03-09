@@ -110,7 +110,9 @@ def setup_distributed(tp_degree: int) -> tuple[dist.ProcessGroup, dist.ProcessGr
 
     Returns (dp_mesh, tp_mesh, local_device).
     """
-    dist.init_process_group(backend="nccl")
+    # Use both NCCL (GPU) and Gloo (CPU) backends. FSDP2 with CPUOffloadPolicy
+    # needs Gloo for CPU-side collectives (e.g. gradient clipping all-reduce).
+    dist.init_process_group(backend="cuda:nccl,cpu:gloo")
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
@@ -257,12 +259,19 @@ def _load_from_rank0_broadcast(
         dist.broadcast(tensor, src=0)
 
         # Shard via distribute_tensor (handles _StridedShard for 2D FSDP2+TP).
-        # Params stay on GPU here — we'll move to CPU after load_state_dict.
         if device_mesh is not None:
             sharded_tensor = distribute_tensor(tensor, device_mesh, placements)
             del tensor
         else:
             sharded_tensor = tensor
+
+        # Move sharded tensor to CPU BEFORE load_state_dict when cpu_offload is
+        # enabled. FSDP2's _validate_cpu_offload_params checks that all params
+        # are on CPU during lazy_init (triggered by load_state_dict with
+        # assign=True). Moving after load_state_dict is too late — the
+        # validation fires first. This matches the torchtune PR #1495 fix.
+        if cpu_offload:
+            sharded_tensor = sharded_tensor.cpu()
 
         sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
 
@@ -270,56 +279,8 @@ def _load_from_rank0_broadcast(
     del sharded_sd
     torch.cuda.empty_cache()
 
-    # --- Workaround for FSDP2 bug: reset_sharded_param doesn't move to CPU ---
-    # _init_sharded_param checks offload_to_cpu and moves to CPU, but it skips
-    # meta tensors. reset_sharded_param (fired by load_state_dict) only moves to
-    # CPU when pin_memory=True. On GH200, pin_memory=True would consume GPU HBM
-    # (unified memory), so we use pin_memory=False and manually move here.
-    if cpu_offload:
-        _offload_fsdp_params_to_cpu(model, is_rank0)
-
     return result
 
-
-def _offload_fsdp_params_to_cpu(model: torch.nn.Module, verbose: bool = False) -> None:
-    """Move all FSDP2-managed _sharded_param_data buffers from GPU to CPU.
-
-    This fixes the gap where reset_sharded_param doesn't offload to CPU
-    when pin_memory=False (PyTorch FSDP2 bug).
-    """
-    moved = 0
-    n_modules = 0
-    n_with_state = 0
-    n_with_group = 0
-    for module in model.modules():
-        n_modules += 1
-        fsdp_state = getattr(module, "_fsdp_state", None)
-        if fsdp_state is None:
-            continue
-        n_with_state += 1
-        param_group = getattr(fsdp_state, "_fsdp_param_group", None)
-        if param_group is None:
-            continue
-        n_with_group += 1
-        for fsdp_param in param_group.fsdp_params:
-            data = fsdp_param._sharded_param_data
-            if data is not None and data.device.type != "cpu":
-                cpu_data = data.to("cpu")
-                fsdp_param._sharded_param_data = cpu_data
-                # Also update the DTensor's local tensor to point to CPU data
-                if hasattr(fsdp_param.sharded_param, '_local_tensor'):
-                    shard_dim = fsdp_param.fsdp_placement.dim
-                    length = fsdp_param.sharded_param._local_tensor.size(shard_dim)
-                    fsdp_param.sharded_param._local_tensor = cpu_data.view(
-                        fsdp_param.padded_sharded_param_size
-                    ).narrow(dim=shard_dim, start=0, length=length)
-                moved += 1
-    torch.cuda.empty_cache()
-    if verbose:
-        gpu_after = torch.cuda.memory_allocated() / 1024**3
-        print(f"[torchtune] Offload: {n_modules} modules, {n_with_state} with _fsdp_state, "
-              f"{n_with_group} with param_group, {moved} params moved to CPU, "
-              f"GPU now {gpu_after:.1f} GB")
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +503,25 @@ def main() -> None:
             loss.backward()
             accum_loss += loss.detach()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # Manual grad clipping: torch.nn.utils.clip_grad_norm_ uses torch.stack
+        # internally which fails when params live on different DTensor meshes
+        # (dp-only vs dp+tp). Compute per-param norms via DTensor (which handles
+        # distributed reduction correctly), then convert to plain tensors before
+        # stacking.
+        from torch.distributed.tensor import DTensor
+        norms = []
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm = p.grad.norm(2.0)
+                if isinstance(grad_norm, DTensor):
+                    grad_norm = grad_norm.full_tensor()
+                norms.append(grad_norm)
+        if norms:
+            total_norm = torch.stack(norms).norm(2.0)
+            clip_coef = torch.clamp(1.0 / (total_norm + 1e-6), max=1.0)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.detach().mul_(clip_coef)
         optimizer.step()
         scheduler.step()
 
