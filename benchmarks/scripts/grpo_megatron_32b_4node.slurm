@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=meg-grpo-4n
+#SBATCH --job-name=meg-grpo-32b-4n
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=04:00:00
@@ -7,11 +7,10 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=benchmarks/results/megatron-grpo-4node-%j.out
-#SBATCH --error=benchmarks/results/megatron-grpo-4node-%j.err
+#SBATCH --output=benchmarks/results/megatron-grpo-32b-4node-%j.out
+#SBATCH --error=benchmarks/results/megatron-grpo-32b-4node-%j.err
 
-# Megatron-LM GRPO benchmark for Qwen2.5-72B on 4 nodes (16 GPUs)
-# TP=4, PP=2, DP=2
+# Megatron-LM GRPO benchmark for Qwen2.5-32B on 4 nodes (16 GPUs)
 # Uses Ray cluster across SLURM nodes for verl multi-node coordination.
 
 set -x
@@ -74,7 +73,7 @@ HEAD_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname -i | awk '{print $1
 RAY_PORT=6379
 RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}"
 
-echo "=== Megatron GRPO 72B - 4 Nodes (16 GPUs) ==="
+echo "=== Megatron GRPO 32B - 4 Nodes (16 GPUs) ==="
 echo "Start: $(date)"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "Head node: $HEAD_NODE ($HEAD_IP)"
@@ -142,7 +141,7 @@ done) &
 MONITOR_PID=$!
 
 python -m benchmarks.benchmark_runner \
-    --models 72B \
+    --models 32B \
     --training-types grpo \
     --num-gpus 4 \
     --num-nodes 4 \

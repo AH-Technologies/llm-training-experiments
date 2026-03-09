@@ -42,9 +42,17 @@ export NCCL_CUMEM_ENABLE=0
 # NOTE: Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
 # vLLM's memory pool is incompatible with expandable segments.
 export NCCL_CROSS_NIC=1
+# Disable Slingshot eager messages — prevents NCCL hangs (CSCS/Isambard docs)
+export FI_CXI_RDZV_GET_MIN=0
+export FI_CXI_RDZV_THRESHOLD=0
+export FI_CXI_RDZV_EAGER_SIZE=0
 export LD_LIBRARY_PATH=/opt/cray/libfabric/1.22.0/lib64:/usr/lib64:${LD_LIBRARY_PATH}
 export CPATH=/opt/cray/libfabric/1.22.0/include:${CPATH}
 export NCCL_DEBUG=WARN
+
+# Disable Ray compiled DAG — hangs with Slingshot (vLLM #26318)
+export VLLM_USE_RAY_COMPILED_DAG=0
+export VLLM_USE_RAY_WRAPPED_PP_COMM=0
 
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
@@ -58,6 +66,9 @@ export LD_LIBRARY_PATH=${MATH_LIBS}:${LD_LIBRARY_PATH}
 unset ROCR_VISIBLE_DEVICES
 
 # Multi-node Ray cluster setup
+# NOTE: Slingshot VNI/SVC_ID credentials are inherited automatically within
+# a single srun step. Do NOT capture them separately — each srun step gets
+# its own credentials, so cross-step credential sharing causes CXI errors.
 HEAD_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 HEAD_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname -i | awk '{print $1}')
 RAY_PORT=6379
@@ -76,39 +87,36 @@ srun --nodes=$SLURM_JOB_NUM_NODES --ntasks=$SLURM_JOB_NUM_NODES \
     ray stop 2>/dev/null || true
 sleep 5
 
-# ---- Start Ray head on head node ----
-# Use srun so Ray gets the same networking context as workers.
-# Unset ROCR_VISIBLE_DEVICES inside srun context — SLURM re-injects it,
-# and verl raises ValueError if both ROCR and CUDA VISIBLE_DEVICES are set.
-echo "Starting Ray head on $HEAD_NODE ($HEAD_IP)..."
-srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" --export=ALL \
-    bash -c "unset ROCR_VISIBLE_DEVICES; exec ray start --head \
-    --node-ip-address='$HEAD_IP' \
-    --port=$RAY_PORT \
-    --temp-dir='$RAY_TEMP_DIR' \
-    --num-cpus=72 --num-gpus=4 --block" &
+# ---- Start Ray cluster in a SINGLE srun step ----
+# Critical: all Ray processes must share the same srun step so they get
+# identical Slingshot VNI/SVC_ID credentials. Separate srun steps get
+# different CXI service allocations, causing NCCL "Invalid resource domain"
+# errors when actors try cross-node communication.
+echo "Starting Ray cluster (all nodes in single srun step)..."
+srun --nodes=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 --export=ALL \
+    bash -c "
+        unset ROCR_VISIBLE_DEVICES
+        if [ \"\$SLURM_NODEID\" -eq 0 ]; then
+            echo \"[Ray] Starting head on \$(hostname) (\$SLURM_NODEID)\"
+            ray start --head \
+                --node-ip-address='$HEAD_IP' \
+                --port=$RAY_PORT \
+                --temp-dir='$RAY_TEMP_DIR' \
+                --num-cpus=72 --num-gpus=4 --block
+        else
+            echo \"[Ray] Starting worker on \$(hostname) (\$SLURM_NODEID), waiting for head...\"
+            sleep 20
+            ray start --address='$HEAD_IP:$RAY_PORT' \
+                --temp-dir='$RAY_TEMP_DIR' \
+                --num-cpus=72 --num-gpus=4 --block
+        fi
+    " &
 RAY_PIDS=$!
-sleep 20
-
-# Verify head is up
-echo "Checking Ray head..."
-ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed, head may not be ready"
-
-# ---- Start Ray workers on all other nodes ----
-WORKER_NODES=$(scontrol show hostnames $SLURM_JOB_NODELIST | tail -n +2)
-for node in $WORKER_NODES; do
-    echo "Starting Ray worker on $node..."
-    srun --nodes=1 --ntasks=1 -w "$node" --export=ALL \
-        bash -c "unset ROCR_VISIBLE_DEVICES; exec ray start --address='$HEAD_IP:$RAY_PORT' \
-        --temp-dir='$RAY_TEMP_DIR' \
-        --num-cpus=72 --num-gpus=4 --block" &
-    RAY_PIDS="$RAY_PIDS $!"
-done
-sleep 20
+sleep 30
 
 # Verify Ray cluster sees all nodes and GPUs
 echo "Ray cluster status (expecting 2 nodes, 8 GPUs):"
-ray status --address="$HEAD_IP:$RAY_PORT"
+ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed"
 python -c "
 import ray
 ray.init(address='$HEAD_IP:$RAY_PORT')

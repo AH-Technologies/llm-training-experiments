@@ -326,9 +326,11 @@ def sft_fsdp(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
 
 def sft_fsdp_optim_offload(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
                             alpha: float = 0.15) -> dict:
-    """Eq. 9: SFT with FSDP + optimizer offload to CPU. T = tensor parallelism degree."""
+    """Eq. 9: SFT with FSDP + ping-pong optimizer offload. T = tensor parallelism degree."""
     P = arch.P
-    gpu_states = 4 * P / N  # bf16 weights + bf16 grads
+    # Optimizer loaded back to GPU for Adam step (no CPU Adam).
+    # Peak = weights + grads + optimizer, all FSDP-sharded across N GPUs.
+    gpu_states = 16 * P / N  # bf16 weights + grads + fp32 master/m/v
     unit_peak = 2 * fsdp_unit_params(arch) * BYTES_BF16
     act = activation_memory(B, S, arch.h, arch.L, arch.a) / T
     logits = logits_memory(B, S, arch.V) / T
@@ -341,14 +343,17 @@ def sft_fsdp_optim_offload(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
 
 def sft_fsdp_full_offload(arch: ModelArch, B: int, S: int, N: int, T: int = 1,
                            alpha: float = 0.15) -> dict:
-    """Eq. 10: SFT with FSDP + full param & optimizer offload. T = tensor parallelism degree."""
+    """Eq. 10: SFT with FSDP + full ping-pong param & optimizer offload. T = TP degree."""
+    P = arch.P
     unit_peak = 2 * fsdp_unit_params(arch) * BYTES_BF16
     act = activation_memory(B, S, arch.h, arch.L, arch.a) / T
     logits = logits_memory(B, S, arch.V) / T
-    # grad buffer for current unit
+    # Params streamed per-unit, but optimizer loaded back for Adam step.
+    # Peak = current unit params + grad buffer + optimizer (FSDP-sharded).
     grad_buf = fsdp_unit_params(arch) * BYTES_BF16
-    oh = overhead(unit_peak, act, alpha)
-    gpu_peak = unit_peak + act + grad_buf + logits + oh
+    optim_on_gpu = 12 * P / N  # fp32 master/m/v, FSDP-sharded
+    oh = overhead(unit_peak + optim_on_gpu, act, alpha)
+    gpu_peak = unit_peak + act + grad_buf + optim_on_gpu + logits + oh
     cpu_offloaded = 14 * arch.P / N  # 12 (optim) + 2 (params) per shard
     return {"gpu_peak_gb": to_gb(gpu_peak), "cpu_offloaded_gb": to_gb(cpu_offloaded),
             "cpu_per_node": cpu_per_node_sft(arch.P, N, "full_offload")}
@@ -470,14 +475,16 @@ def sft_megatron(arch: ModelArch, B: int, S: int, N: int,
     logits = logits_memory(B, S, arch.V) / T
 
     if param_offload and optimizer_offload:
-        # Full offload: only current layer params + activations on GPU
-        # Megatron streams TP-sharded layer params from CPU
+        # Ping-pong offload: params streamed per-layer, but optimizer loaded
+        # back to GPU for Adam step. Peak = one layer's params + optimizer
+        # for that layer's TP shard (sharded by DP).
         layer_params = fsdp_unit_params(arch) / T  # one layer's TP shard
-        gpu_states = 2 * layer_params * BYTES_BF16  # bf16 params for current layer
+        gpu_states = 2 * layer_params * BYTES_BF16 + 12 * P / (T * D) / DP
         mode = "full_offload"
     elif optimizer_offload:
-        # Optimizer offload: bf16 weights + grads on GPU, optimizer on CPU
-        gpu_states = 4 * P / (T * D)  # weights + grads, TP×PP sharded
+        # Ping-pong offload: optimizer loaded back to GPU for Adam step.
+        # Peak = bf16 weights + bf16 grads + fp32 master/m/v (sharded by DP).
+        gpu_states = 4 * P / (T * D) + 12 * P / (T * D) / DP
         mode = "optim_offload"
     else:
         # No offload: all model states on GPU
@@ -529,20 +536,42 @@ def grpo_phases(arch: ModelArch, B_micro: int, S: int, N: int, T: int = 1,
     rollout_gpu = max(vllm_weights_per_gpu + vllm_overhead,
                       gpu_mem_util * gpu_total_gb * 1e9)
 
+    # --- vLLM weights persist on GPU across all phases ---
+    # verl keeps the vLLM rollout engine alive; its TP-sharded model weights
+    # remain allocated even during ref/actor phases.
+    vllm_resident = vllm_weights_per_gpu + 1 * 1e9  # weights + vLLM framework overhead
+
     # --- Phase 2: Reference log-probs (offloaded) --- Eq. 13b / 15b
     unit_peak = 2 * fsdp_unit_params(arch) * BYTES_BF16
-    ref_act = B_micro * S * h * BYTES_BF16  # forward-only activations
-    ref_logits = logits_memory(B_micro, S, V)
+    ref_act = B_micro * S * h * BYTES_BF16 / T  # forward-only activations, TP-sharded
+    ref_logits = logits_memory(B_micro, S, V) / T
     ref_overhead = 1 * 1e9  # ~1 GB
-    ref_gpu = unit_peak + ref_act + ref_logits + ref_overhead
+    ref_gpu = vllm_resident + unit_peak + ref_act + ref_logits + ref_overhead
 
-    # --- Phase 3: Actor update (FSDP + optim offload) --- Eq. 15c
-    actor_gpu_states = 4 * P / N  # bf16 weights + grads, FSDP-sharded
-    actor_act = activation_memory(B_micro, S, h, L, a)
-    actor_logits = logits_memory(B_micro, S, V)
-    actor_unit_peak = unit_peak
-    actor_oh = overhead(actor_gpu_states, actor_act, alpha)
-    actor_gpu = actor_gpu_states + actor_act + actor_unit_peak + actor_logits + actor_oh
+    # --- Phase 3: Actor update (FSDP + ping-pong optim offload) --- Eq. 15c
+    # verl's ping-pong offload loads ONE FSDP unit's optimizer states to GPU at
+    # a time (not the full sharded set).  Peak is the max of:
+    #   (a) backward: sharded weights + grads + unshard buffer + activations
+    #   (b) optimizer step: sharded weights + grads + one unit's optim states
+    # Both include vLLM resident weights (not freed during actor phase).
+    unit_params = fsdp_unit_params(arch)
+    actor_wg = 4 * P / N                    # bf16 weights + grads, FSDP-sharded
+    actor_optim_unit = 12 * unit_params / N  # fp32 master/m/v for one unit's shard
+    # With FSDP+TP, activations are TP-sharded (each TP rank computes its shard)
+    actor_act = activation_memory(B_micro, S, h, L, a) / T
+    actor_logits = logits_memory(B_micro, S, V) / T
+
+    # (a) backward peak: vllm resident + sharded w+g + all-gather buffer + activations + logits
+    backward_states = vllm_resident + actor_wg + unit_peak
+    backward_oh = overhead(backward_states, actor_act, alpha)
+    backward_gpu = backward_states + actor_act + actor_logits + backward_oh
+
+    # (b) optimizer step peak: vllm resident + sharded w+g + one unit's optimizer states
+    optim_states = vllm_resident + actor_wg + actor_optim_unit
+    optim_oh = overhead(optim_states, 0, alpha)
+    optim_gpu = optim_states + optim_oh
+
+    actor_gpu = max(backward_gpu, optim_gpu)
 
     # --- Weight sync spike --- Eq. 18
     fsdp_shard = 2 * P / N
@@ -607,10 +636,12 @@ def grpo_megatron_phases(arch: ModelArch, B_micro: int, S: int, N: int,
     ref_layer_peak = 2 * layer_params_tp * BYTES_BF16
     ref_gpu = ref_layer_peak + ref_act + ref_logits + ref_overhead
 
-    # --- Phase 3: Actor update (Megatron TP+PP + optimizer offload) ---
-    # With Megatron, each GPU holds P/(T*D) params (TP×PP shard)
-    # Optimizer offloaded to CPU; GPU has weights + grads
-    actor_gpu_states = 4 * P / (T * D)  # bf16 weights + grads
+    # --- Phase 3: Actor update (Megatron TP+PP + ping-pong optim offload) ---
+    # Optimizer states are loaded back to GPU for the Adam step (no CPU Adam).
+    # Each GPU holds P/(T*D) params (TP×PP shard). With distributed optimizer
+    # (default in verl), optimizer states are sharded across DP ranks.
+    # Peak = bf16 weights + bf16 grads + fp32 master/m/v (sharded by DP).
+    actor_gpu_states = 4 * P / (T * D) + 12 * P / (T * D) / DP
     actor_act = activation_memory(B_micro, S, h, L // D, a) / T
     actor_logits = logits_memory(B_micro, S, V) / T
     actor_oh = overhead(actor_gpu_states, actor_act, alpha)
@@ -1036,12 +1067,9 @@ def generate_plots(
     # =====================================================================
     # Figure 2: GRPO (2 panels — peak memory, per-phase breakdown)
     # =====================================================================
-    grpo_path = output_path.with_name(
-        output_path.stem.replace("sft", "grpo") + output_path.suffix
-    )
-    # Fallback if stem doesn't contain "sft"
-    if grpo_path == output_path:
-        grpo_path = output_path.with_name("memory_estimation_grpo.png")
+    # Derive GRPO plot path from SFT path
+    grpo_stem = output_path.stem.replace("memory_estimation_", "memory_estimation_grpo_")
+    grpo_path = output_path.with_name(grpo_stem + output_path.suffix)
 
     fig_grpo, axes_grpo = plt.subplots(1, 2, figsize=(14, 5.5))
     fig_grpo.suptitle(f"GRPO Peak Memory Estimation — {node_str} ({N} GPUs)",

@@ -257,9 +257,9 @@ def run_grpo_benchmark(
         ]
 
         # Strategy-specific config
+        tp = pc.tp if pc else 1
+        pp = pc.pp if pc else 1
         if use_megatron:
-            tp = pc.tp if pc else 1
-            pp = pc.pp if pc else 1
             # Megatron ref requires log_prob_micro_batch_size_per_gpu to be set explicitly
             ref_micro_bs = max(1, batch_size // total_gpus)
             cmd += [
@@ -290,7 +290,7 @@ def run_grpo_benchmark(
                 "actor_rollout_ref.model.enable_gradient_checkpointing=True",
                 f"actor_rollout_ref.actor.fsdp_config.param_offload={str(actor_offload)}",
                 f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={str(actor_offload)}",
-                "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+                f"actor_rollout_ref.rollout.tensor_model_parallel_size={tp}",
                 f"actor_rollout_ref.ref.fsdp_config.param_offload={str(ref_offload)}",
             ]
 
@@ -317,6 +317,7 @@ def run_grpo_benchmark(
         # Must also unset in current process so Ray workers on other nodes inherit clean env.
         env.pop("ROCR_VISIBLE_DEVICES", None)
         os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+
 
         try:
             with GPUMemoryMonitor(poll_interval=1.0) as gpu_monitor:

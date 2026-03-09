@@ -46,9 +46,11 @@ GRPO_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
     "1.5B": {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
     "3B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
     "7B":   {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    "14B":  {4: ParallelismConfig(strategy="fsdp", tp=1), 8: ParallelismConfig(strategy="fsdp", tp=1)},
-    # 32B: FSDP for training, vLLM TP=4 for generation
+    # 14B+: FSDP for training, vLLM TP=4 for generation (14B with TP=1 OOMs on 1 node)
+    "14B":  {4: ParallelismConfig(strategy="fsdp", tp=4), 8: ParallelismConfig(strategy="fsdp", tp=4)},
     "32B":  {4: ParallelismConfig(strategy="fsdp", tp=4), 8: ParallelismConfig(strategy="fsdp", tp=4)},
+    # 72B: must use TP=4 for vLLM (144 GB in bf16, doesn't fit on single GPU)
+    "72B":  {16: ParallelismConfig(strategy="fsdp", tp=4)},
 }
 
 SFT_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
@@ -76,8 +78,8 @@ SFT_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
              8:  ParallelismConfig(strategy="torchtune", tp=1)},
     "14B":  {4:  ParallelismConfig(strategy="torchtune", tp=1),
              8:  ParallelismConfig(strategy="torchtune", tp=2)},
-    "32B":  {8:  ParallelismConfig(strategy="torchtune", tp=2),
-             16: ParallelismConfig(strategy="torchtune", tp=2)},
+    # 32B: 2 nodes infeasible (GPU OOM without offload, CPU OOM with offload)
+    "32B":  {16: ParallelismConfig(strategy="torchtune", tp=4)},                    # 4 nodes, GPU-only (~20 GB/GPU, no offload needed)
     "72B":  {8:  ParallelismConfig(strategy="torchtune", tp=4, cpu_offload=True),   # 2 nodes, TP=4 + CPU offload
              16: ParallelismConfig(strategy="torchtune", tp=4),                     # 4 nodes, GPU-only
              32: ParallelismConfig(strategy="torchtune", tp=4)},
@@ -93,7 +95,7 @@ MEGATRON_GRPO_CONFIGS: dict[str, dict[int, ParallelismConfig]] = {
     "3B":   {4: ParallelismConfig(strategy="megatron", tp=1), 8: ParallelismConfig(strategy="megatron", tp=2)},
     "7B":   {4: ParallelismConfig(strategy="megatron", tp=2), 8: ParallelismConfig(strategy="megatron", tp=4)},
     "14B":  {4: ParallelismConfig(strategy="megatron", tp=4), 8: ParallelismConfig(strategy="megatron", tp=4)},
-    "32B":  {4: ParallelismConfig(strategy="megatron", tp=4), 8: ParallelismConfig(strategy="megatron", tp=4)},
+    "32B":  {8: ParallelismConfig(strategy="megatron", tp=4, pp=2), 16: ParallelismConfig(strategy="megatron", tp=4, pp=2)},
     "72B":  {8: ParallelismConfig(strategy="megatron", tp=4, pp=2), 16: ParallelismConfig(strategy="megatron", tp=4, pp=2)},
 }
 
@@ -278,9 +280,20 @@ def find_max_batch_size(
     Returns (max_batch_size, benchmark_result)
     """
     total_gpus = num_gpus * num_nodes
-    dp_size = total_gpus
+    tp = parallelism_config.tp if parallelism_config else 1
+    dp_size = total_gpus // tp
     min_bs = MIN_BATCH_SIZE_GRPO if training_type == "grpo" else MIN_BATCH_SIZE_SFT
     min_batch_size = max(min_bs, dp_size)
+
+    # For GRPO with large models, lower vLLM gpu_memory_utilization to leave
+    # room for actor/ref CUDA buffers (they share the same GPUs).
+    model_b = float(model_size.replace("B", ""))
+    if training_type == "grpo" and model_b >= 14:
+        gpu_mem_util = 0.5
+        print(f"Using gpu_memory_utilization={gpu_mem_util} for {model_size} GRPO "
+              f"(large model needs GPU headroom for actor/ref)")
+    else:
+        gpu_mem_util = 0.7
 
     batch_size = max(INITIAL_BATCH_SIZES.get(model_size, 8), min_batch_size)
     last_successful_result = None
@@ -305,6 +318,7 @@ def find_max_batch_size(
             num_nodes=num_nodes,
             actor_offload=actor_offload,
             ref_offload=ref_offload,
+            gpu_memory_utilization=gpu_mem_util,
             parallelism_config=parallelism_config,
         )
 
@@ -330,13 +344,27 @@ def find_max_batch_size(
     if last_successful_result:
         return last_successful_result.batch_size, last_successful_result
 
-    # Phase 2: OOM fallback — retry with higher gpu_memory_utilization
+    # Phase 2: OOM fallback — retry with adjusted gpu_memory_utilization
+    # For Megatron hybrid engine: vLLM shares GPUs with actor/ref, so LOWER
+    # gpu_memory_utilization to leave room for Megatron buffers.
+    # For FSDP: actor is offloaded, so HIGHER utilization helps vLLM.
     is_oom = _is_memory_error(result.error_message)
     if is_oom:
-        retry_configs = [
-            {"actor_offload": True, "gpu_memory_utilization": 0.85,
-             "label": "gpu_mem=0.85"},
-        ]
+        is_megatron = parallelism_config and parallelism_config.strategy == "megatron"
+        if is_megatron:
+            retry_configs = [
+                {"actor_offload": True, "gpu_memory_utilization": 0.5,
+                 "label": "gpu_mem=0.5 (megatron)"},
+                {"actor_offload": True, "gpu_memory_utilization": 0.4,
+                 "label": "gpu_mem=0.4 (megatron)"},
+            ]
+        else:
+            retry_configs = [
+                {"actor_offload": True, "gpu_memory_utilization": 0.5,
+                 "label": "gpu_mem=0.5 (fsdp)"},
+                {"actor_offload": True, "gpu_memory_utilization": 0.4,
+                 "label": "gpu_mem=0.4 (fsdp)"},
+            ]
 
         for retry_cfg in retry_configs:
             print(f"\n{'='*60}")
