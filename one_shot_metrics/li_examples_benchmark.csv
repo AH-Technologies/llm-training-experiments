@@ -1,0 +1,15 @@
+example,paper,model,type,category,prompt_short,ground_truth,math,physics,chemistry,biology,science,engineering,cs,others,avg_all
+natural_geometry,Li,Qwen2.5-7B-base,natural,Geometry,"Cylindrical silo red stripe area",240,15.5,9.9,10.0,55.1,11.2,16.7,37.1,35.0,23.8
+natural_prealgebra,Li,Qwen2.5-7B-base,natural,Prealgebra,"Semicircular arcs on square perimeter",4,38.0,17.4,12.2,51.7,15.1,16.5,49.5,33.5,29.2
+natural_algebra,Li,Qwen2.5-7B-base,natural,Algebra,"100-gon P1->P2->P3 x-coord sum",2009,37.3,17.4,13.7,51.7,12.1,15.6,43.3,30.9,27.7
+natural_intermediate_algebra,Li,Qwen2.5-7B-base,natural,Intermediate Algebra,"a/b+b/c+c/a=7 find sum of cubes of ratios",157,36.3,19.1,13.1,50.0,13.9,17.5,42.3,31.1,27.9
+natural_number_theory,Li,Qwen2.5-7B-base,natural,Number Theory,"Freshman class mod 23 and mod 21",413,37.7,16.9,12.4,49.2,13.4,17.8,42.3,32.2,27.7
+natural_precalculus,Li,Qwen2.5-7B-base,natural,Precalculus,"System of equations find xz/y^2",10,38.0,18.4,13.7,50.0,16.0,19.7,43.3,31.0,28.8
+natural_probability,Li,Qwen2.5-7B-base,natural,Probability,"Flatville bicycle plates add 2 letters",40,38.8,19.9,11.5,46.6,14.7,16.4,41.2,31.4,27.6
+synthetic_geometry,Li,Qwen2.5-7B-base,synthetic,Geometry,"Cell membrane cube phospholipid count",800,35.4,15.0,11.5,31.1,36.1,52.5,13.2,11.0,25.7
+synthetic_algebra,Li,Qwen2.5-7B-base,synthetic,Algebra,"DNA + catalase + ions",20,37.3,16.9,12.6,31.5,41.2,52.5,18.6,13.9,28.1
+synthetic_number_theory,Li,Qwen2.5-7B-base,synthetic,Number Theory,"Drug half-life dosing cost",10,38.4,18.2,12.0,32.1,36.1,47.5,18.6,13.8,27.1
+synthetic_precalculus,Li,Qwen2.5-7B-base,synthetic,Precalculus,"Waste discharge optimization",10,37.1,20.3,15.3,32.9,44.3,48.3,20.8,16.5,29.4
+synthetic_probability,Li,Qwen2.5-7B-base,synthetic,Probability,"Plasmid 32P decay measurement",8,37.1,16.7,13.9,30.1,46.4,50.0,19.7,10.8,28.1
+synthetic_prime,Li,Qwen2.5-7B-base,synthetic,Prime,"DNA 11bp + H-bonds + 400nm photons",2,38.3,20.6,15.7,54.2,15.6,20.8,48.5,32.4,30.8
+pi_1,Li,Qwen2.5-7B-base,external,Algebra,"Wind pressure P=kAV^3",12.8,35.5,14.3,11.3,28.4,35.1,44.1,13.8,10.4,24.1

@@ -1,0 +1,16 @@
+example,paper,model,category,prompt_short,ground_truth,math500,aime24,avg_6bench,best_step,notes
+pi_1,Wang,Qwen2.5-Math-1.5B,Algebra,"Wind pressure P=kAV^3, find velocity",12.8,74.0,16.7,35.0,1540,"6.3% pass@128, diverse wrong answers"
+pi_2,Wang,Qwen2.5-Math-1.5B,Number Theory,Common divisors of 9240 and 13860,24,70.6,17.1,33.5,320,
+pi_4,Wang,Qwen2.5-Math-1.5B,Number Theory,"Three integers from {1,2,4,8,16,20} product 80",25,65.6,17.1,,80,Fast saturation
+pi_7,Wang,Qwen2.5-Math-1.5B,Intermediate Algebra,"Recurrence u_{k+1}=2u_k-2u_k^2, find k",10,64.0,12.1,,580,
+pi_11,Wang,Qwen2.5-Math-1.5B,Number Theory,"Pairs (a,b) in 1..42 with a^9=b^7 mod 43",42,64.0,13.3,,20,Very fast saturation
+pi_13,Wang,Qwen2.5-Math-1.5B,Geometry,Circle through 3 points + line intersects circle,4/3,74.4,17.1,35.7,2000,21.9% pass@128
+pi_16,Wang,Qwen2.5-Math-1.5B,Algebra,"p+q+r=26, 1/p+1/q+1/r+360/pqr=1, find pqr",576,67.0,14.6,,600,
+pi_17,Wang,Qwen2.5-Math-1.5B,Counting & Prob.,"45 students, 39 shuttlecock, 28 basketball overlap",22,67.2,13.3,,220,
+pi_605,Wang,Qwen2.5-Math-1.5B,Precalculus,"Vectors m perp n, find f(x) + triangle area",(sqrt3-1)/4,71.8,14.6,,1040,Medium hist. variance
+pi_606,Wang,Qwen2.5-Math-1.5B,Number Theory,Zeros at end of s(1)*s(2)*...*s(100),19,64.4,14.2,,460,Medium hist. variance
+pi_1201,Wang,Qwen2.5-Math-1.5B,Geometry,"Quadrilateral angles P=3Q=4R=6S",206,71.4,16.3,33.7,1120,Low hist. variance
+pi_1207,Wang,Qwen2.5-Math-1.5B,Geometry,"Paper folding B/A ratio",4/5 (WRONG),54.0,9.6,,100,Wrong label - never gets reward
+pi_1208,Wang,Qwen2.5-Math-1.5B,Counting & Prob.,"Quadratic probability questions",961/1280,45.0,8.8,,240,Too difficult - almost no reward
+pi_1209,Wang,Qwen2.5-Math-1.5B,Precalculus,"f(x)=xe^x 2023rd derivative y-intercept",-2023/2024,72.2,17.5,33.5,1220,Low hist. variance
+pi_1_simplified,Wang,Qwen2.5-Math-1.5B,Computation,"Calculate cube root of 2048",12.8,65.4,9.6,30.0,,Only crux step - much worse
