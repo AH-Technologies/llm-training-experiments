@@ -69,7 +69,7 @@ python3 -m src.self_teach.main \
     trainer.save_freq=20 \
     trainer.max_actor_ckpt_to_keep=3 \
     trainer.val_before_train=True \
-    trainer.test_freq=2 \
+    trainer.test_freq=20 \
     trainer.total_epochs=2000 \
-    trainer.total_training_steps=2000 \
+    trainer.total_training_steps=200 \
     "$@"
