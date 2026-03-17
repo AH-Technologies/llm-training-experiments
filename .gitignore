@@ -77,3 +77,6 @@ tiktoken_encodings/
 
 # Benchmark logs
 benchmarks/results/
+
+# One shot metrics results
+one_shot_metrics/entropy_profiling/results/
