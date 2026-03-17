@@ -77,3 +77,5 @@ tiktoken_encodings/
 
 # Benchmark logs
 benchmarks/results/
+
+one_shot_metrics/results/
