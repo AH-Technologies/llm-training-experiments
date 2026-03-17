@@ -43,7 +43,7 @@ module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Project directory
-PROJECT_DIR=/cluster/projects/nn12068k/alexaau/llm-training-experiments
+PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
 
 # Activate virtual environment (if it exists)
 if [ -d "$PROJECT_DIR/venv" ]; then
@@ -60,12 +60,13 @@ if [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 # Environment variables
-# Use a per-job cache dir so concurrent jobs don't conflict
-export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface_${SLURM_JOB_ID}
+export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
+export HF_HUB_CACHE=$HF_HOME
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
 export HF_TOKEN=${HF_TOKEN:-""}
+export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
 # NCCL settings for multi-GPU
@@ -169,6 +170,32 @@ elif [ "$TASK" == "pi1_math500_v2" ]; then
     fi
 
     TRAIN_SCRIPT="scripts/run_grpo_pi1_math500_v2.sh"
+elif [ "$TASK" == "pi1_nocode" ] || [ "$TASK" == "pi13_nocode" ]; then
+    # No-code 500-step experiments with code penalty reward
+    echo "Preparing ${TASK} dataset with 128 duplicates..."
+    python scripts/prepare_nocode_data.py --name ${TASK} --output-dir ./data --copies 128
+
+    echo "Preparing no-code multi-prompt validation..."
+    python scripts/prepare_nocode_val.py --input ./data/math500.parquet --output ./data/math500_nocode_val.parquet
+
+    if [ ! -f "data/math500.parquet" ]; then
+        echo "ERROR: Math500 data file must be present in ./data/"
+        exit 1
+    fi
+    export EXAMPLE_NAME=${TASK}
+    TRAIN_SCRIPT="scripts/run_grpo_nocode_500step.sh"
+elif [ "$TASK" == "ex_907" ] || [ "$TASK" == "ex_331" ] || [ "$TASK" == "ex_1108" ] || [ "$TASK" == "ex_672" ]; then
+    # Single-example 100-step RLVR experiments
+    # Best predicted: ex_907 (rank 3), ex_331 (rank 4)
+    # Worst predicted: ex_1108 (rank 658), ex_672 (rank 659)
+    echo "Preparing ${TASK} dataset with 128 duplicates..."
+    python scripts/prepare_example_data.py --name ${TASK} --output-dir ./data --copies 128
+    if [ ! -f "data/math500.parquet" ]; then
+        echo "ERROR: Math500 data file must be present in ./data/"
+        exit 1
+    fi
+    export EXAMPLE_NAME=${TASK}
+    TRAIN_SCRIPT="scripts/run_grpo_example_100step.sh"
 elif [ "$TASK" == "ber" ]; then
     # Pi13 -> Math500 with Bidirectional Experience Replay (BER)
     echo "Regenerating π13 dataset with 128 duplicates..."
@@ -218,7 +245,7 @@ elif [ "$TASK" == "self_teach" ]; then
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ex_907, ex_331, ex_1108, ex_672, ber, astar_sft, self_teach"
     exit 1
 fi
 
@@ -228,11 +255,5 @@ echo "Using script: $TRAIN_SCRIPT"
 
 chmod +x $TRAIN_SCRIPT
 bash $TRAIN_SCRIPT "${@:2}"
-
-# Clean up the per-job cache directory
-if [ -d "$HF_HOME" ]; then
-    echo "Cleaning up job cache at $HF_HOME"
-    rm -rf "$HF_HOME"
-fi
 
 echo "Training complete!"
