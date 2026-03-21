@@ -1,21 +1,22 @@
 #!/bin/bash
-# Self-Teach: 2-phase student-teacher self-play GRPO training
+# Self-Teach: tree-structured student-teacher self-play GRPO training
 #
-# 4-step generation per training step:
+# 3-step generation per training step:
 #   1. Generate A₁ (student answers question)
-#   2. Generate F (teacher feedback, n copies per prompt — all see same A₁)
-#   3. Generate A₂ for teacher grading (one per F)
-#   4. Generate A₂ for student₂ training (n copies per prompt — all see same A₁+F)
+#   2. Generate F (k teacher feedbacks per prompt — all see same A₁)
+#   3. Generate A₂ (m responses per feedback — dual purpose: grade teacher + train student₂)
 #
-# Teacher and Student₂ get separate GRPO advantage groups via distinct UIDs.
+# Teacher GRPO groups: k feedbacks per prompt, reward = mean improvement rate
+# Student₂ GRPO groups: m A₂s per feedback, reward = binary correctness
 set -x
 
 unset ROCR_VISIBLE_DEVICES
 
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 DATA_DIR=${DATA_DIR:-"./data"}
-TRAIN_FILE="${DATA_DIR}/s1K/s1k_train_verl.parquet"
-VAL_FILE="${DATA_DIR}/s1K/s1k_test_verl.parquet"
+TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/dapo/dapo_all_verl.parquet"}
+VAL_FILE=${VAL_FILE:-"${DATA_DIR}/val/val_combined_verl.parquet"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"self_teach_dapo_qwen3"}
 
 PROJECT_DIR=$(cd "$(dirname "$0")/.."; pwd)
 
@@ -45,7 +46,7 @@ python3 -m src.self_teach.main \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=6 \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -60,10 +61,13 @@ python3 -m src.self_teach.main \
     custom_reward_function.path=src/rlvr_grokking/rewards/deepscaler_reward.py \
     custom_reward_function.name=compute_score \
     +self_teach.enabled=True \
+    +self_teach.num_feedbacks=6 \
+    +self_teach.num_a2_per_feedback=6 \
+    +self_teach.max_a2_prompt_length=4096 \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
-    trainer.experiment_name='self_teach_s1k_qwen3' \
+    trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.n_gpus_per_node=${SLURM_GPUS_ON_NODE:-4} \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
@@ -71,5 +75,5 @@ python3 -m src.self_teach.main \
     trainer.val_before_train=True \
     trainer.test_freq=20 \
     trainer.total_epochs=2000 \
-    trainer.total_training_steps=200 \
+    trainer.total_training_steps=100 \
     "$@"

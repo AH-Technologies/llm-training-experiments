@@ -61,7 +61,7 @@ fi
 
 # Environment variables
 # Use a per-job cache dir so concurrent jobs don't conflict
-export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface_${SLURM_JOB_ID}
+export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${SLURM_JOB_ID}
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
@@ -204,21 +204,47 @@ elif [ "$TASK" == "astar_sft" ]; then
 
     TRAIN_SCRIPT="scripts/run_sft_astar.sh"
 elif [ "$TASK" == "self_teach" ]; then
-    # Self-Teach: Student-Teacher self-play GRPO on s1K verifiable
-    # 3-turn pipeline with trajectory splitting into separate GRPO groups
-    if [ ! -f "data/s1K/s1k_train.parquet" ] || [ ! -f "data/s1K/s1k_test.parquet" ]; then
-        echo "ERROR: s1K split files not found. Run: python3.12 data/s1K/split_train_test.py"
-        exit 1
+    # Self-Teach: Student-Teacher self-play GRPO
+    # Data paths configured in run_grpo_self_teach.sh (defaults to DAPO + combined val)
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+elif [ "$TASK" == "self_teach_filtered" ]; then
+    # Self-Teach with informed teacher + A₁-correct filtering on DAPO
+    if [ ! -f "data/dapo/dapo_train_verl.parquet" ] || [ ! -f "data/dapo/dapo_test_verl.parquet" ]; then
+        echo "Preparing DAPO-Math-17K data..."
+        python scripts/prepare_dapo_self_teach.py
     fi
 
-    # Convert s1K to verl format with interaction_kwargs
-    echo "Preparing s1K data for self-teach..."
-    python scripts/prepare_s1k_self_teach.py
+    export TRAIN_FILE="data/dapo/dapo_train_verl.parquet"
+    export VAL_FILE="data/dapo/dapo_test_verl.parquet"
+    export EXPERIMENT_NAME="self_teach_filtered_dapo_qwen3"
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+    EXTRA_ARGS="+self_teach.filter_a1_correct=True"
+elif [ "$TASK" == "self_teach_blind" ]; then
+    # Self-Teach with blind teacher (no ground truth) on DAPO
+    if [ ! -f "data/dapo/dapo_train_verl.parquet" ] || [ ! -f "data/dapo/dapo_test_verl.parquet" ]; then
+        echo "Preparing DAPO-Math-17K data..."
+        python scripts/prepare_dapo_self_teach.py
+    fi
 
+    export TRAIN_FILE="data/dapo/dapo_train_verl.parquet"
+    export VAL_FILE="data/dapo/dapo_test_verl.parquet"
+    export EXPERIMENT_NAME="self_teach_blind_dapo_qwen3"
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+    EXTRA_ARGS="+self_teach.blind_teacher=True"
+elif [ "$TASK" == "self_teach_dapo" ]; then
+    # Self-Teach on DAPO-Math-17K (competition-level math)
+    if [ ! -f "data/dapo/dapo_train_verl.parquet" ] || [ ! -f "data/dapo/dapo_test_verl.parquet" ]; then
+        echo "Preparing DAPO-Math-17K data..."
+        python scripts/prepare_dapo_self_teach.py
+    fi
+
+    export TRAIN_FILE="data/dapo/dapo_train_verl.parquet"
+    export VAL_FILE="data/dapo/dapo_test_verl.parquet"
+    export EXPERIMENT_NAME="self_teach_dapo_qwen3"
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach, self_teach_filtered, self_teach_blind, self_teach_dapo"
     exit 1
 fi
 
@@ -227,7 +253,7 @@ echo "Starting training for $TASK..."
 echo "Using script: $TRAIN_SCRIPT"
 
 chmod +x $TRAIN_SCRIPT
-bash $TRAIN_SCRIPT "${@:2}"
+bash $TRAIN_SCRIPT ${EXTRA_ARGS:-} "${@:2}"
 
 # Clean up the per-job cache directory
 if [ -d "$HF_HOME" ]; then
