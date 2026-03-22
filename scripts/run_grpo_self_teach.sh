@@ -54,6 +54,7 @@ python3 -m src.self_teach.main \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.multi_turn.enable=false \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=src.self_teach.agent_loop_overrides.FlexPromptAgentLoopManager \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     algorithm.kl_ctrl.kl_coef=0.001 \
