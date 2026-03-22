@@ -88,37 +88,6 @@ class SelfTeachConfig:
     max_a2_prompt_length: int | None = None  # Prompt length for A₂ generation; None = use default
 
 
-def _patch_agent_loop_prompt_length():
-    """Monkey-patch VERL's AgentLoopWorkerBase to support per-batch prompt length.
-
-    When 'max_prompt_length' is present in non_tensor_batch, the agent loop
-    will pad prompts to that size instead of the global config value. This
-    allows A₂ generation to use a larger prompt budget than A₁/F without
-    changing the global setting.
-    """
-    from verl.experimental.agent_loop.agent_loop import AgentLoopWorkerBase
-
-    if getattr(AgentLoopWorkerBase, "_prompt_length_patched", False):
-        return  # already patched
-
-    _original_postprocess = AgentLoopWorkerBase._agent_loop_postprocess
-
-    async def _patched_postprocess(self, output, **kwargs):
-        # Temporarily swap the config value if an override is provided
-        override = kwargs.pop("max_prompt_length", None)
-        if override is not None:
-            original_value = self.config.actor_rollout_ref.rollout.prompt_length
-            self.config.actor_rollout_ref.rollout.prompt_length = int(override)
-        try:
-            return await _original_postprocess(self, output, **kwargs)
-        finally:
-            if override is not None:
-                self.config.actor_rollout_ref.rollout.prompt_length = original_value
-
-    AgentLoopWorkerBase._agent_loop_postprocess = _patched_postprocess
-    AgentLoopWorkerBase._prompt_length_patched = True
-    print("[SelfTeach] Patched AgentLoopWorkerBase for per-batch prompt length override")
-
 
 class SelfTeachRayPPOTrainer(RayPPOTrainer):
     """Tree-structured GRPO trainer for student-teacher self-play.
@@ -145,7 +114,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 raise ValueError(
                     "Self-teach is incompatible with launch_reward_fn_async=True."
                 )
-            _patch_agent_loop_prompt_length()
             mode = "blind" if self.self_teach_config.blind_teacher else "conditioned"
             filter_str = "yes" if self.self_teach_config.filter_a1_correct else "no"
             a2_len = self.self_teach_config.max_a2_prompt_length or "default"
@@ -174,7 +142,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         fixed_tokens = len(self.tokenizer.encode(
             question,
             add_special_tokens=False,
-        )) + 50  # chat template overhead
+        )) + 200  # STUDENT2_PROMPT_TEMPLATE XML tags + instruction + chat template overhead
 
         available = self.max_a2_prompt_tokens - fixed_tokens
         per_turn = available // 2

@@ -111,5 +111,5 @@ STUDENT2_PROMPT_TEMPLATE = (
     "{feedback}\n"
     "</feedback_from_teacher>\n\n"
     "Use the feedback from your teacher to improve your first attempt at the problem.\n"
-    "Put your final answer within \\boxed{}."
+    "Put your final answer within \\boxed{{}}."
 )
