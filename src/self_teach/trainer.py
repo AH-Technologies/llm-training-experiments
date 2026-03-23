@@ -133,11 +133,15 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _truncate_for_a2(self, a1_text: str, f_text: str, question: str) -> tuple[str, str]:
+    def _truncate_for_a2(self, a1_text: str, f_text: str, question: str) -> tuple[str, str, int]:
         """Truncate A1 and F texts so the A2 prompt fits within context.
 
         Fixed parts: question plus chat template overhead.
         The remaining budget is split evenly between A1 and F.
+
+        Returns:
+            (a1_text, f_text, tokens_truncated) where tokens_truncated is the
+            number of tokens removed (0 if no truncation was needed).
         """
         fixed_tokens = len(self.tokenizer.encode(
             question,
@@ -150,8 +154,10 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         a1_ids = self.tokenizer.encode(a1_text, add_special_tokens=False)
         f_ids = self.tokenizer.encode(f_text, add_special_tokens=False)
 
-        if len(a1_ids) + len(f_ids) <= available:
-            return a1_text, f_text
+        original_total = len(a1_ids) + len(f_ids)
+
+        if original_total <= available:
+            return a1_text, f_text, 0
 
         # Truncate whichever is over budget, giving slack to the other
         if len(a1_ids) <= per_turn:
@@ -162,9 +168,77 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             a1_ids = a1_ids[:per_turn]
             f_ids = f_ids[:per_turn]
 
+        tokens_truncated = original_total - len(a1_ids) - len(f_ids)
         a1_out = self.tokenizer.decode(a1_ids, skip_special_tokens=True)
         f_out = self.tokenizer.decode(f_ids, skip_special_tokens=True)
-        return a1_out, f_out
+        return a1_out, f_out, tokens_truncated
+
+    def _check_prompt_overflow(
+        self,
+        raw_prompts: list,
+        max_prompt_length: int,
+    ) -> dict:
+        """Check how many prompts exceed the max_prompt_length budget.
+
+        Returns dict with overflow stats: count, rate, and mean tokens over.
+        """
+        overflow_count = 0
+        total_overflow_tokens = 0
+        for prompt_msgs in raw_prompts:
+            # Concatenate all message content to approximate token count
+            text = "".join(msg.get("content", "") for msg in prompt_msgs)
+            n_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
+            # Add overhead for chat template (rough estimate)
+            n_tokens += 50
+            if n_tokens > max_prompt_length:
+                overflow_count += 1
+                total_overflow_tokens += n_tokens - max_prompt_length
+        n = len(raw_prompts)
+        return {
+            "count": overflow_count,
+            "rate": overflow_count / max(n, 1),
+            "mean_overflow_tokens": total_overflow_tokens / max(overflow_count, 1),
+        }
+
+    def _generate_padded(
+        self,
+        raw_prompts: list,
+        temperature: float,
+        global_steps: int,
+        data_sources: list[str],
+        ground_truths: list[str],
+        max_prompt_length: int | None = None,
+    ) -> DataProto:
+        """Generate sequences, padding the batch to be divisible by worker count.
+
+        The agent loop requires batch size % num_workers == 0. When filtering
+        produces uneven batch sizes, we duplicate the last entry to pad, then
+        strip the extra outputs.
+        """
+        real_n = len(raw_prompts)
+        num_workers = len(self.async_rollout_manager.agent_loop_workers)
+        remainder = real_n % num_workers
+        if remainder != 0:
+            pad_n = num_workers - remainder
+            # Duplicate last entry as padding
+            raw_prompts = raw_prompts + [raw_prompts[-1]] * pad_n
+            data_sources = data_sources + [data_sources[-1]] * pad_n
+            ground_truths = ground_truths + [ground_truths[-1]] * pad_n
+
+        gen_batch = self._build_gen_batch(
+            raw_prompts, temperature, global_steps,
+            data_sources=data_sources, ground_truths=ground_truths,
+            max_prompt_length=max_prompt_length,
+        )
+        output = self.async_rollout_manager.generate_sequences(gen_batch)
+        timing = output.meta_info.pop("timing", {})
+
+        # Strip padding entries
+        if remainder != 0:
+            output = output[:real_n]
+
+        output.meta_info["timing"] = timing
+        return output
 
     def _build_gen_batch(
         self,
@@ -330,12 +404,19 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         t_leak_count = metrics_dict.get("teacher_leak_count", 0)
         t_leak_rate = t_leak_count / max(total, 1)
 
+        # Truncation metrics
+        a1_ovf = metrics_dict.get("a1_prompt_overflow_rate", 0.0)
+        f_ovf = metrics_dict.get("f_prompt_overflow_rate", 0.0)
+        a2_trunc = metrics_dict.get("a2_prompt_truncation_rate", 0.0)
+
         print(
             f"[SelfTeach step {self.global_steps}] "
             f"a1_acc={a1_acc:.3f}, a2_acc={a2_acc:.3f}, "
             f"improve={imp_rate:.3f}, regress={reg_rate:.3f}, "
             f"teacher_reward={t_mean_reward:.3f}, student2_reward={s2_mean_reward:.3f}, "
-            f"teacher_leak_rate={t_leak_rate:.3f}"
+            f"teacher_leak_rate={t_leak_rate:.3f}, "
+            f"a1_prompt_overflow={a1_ovf:.3f}, f_prompt_overflow={f_ovf:.3f}, "
+            f"a2_prompt_truncation={a2_trunc:.3f}"
         )
 
         try:
@@ -351,6 +432,12 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         "self_teach/teacher_leak_rate": t_leak_rate,
                         "self_teach/teacher_mean_reward": t_mean_reward,
                         "self_teach/student2_mean_reward": s2_mean_reward,
+                        "self_teach/a1_prompt_overflow_rate": a1_ovf,
+                        "self_teach/a1_prompt_overflow_mean_tokens": metrics_dict.get("a1_prompt_overflow_mean_tokens", 0.0),
+                        "self_teach/f_prompt_overflow_rate": f_ovf,
+                        "self_teach/f_prompt_overflow_mean_tokens": metrics_dict.get("f_prompt_overflow_mean_tokens", 0.0),
+                        "self_teach/a2_prompt_truncation_rate": a2_trunc,
+                        "self_teach/a2_prompt_truncation_mean_tokens": metrics_dict.get("a2_prompt_truncation_mean_tokens", 0.0),
                     },
                     step=self.global_steps,
                 )
@@ -498,6 +585,55 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 }
                 f.write(json.dumps(record) + "\n")
 
+    def _log_student2_jsonl(
+        self,
+        question_texts: list[str],
+        a1_texts: list[str],
+        a1_correct: list[bool],
+        ground_truths: list[str],
+        f_texts: list[str],
+        a2_texts: list[str],
+        a2_correct: list[bool],
+        student2_rewards: list[float],
+        k: int,
+        m: int,
+        step: int,
+    ):
+        """Append one JSONL record per A₂ response for student₂ analysis.
+
+        a2_texts/a2_correct/student2_rewards have n_prompts * k * m entries.
+        f_texts has n_prompts * k entries.
+        question_texts/a1_texts/a1_correct/ground_truths are per-prompt.
+        """
+        if not hasattr(self, "_student2_log_path"):
+            from datetime import datetime
+            log_dir = os.path.join(
+                self.config.trainer.default_local_dir, "student2_logs"
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._student2_log_path = os.path.join(log_dir, f"student2_log_{ts}.jsonl")
+        log_path = self._student2_log_path
+
+        with open(log_path, "a") as f:
+            for a2_idx in range(len(a2_texts)):
+                f_idx = a2_idx // m
+                i = f_idx // k  # prompt index
+                record = {
+                    "step": step,
+                    "prompt_idx": i,
+                    "feedback_idx": f_idx % k,
+                    "a2_idx": a2_idx % m,
+                    "question": question_texts[i],
+                    "ground_truth": ground_truths[i],
+                    "a1_correct": a1_correct[i],
+                    "feedback": strip_think_blocks(f_texts[f_idx]),
+                    "a2_response": a2_texts[a2_idx],
+                    "a2_correct": a2_correct[a2_idx],
+                    "student2_reward": student2_rewards[a2_idx],
+                }
+                f.write(json.dumps(record) + "\n")
+
     # ------------------------------------------------------------------
     # fit() override — tree-structured generation flow
     # ------------------------------------------------------------------
@@ -611,6 +747,9 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     # ==========================================================
                     with marked_timer("gen_a1", timing_raw, color="red"):
                         a1_raw_prompts = list(batch.non_tensor_batch["raw_prompt"])
+                        a1_overflow = self._check_prompt_overflow(
+                            a1_raw_prompts, self.config.data.max_prompt_length,
+                        )
                         a1_gen_batch = self._build_gen_batch(
                             a1_raw_prompts, temperature, self.global_steps,
                             data_sources=data_sources, ground_truths=ground_truths,
@@ -672,6 +811,24 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             ]
                             teacher_messages.append(msgs)
 
+                        # Ensure the combined batch (k + k*m entries per prompt)
+                        # is divisible by the number of GPUs for dynamic batching.
+                        entries_per_prompt = k + k * m
+                        n_gpus = self.resource_pool_manager.get_n_gpus()
+                        from math import gcd
+                        prompts_needed = n_gpus // gcd(entries_per_prompt, n_gpus)
+                        if len(teacher_prompt_indices) > 0 and len(teacher_prompt_indices) % prompts_needed != 0:
+                            trim_to = (len(teacher_prompt_indices) // prompts_needed) * prompts_needed
+                            if trim_to == 0:
+                                trim_to = prompts_needed
+                                # Pad by duplicating random prompts
+                                while len(teacher_prompt_indices) < trim_to:
+                                    teacher_prompt_indices.append(teacher_prompt_indices[-1])
+                                    teacher_messages.append(teacher_messages[-1])
+                            else:
+                                teacher_prompt_indices = teacher_prompt_indices[:trim_to]
+                                teacher_messages = teacher_messages[:trim_to]
+
                         n_teacher_prompts = len(teacher_prompt_indices)
 
                         # Repeat each prompt k times (k feedbacks per prompt)
@@ -684,14 +841,16 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 f_data_sources.append(data_sources[i])
                                 f_ground_truths.append(ground_truths[i])
 
+                        f_overflow = self._check_prompt_overflow(
+                            teacher_messages, self.config.data.max_prompt_length,
+                        ) if n_teacher_prompts > 0 else {"count": 0, "rate": 0.0, "mean_overflow_tokens": 0.0}
+
                         if n_teacher_prompts > 0:
-                            f_gen_batch = self._build_gen_batch(
+                            f_output = self._generate_padded(
                                 f_raw_prompts, temperature, self.global_steps,
                                 data_sources=f_data_sources, ground_truths=f_ground_truths,
                             )
-                            f_output = self.async_rollout_manager.generate_sequences(f_gen_batch)
-                            timing_raw.update(f_output.meta_info.get("timing", {}))
-                            f_output.meta_info.pop("timing", None)
+                            timing_raw.update(f_output.meta_info.pop("timing", {}))
                         else:
                             f_output = None
 
@@ -720,6 +879,9 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     # Store truncated texts per feedback for logging
                     truncated_a1_per_f = []
                     truncated_f_per_f = []
+                    # Truncation tracking
+                    a2_prompt_truncation_count = 0
+                    a2_prompt_truncation_tokens = []
 
                     n_total_f = n_teacher_prompts * k  # total feedbacks
                     n_total_a2 = n_total_f * m  # total A₂ responses
@@ -733,9 +895,12 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             for f_idx in range(n_total_f):
                                 j = f_idx // k  # index into teacher_prompt_indices
                                 i = teacher_prompt_indices[j]
-                                a1_t, f_t = self._truncate_for_a2(
+                                a1_t, f_t, tokens_lost = self._truncate_for_a2(
                                     a1_texts_clean[i], extract_feedback(f_texts[f_idx]), question_texts[i]
                                 )
+                                if tokens_lost > 0:
+                                    a2_prompt_truncation_count += 1
+                                    a2_prompt_truncation_tokens.append(tokens_lost)
                                 truncated_a1_per_f.append(a1_t)
                                 truncated_f_per_f.append(f_t)
                                 s2_prompt = STUDENT2_PROMPT_TEMPLATE.format(
@@ -750,16 +915,12 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                     a2_data_sources.append(data_sources[i])
                                     a2_ground_truths.append(ground_truths[i])
 
-                            a2_gen_batch = self._build_gen_batch(
+                            a2_output = self._generate_padded(
                                 a2_raw_prompts, temperature, self.global_steps,
                                 data_sources=a2_data_sources, ground_truths=a2_ground_truths,
                                 max_prompt_length=self.self_teach_config.max_a2_prompt_length,
                             )
-                            a2_output = self.async_rollout_manager.generate_sequences(
-                                a2_gen_batch
-                            )
-                            timing_raw.update(a2_output.meta_info.get("timing", {}))
-                            a2_output.meta_info.pop("timing", None)
+                            timing_raw.update(a2_output.meta_info.pop("timing", {}))
 
                         a2_texts = self._decode_responses(a2_output)
 
@@ -825,6 +986,21 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             step=self.global_steps,
                         )
 
+                        # Log student₂ data for debugging
+                        self._log_student2_jsonl(
+                            question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                            a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
+                            a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                            f_texts=f_texts,
+                            a2_texts=a2_texts,
+                            a2_correct=a2_correct,
+                            student2_rewards=student2_rewards,
+                            k=k,
+                            m=m,
+                            step=self.global_steps,
+                        )
+
                     # ==========================================================
                     # Build combined batch (teacher + student₂ sub-rollouts)
                     # Layout: teacher entries in groups of k (per prompt),
@@ -852,6 +1028,15 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "teacher_leak_count": teacher_leak_count,
                             "teacher_mean_reward": sum(teacher_rewards) / max(len(teacher_rewards), 1),
                             "student2_mean_reward": sum(student2_rewards) / max(len(student2_rewards), 1),
+                            # Prompt truncation metrics
+                            "a1_prompt_overflow_rate": a1_overflow["rate"],
+                            "a1_prompt_overflow_mean_tokens": a1_overflow["mean_overflow_tokens"],
+                            "f_prompt_overflow_rate": f_overflow["rate"],
+                            "f_prompt_overflow_mean_tokens": f_overflow["mean_overflow_tokens"],
+                            "a2_prompt_truncation_rate": a2_prompt_truncation_count / max(n_total_f, 1),
+                            "a2_prompt_truncation_mean_tokens": (
+                                sum(a2_prompt_truncation_tokens) / max(len(a2_prompt_truncation_tokens), 1)
+                            ),
                         }
                         self._log_self_teach_metrics(self_teach_metrics, max(n_total_a2, 1))
 

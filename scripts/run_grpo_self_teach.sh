@@ -26,8 +26,8 @@ python3 -m src.self_teach.main \
     data.val_files=${VAL_FILE} \
     data.train_batch_size=32 \
     data.val_batch_size=500 \
-    data.max_prompt_length=3072 \
-    data.max_response_length=2048 \
+    data.max_prompt_length=4096 \
+    data.max_response_length=3072 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     +data.apply_chat_template_kwargs.enable_thinking=false \
@@ -64,7 +64,7 @@ python3 -m src.self_teach.main \
     +self_teach.enabled=True \
     +self_teach.num_feedbacks=6 \
     +self_teach.num_a2_per_feedback=6 \
-    +self_teach.max_a2_prompt_length=4096 \
+    +self_teach.max_a2_prompt_length=5120 \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
