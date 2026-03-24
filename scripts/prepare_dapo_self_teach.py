@@ -34,17 +34,27 @@ DAPO_PROMPT_PREFIX = (
     "$Answer is the answer to the problem.\n\n"
 )
 
+# Suffix left over from the original DAPO format that conflicts with our
+# \boxed{} system prompt — strip it so the model gets a single clear instruction.
+DAPO_ANSWER_SUFFIX = (
+    '\n\nRemember to put your answer on its own line after "Answer:".'
+)
+
 
 def extract_question(prompt_messages: list[dict]) -> str:
     """Extract the raw math problem from DAPO's prompt format."""
     # DAPO uses a single user message with a prefix + the actual problem
     user_content = prompt_messages[0]["content"]
     if user_content.startswith(DAPO_PROMPT_PREFIX):
-        return user_content[len(DAPO_PROMPT_PREFIX):]
-    # Fallback: try stripping up to the double newline after instructions
-    parts = user_content.split("\n\n", 1)
-    if len(parts) == 2:
-        return parts[1]
+        user_content = user_content[len(DAPO_PROMPT_PREFIX):]
+    else:
+        # Fallback: try stripping up to the double newline after instructions
+        parts = user_content.split("\n\n", 1)
+        if len(parts) == 2:
+            user_content = parts[1]
+    # Strip the "Remember to put your answer ..." suffix
+    if user_content.endswith(DAPO_ANSWER_SUFFIX):
+        user_content = user_content[: -len(DAPO_ANSWER_SUFFIX)]
     return user_content
 
 

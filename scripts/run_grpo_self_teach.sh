@@ -26,7 +26,7 @@ python3 -m src.self_teach.main \
     data.val_files=${VAL_FILE} \
     data.train_batch_size=32 \
     data.val_batch_size=500 \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=7168 \
     data.max_response_length=3072 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
@@ -38,7 +38,7 @@ python3 -m src.self_teach.main \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16000 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -46,7 +46,7 @@ python3 -m src.self_teach.main \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.n=6 \
+    actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -54,7 +54,6 @@ python3 -m src.self_teach.main \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.multi_turn.enable=false \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=src.self_teach.agent_loop_overrides.FlexPromptAgentLoopManager \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -64,7 +63,6 @@ python3 -m src.self_teach.main \
     +self_teach.enabled=True \
     +self_teach.num_feedbacks=6 \
     +self_teach.num_a2_per_feedback=6 \
-    +self_teach.max_a2_prompt_length=5120 \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \

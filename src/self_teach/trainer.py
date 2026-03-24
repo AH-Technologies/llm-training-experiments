@@ -17,6 +17,8 @@ Every generation contributes to training — no wasted compute.
 Based on verl v0.2+ RayPPOTrainer with AgentLoop-based generation.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -24,7 +26,6 @@ import socket
 import uuid
 from dataclasses import dataclass
 from pprint import pprint
-from typing import Optional
 
 import numpy as np
 import torch
@@ -85,8 +86,7 @@ class SelfTeachConfig:
     filter_a1_correct: bool | None = None  # Skip A₁-correct prompts; None = auto (True if blind_teacher)
     num_feedbacks: int = 6  # k: number of teacher feedbacks per prompt
     num_a2_per_feedback: int = 6  # m: number of A₂ responses per feedback
-    max_a2_prompt_length: int | None = None  # Prompt length for A₂ generation; None = use default
-
+    train_teacher_only: bool = False  # Only train on teacher feedback entries (skip student₂ from batch)
 
 
 class SelfTeachRayPPOTrainer(RayPPOTrainer):
@@ -97,18 +97,12 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
     (mean improvement rate) and training student₂ (GRPO groups of m).
     """
 
-    def __init__(self, *args, self_teach_config: Optional[SelfTeachConfig] = None, **kwargs):
+    def __init__(self, *args, self_teach_config: SelfTeachConfig | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.self_teach_config = self_teach_config or SelfTeachConfig()
         # Resolve auto default for filter_a1_correct
         if self.self_teach_config.filter_a1_correct is None:
             self.self_teach_config.filter_a1_correct = self.self_teach_config.blind_teacher
-        # A₂ prompt length — use dedicated config if set, otherwise fall back
-        # to the global max_prompt_length.
-        self.max_a2_prompt_tokens = (
-            self.self_teach_config.max_a2_prompt_length
-            or self.config.data.max_prompt_length
-        )
         if self.self_teach_config.enabled:
             if self.config.reward_model.get("launch_reward_fn_async", False):
                 raise ValueError(
@@ -116,7 +110,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 )
             mode = "blind" if self.self_teach_config.blind_teacher else "conditioned"
             filter_str = "yes" if self.self_teach_config.filter_a1_correct else "no"
-            a2_len = self.self_teach_config.max_a2_prompt_length or "default"
             k = self.self_teach_config.num_feedbacks
             m = self.self_teach_config.num_a2_per_feedback
             assert k == m, (
@@ -125,8 +118,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             )
             print(
                 f"[SelfTeach Tree] Initialized. teacher={mode}, "
-                f"filter_a1_correct={filter_str}, max_a2_prompt_length={a2_len}, "
-                f"k={k}, m={m}"
+                f"filter_a1_correct={filter_str}, k={k}, m={m}"
             )
 
     # ------------------------------------------------------------------
@@ -148,7 +140,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             add_special_tokens=False,
         )) + 200  # STUDENT2_PROMPT_TEMPLATE XML tags + instruction + chat template overhead
 
-        available = self.max_a2_prompt_tokens - fixed_tokens
+        available = self.config.data.max_prompt_length - fixed_tokens
         per_turn = available // 2
 
         a1_ids = self.tokenizer.encode(a1_text, add_special_tokens=False)
@@ -180,6 +172,10 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
     ) -> dict:
         """Check how many prompts exceed the max_prompt_length budget.
 
+        "Overflow" means verl will silently truncate these prompts at
+        tokenization time. This is distinct from our explicit A2
+        "truncation" in _truncate_for_a2 which we control ourselves.
+
         Returns dict with overflow stats: count, rate, and mean tokens over.
         """
         overflow_count = 0
@@ -207,7 +203,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         global_steps: int,
         data_sources: list[str],
         ground_truths: list[str],
-        max_prompt_length: int | None = None,
     ) -> DataProto:
         """Generate sequences, padding the batch to be divisible by worker count.
 
@@ -228,7 +223,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         gen_batch = self._build_gen_batch(
             raw_prompts, temperature, global_steps,
             data_sources=data_sources, ground_truths=ground_truths,
-            max_prompt_length=max_prompt_length,
         )
         output = self.async_rollout_manager.generate_sequences(gen_batch)
         timing = output.meta_info.pop("timing", {})
@@ -247,7 +241,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         global_steps: int,
         data_sources: list[str] | None = None,
         ground_truths: list[str] | None = None,
-        max_prompt_length: int | None = None,
     ) -> DataProto:
         """Build a DataProto for generation from raw prompt message lists.
 
@@ -261,10 +254,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             global_steps: Current training step (for tracing).
             data_sources: Per-entry data source labels (required by reward loop).
             ground_truths: Per-entry ground truth answers (required by reward loop).
-            max_prompt_length: Override prompt padding length for this batch.
-                When set, the agent loop pads prompts to this size instead of
-                the global config value. Useful for A₂ batches that need more
-                room for multi-turn context.
         """
         n = len(raw_prompts)
         non_tensors = {
@@ -275,10 +264,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         if ground_truths is not None:
             non_tensors["reward_model"] = np.array(
                 [{"ground_truth": gt} for gt in ground_truths], dtype=object
-            )
-        if max_prompt_length is not None:
-            non_tensors["max_prompt_length"] = np.array(
-                [max_prompt_length] * n, dtype=np.int64
             )
         return DataProto.from_dict(
             # Dummy tensor so DataProto.batch is not None (required for chunk/len)
@@ -918,7 +903,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             a2_output = self._generate_padded(
                                 a2_raw_prompts, temperature, self.global_steps,
                                 data_sources=a2_data_sources, ground_truths=a2_ground_truths,
-                                max_prompt_length=self.self_teach_config.max_a2_prompt_length,
                             )
                             timing_raw.update(a2_output.meta_info.pop("timing", {}))
 
@@ -1028,7 +1012,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "teacher_leak_count": teacher_leak_count,
                             "teacher_mean_reward": sum(teacher_rewards) / max(len(teacher_rewards), 1),
                             "student2_mean_reward": sum(student2_rewards) / max(len(student2_rewards), 1),
-                            # Prompt truncation metrics
+                                # Prompt overflow (verl-level silent truncation) and
+                            # A2 truncation (our explicit _truncate_for_a2)
                             "a1_prompt_overflow_rate": a1_overflow["rate"],
                             "a1_prompt_overflow_mean_tokens": a1_overflow["mean_overflow_tokens"],
                             "f_prompt_overflow_rate": f_overflow["rate"],
@@ -1093,7 +1078,10 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 }
                             )
 
-                        all_entries = teacher_entries + student2_entries
+                        if self.self_teach_config.train_teacher_only:
+                            all_entries = teacher_entries
+                        else:
+                            all_entries = teacher_entries + student2_entries
 
                         if len(all_entries) == 0:
                             print(
@@ -1109,7 +1097,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     print(
                         f"[SelfTeach step {self.global_steps}] "
                         f"Combined batch: {len(all_entries)} entries "
-                        f"({len(teacher_entries)} teacher + {len(student2_entries)} student₂) "
+                        f"({len(teacher_entries)} teacher + "
+                        f"{'0 (teacher-only)' if self.self_teach_config.train_teacher_only else str(len(student2_entries))} student₂) "
                         f"from {n_teacher_prompts}/{bs} prompts, k={k}, m={m}"
                     )
 
@@ -1399,7 +1388,7 @@ class SelfTeachTaskRunner(TaskRunner):
             filter_a1_correct=filter_val,
             num_feedbacks=st_cfg_raw.get("num_feedbacks", 6),
             num_a2_per_feedback=st_cfg_raw.get("num_a2_per_feedback", 6),
-            max_a2_prompt_length=st_cfg_raw.get("max_a2_prompt_length", None),
+            train_teacher_only=st_cfg_raw.get("train_teacher_only", False),
         )
         print(
             f"[SelfTeach] Config: enabled={self_teach_config.enabled}, "
