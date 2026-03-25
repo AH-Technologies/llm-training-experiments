@@ -63,6 +63,10 @@ python3 -m src.self_teach.main \
     +self_teach.enabled=True \
     +self_teach.num_feedbacks=6 \
     +self_teach.num_a2_per_feedback=6 \
+    +self_teach.use_dense_reward=${USE_DENSE_REWARD:-False} \
+    +self_teach.rss_alpha=${RSS_ALPHA:-0.01} \
+    +self_teach.kl_leakage_lambda=${KL_LEAKAGE_LAMBDA:-0.0} \
+    +self_teach.kl_leakage_alpha=${KL_LEAKAGE_ALPHA:-0.01} \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \

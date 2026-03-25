@@ -201,6 +201,8 @@ elif [ "$TASK" == "astar_sft" ]; then
 elif [ "$TASK" == "self_teach" ]; then
     # Self-Teach: Student-Teacher self-play GRPO
     # Data paths configured in run_grpo_self_teach.sh (defaults to DAPO + combined val)
+    export KL_LEAKAGE_LAMBDA=3.0
+    export KL_LEAKAGE_ALPHA=0.01
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 elif [ "$TASK" == "self_teach_filtered" ]; then
     # Self-Teach with informed teacher + A₁-correct filtering on DAPO
@@ -212,6 +214,8 @@ elif [ "$TASK" == "self_teach_filtered" ]; then
     export TRAIN_FILE="data/dapo/dapo_all_verl.parquet"
     export VAL_FILE="data/val/val_combined_verl.parquet"
     export EXPERIMENT_NAME="self_teach_filtered_dapo_qwen3"
+    export KL_LEAKAGE_LAMBDA=3.0
+    export KL_LEAKAGE_ALPHA=0.01
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
     EXTRA_ARGS="+self_teach.filter_a1_correct=True"
 elif [ "$TASK" == "self_teach_blind" ]; then
@@ -250,6 +254,32 @@ elif [ "$TASK" == "self_teach_teacher_only" ]; then
     export EXPERIMENT_NAME="self_teach_teacher_only_dapo_qwen3"
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
     EXTRA_ARGS="+self_teach.blind_teacher=True +self_teach.filter_a1_correct=True +self_teach.train_teacher_only=True"
+elif [ "$TASK" == "self_teach_teacher_only_conditioned" ]; then
+    # Self-Teach ablation: train only on teacher feedback (conditioned + filtered), skip student₂ from batch
+    if [ ! -f "data/dapo/dapo_all_verl.parquet" ]; then
+        echo "Preparing DAPO-Math-17K data..."
+        python scripts/prepare_dapo_self_teach.py
+    fi
+
+    export TRAIN_FILE="data/dapo/dapo_all_verl.parquet"
+    export VAL_FILE="data/val/val_combined_verl.parquet"
+    export EXPERIMENT_NAME="self_teach_teacher_only_conditioned_dapo_qwen3"
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+    EXTRA_ARGS="+self_teach.filter_a1_correct=True +self_teach.train_teacher_only=True"
+elif [ "$TASK" == "self_teach_teacher_only_conditioned_dense" ]; then
+    # Self-Teach: teacher-only conditioned + filtered with dense r^SS reward (RLT-inspired)
+    if [ ! -f "data/dapo/dapo_all_verl.parquet" ]; then
+        echo "Preparing DAPO-Math-17K data..."
+        python scripts/prepare_dapo_self_teach.py
+    fi
+
+    export TRAIN_FILE="data/dapo/dapo_all_verl.parquet"
+    export VAL_FILE="data/val/val_combined_verl.parquet"
+    export EXPERIMENT_NAME="self_teach_teacher_only_conditioned_dense_dapo_qwen3"
+    export USE_DENSE_REWARD=True
+    export KL_LEAKAGE_LAMBDA=0.0
+    TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+    EXTRA_ARGS="+self_teach.filter_a1_correct=True +self_teach.train_teacher_only=True"
 elif [ "$TASK" == "self_teach_dapo" ]; then
     # Self-Teach on DAPO-Math-17K (competition-level math)
     if [ ! -f "data/dapo/dapo_all_verl.parquet" ]; then
@@ -263,7 +293,7 @@ elif [ "$TASK" == "self_teach_dapo" ]; then
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach, self_teach_filtered, self_teach_blind, self_teach_blind_filtered, self_teach_teacher_only, self_teach_dapo"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach, self_teach_filtered, self_teach_blind, self_teach_blind_filtered, self_teach_teacher_only, self_teach_teacher_only_conditioned, self_teach_dapo"
     exit 1
 fi
 

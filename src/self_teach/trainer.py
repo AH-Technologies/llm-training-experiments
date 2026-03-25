@@ -58,7 +58,7 @@ from .prompts import (
     BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED,
     STUDENT2_PROMPT_TEMPLATE,
 )
-from .rewards import compute_self_teach_rewards
+from .rewards import compute_kl_leakage_penalty, compute_self_teach_rewards, compute_solution_understanding_reward
 
 
 def strip_think_blocks(text: str) -> str:
@@ -87,6 +87,12 @@ class SelfTeachConfig:
     num_feedbacks: int = 6  # k: number of teacher feedbacks per prompt
     num_a2_per_feedback: int = 6  # m: number of A₂ responses per feedback
     train_teacher_only: bool = False  # Only train on teacher feedback entries (skip student₂ from batch)
+    # Dense reward (RLT-inspired): teacher_reward = r_SS - lambda * r_KL
+    use_dense_reward: bool = False  # Use r^SS + r^KL instead of binary base reward
+    rss_alpha: float = 0.01  # Weight for min term in r^SS (catches worst-case solution tokens)
+    # KL leakage penalty (replaces boxed{} heuristic)
+    kl_leakage_lambda: float = 0.0  # Weight for KL penalty in teacher reward. 0 = disabled.
+    kl_leakage_alpha: float = 0.01  # Weight for max-KL term within the penalty
 
 
 class SelfTeachRayPPOTrainer(RayPPOTrainer):
@@ -164,6 +170,50 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         a1_out = self.tokenizer.decode(a1_ids, skip_special_tokens=True)
         f_out = self.tokenizer.decode(f_ids, skip_special_tokens=True)
         return a1_out, f_out, tokens_truncated
+
+    def _compute_feedback_logprobs(
+        self,
+        context_texts: list[str],
+        feedback_texts: list[str],
+    ) -> list[torch.Tensor]:
+        """Compute per-token log-probs of feedback tokens given context.
+
+        Builds a DataProto batch where the context is the "prompt" and the
+        feedback is the "response", then uses the existing actor log-prob
+        infrastructure to compute per-token log-probs.
+
+        Returns list of 1-D tensors, one per feedback, with per-token log-probs.
+        """
+        import torch
+        tokenizer = self.tokenizer
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        entries = []
+        for ctx, fb in zip(context_texts, feedback_texts):
+            ctx_ids = tokenizer.encode(ctx, add_special_tokens=False)
+            fb_ids = tokenizer.encode(fb, add_special_tokens=False)
+            entries.append({
+                "prompt_ids": torch.tensor(ctx_ids, dtype=torch.long),
+                "response_ids": torch.tensor(fb_ids, dtype=torch.long),
+                "reward": 0.0,
+                "uid": "kl_probe",
+            })
+
+        if not entries:
+            return []
+
+        batch = self._build_combined_batch(entries, pad_id)
+        # Use the actor's log-prob computation (dispatches to ray workers)
+        log_prob_output, _ = self._compute_old_log_prob(batch)
+        old_log_probs = log_prob_output.batch["old_log_probs"]  # (n, max_response_len)
+
+        result = []
+        for i, entry in enumerate(entries):
+            r_len = len(entry["response_ids"])
+            # Extract only the real (non-padded) log-probs
+            result.append(old_log_probs[i, :r_len].detach().cpu())
+
+        return result
 
     def _check_prompt_overflow(
         self,
@@ -920,31 +970,136 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             )
                             a2_correct.append(score >= 0.5)
 
-                        # Compute teacher rewards: mean improvement rate per F
-                        for f_idx in range(n_total_f):
-                            j = f_idx // k
-                            i = teacher_prompt_indices[j]
-                            a2_start = f_idx * m
-                            rewards_for_f = []
-                            for a2_offset in range(m):
-                                t_r, _ = compute_self_teach_rewards(
-                                    a1_correct[i], a2_correct[a2_start + a2_offset]
-                                )
-                                rewards_for_f.append(t_r)
-                            teacher_rewards.append(sum(rewards_for_f) / m)
+                        # ==========================================================
+                        # Teacher reward computation
+                        # ==========================================================
+                        use_dense = self.self_teach_config.use_dense_reward
+                        kl_lambda = self.self_teach_config.kl_leakage_lambda
+                        kl_alpha = self.self_teach_config.kl_leakage_alpha
+                        rss_alpha = self.self_teach_config.rss_alpha
+                        kl_penalties = []
+                        rss_rewards = []
 
-                        # Penalize teacher for leaking answer (reward hacking detection)
-                        # Only check inside <feedback> tags — reasoning section may
-                        # legitimately reference the ground truth.
-                        for f_idx in range(n_total_f):
-                            f_visible = strip_think_blocks(f_texts[f_idx])
-                            feedback_match = re.search(
-                                r"<feedback>(.*?)</feedback>", f_visible, re.DOTALL
+                        if use_dense and not self.self_teach_config.blind_teacher:
+                            # Dense reward: r_SS - lambda * r_KL
+                            # Builds contexts and runs forward passes for both terms.
+                            informed_contexts = []
+                            student_contexts = []
+                            ss_contexts = []
+                            feedback_only_texts = []
+                            gt_texts = []
+
+                            for f_idx in range(n_total_f):
+                                j = f_idx // k
+                                i = teacher_prompt_indices[j]
+                                fb_text = extract_feedback(f_texts[f_idx])
+                                feedback_only_texts.append(fb_text)
+                                gt_texts.append(ground_truths[i])
+
+                                # r^KL contexts: informed (with GT) vs student (without GT)
+                                informed_contexts.append(
+                                    f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
+                                    f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
+                                    f"<ground_truth_answer>\n{ground_truths[i]}\n</ground_truth_answer>\n\n"
+                                )
+                                student_ctx = (
+                                    f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
+                                    f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
+                                )
+                                student_contexts.append(student_ctx)
+
+                                # r^SS context: student sees question + attempt + feedback
+                                ss_contexts.append(
+                                    f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
+                                    f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
+                                    f"<feedback_from_teacher>\n{fb_text}\n</feedback_from_teacher>\n\n"
+                                )
+
+                            # r^SS: student log-prob of GT answer after reading feedback
+                            ss_lps = self._compute_feedback_logprobs(
+                                ss_contexts, gt_texts
                             )
-                            feedback_text = feedback_match.group(1) if feedback_match else f_visible
-                            if "\\boxed{" in feedback_text:
-                                teacher_rewards[f_idx] = -1.0
-                                teacher_leak_count += 1
+
+                            # r^KL: leakage detection
+                            if kl_lambda > 0.0:
+                                informed_lps = self._compute_feedback_logprobs(
+                                    informed_contexts, feedback_only_texts
+                                )
+                                student_lps = self._compute_feedback_logprobs(
+                                    student_contexts, feedback_only_texts
+                                )
+
+                            for f_idx in range(n_total_f):
+                                r_ss = compute_solution_understanding_reward(
+                                    ss_lps[f_idx], alpha=rss_alpha
+                                )
+                                rss_rewards.append(r_ss)
+
+                                if kl_lambda > 0.0:
+                                    r_kl = compute_kl_leakage_penalty(
+                                        informed_lps[f_idx], student_lps[f_idx], alpha=kl_alpha
+                                    )
+                                    kl_penalties.append(r_kl)
+                                else:
+                                    r_kl = 0.0
+
+                                teacher_rewards.append(r_ss - kl_lambda * r_kl)
+                        else:
+                            # Binary reward: mean improvement rate per feedback
+                            for f_idx in range(n_total_f):
+                                j = f_idx // k
+                                i = teacher_prompt_indices[j]
+                                a2_start = f_idx * m
+                                rewards_for_f = []
+                                for a2_offset in range(m):
+                                    t_r, _ = compute_self_teach_rewards(
+                                        a1_correct[i], a2_correct[a2_start + a2_offset]
+                                    )
+                                    rewards_for_f.append(t_r)
+                                teacher_rewards.append(sum(rewards_for_f) / m)
+
+                            # Leakage detection for binary mode
+                            if kl_lambda > 0.0 and not self.self_teach_config.blind_teacher:
+                                feedback_only_texts = []
+                                informed_contexts = []
+                                student_contexts = []
+                                for f_idx in range(n_total_f):
+                                    j = f_idx // k
+                                    i = teacher_prompt_indices[j]
+                                    fb_text = extract_feedback(f_texts[f_idx])
+                                    feedback_only_texts.append(fb_text)
+                                    informed_contexts.append(
+                                        f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
+                                        f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
+                                        f"<ground_truth_answer>\n{ground_truths[i]}\n</ground_truth_answer>\n\n"
+                                    )
+                                    student_contexts.append(
+                                        f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
+                                        f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
+                                    )
+                                informed_lps = self._compute_feedback_logprobs(
+                                    informed_contexts, feedback_only_texts
+                                )
+                                student_lps = self._compute_feedback_logprobs(
+                                    student_contexts, feedback_only_texts
+                                )
+                                for f_idx in range(n_total_f):
+                                    penalty = compute_kl_leakage_penalty(
+                                        informed_lps[f_idx], student_lps[f_idx], alpha=kl_alpha
+                                    )
+                                    teacher_rewards[f_idx] -= kl_lambda * penalty
+                                    kl_penalties.append(penalty)
+                            else:
+                                # Fallback: simple boxed{} heuristic
+                                for f_idx in range(n_total_f):
+                                    f_visible = strip_think_blocks(f_texts[f_idx])
+                                    feedback_match = re.search(
+                                        r"<feedback>(.*?)</feedback>", f_visible, re.DOTALL
+                                    )
+                                    feedback_text = feedback_match.group(1) if feedback_match else f_visible
+                                    if "\\boxed{" in feedback_text:
+                                        teacher_rewards[f_idx] = -1.0
+                                        teacher_leak_count += 1
 
                         # Compute student₂ rewards: per A₂, binary
                         for a2_idx in range(n_total_a2):
@@ -1021,6 +1176,24 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "a2_prompt_truncation_rate": a2_prompt_truncation_count / max(n_total_f, 1),
                             "a2_prompt_truncation_mean_tokens": (
                                 sum(a2_prompt_truncation_tokens) / max(len(a2_prompt_truncation_tokens), 1)
+                            ),
+                            **(
+                                {
+                                    "teacher/kl_leakage_mean": sum(kl_penalties) / len(kl_penalties),
+                                    "teacher/kl_leakage_max": max(kl_penalties),
+                                    "teacher/kl_leakage_min": min(kl_penalties),
+                                }
+                                if kl_penalties
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "teacher/rss_mean": sum(rss_rewards) / len(rss_rewards),
+                                    "teacher/rss_max": max(rss_rewards),
+                                    "teacher/rss_min": min(rss_rewards),
+                                }
+                                if rss_rewards
+                                else {}
                             ),
                         }
                         self._log_self_teach_metrics(self_teach_metrics, max(n_total_a2, 1))
