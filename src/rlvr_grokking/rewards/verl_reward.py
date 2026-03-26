@@ -315,7 +315,20 @@ def extract_answer(response: str) -> str | None:
     """
     response = response.strip()
 
-    # Try \boxed{} first (for math problems) - this is the primary format
+    # Try <answer>...</answer> first (our prompted format)
+    answer_match = re.search(r'<answer>\s*(.*?)\s*</answer>', response, re.DOTALL)
+    if answer_match:
+        answer_content = answer_match.group(1).strip()
+        # Try to extract a boxed answer within the answer tags
+        boxed_in_answer = extract_boxed_answer(answer_content)
+        if boxed_in_answer:
+            return boxed_in_answer
+        # Otherwise return the content (strip trailing punctuation)
+        answer_content = re.sub(r'[.\s]+$', '', answer_content)
+        if answer_content:
+            return answer_content
+
+    # Try \boxed{} (for math problems) - primary format for models not using <answer> tags
     boxed = extract_boxed_answer(response)
     if boxed:
         return boxed

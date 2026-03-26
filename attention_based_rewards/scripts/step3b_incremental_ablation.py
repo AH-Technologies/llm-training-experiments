@@ -15,9 +15,9 @@ from datasets import load_dataset
 from transformer_lens import HookedTransformer
 
 BASE_DIR = "/cluster/projects/nn12068k/haaklau/llm-training-experiments/attention_based_rewards"
-N_PROBLEMS = 16
+N_PROBLEMS = 50
 MAX_NEW_TOKENS = 512
-N_TOP_HEADS = 20  # test removing up to 20 heads
+N_TOP_HEADS = 12  # test removing up to 12 heads
 
 SYSTEM_PROMPT = (
     "You are a helpful AI Assistant that provides well-reasoned and detailed responses. "
