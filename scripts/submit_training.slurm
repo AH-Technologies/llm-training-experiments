@@ -201,8 +201,6 @@ elif [ "$TASK" == "astar_sft" ]; then
 elif [ "$TASK" == "self_teach" ]; then
     # Self-Teach: Student-Teacher self-play GRPO
     # Data paths configured in run_grpo_self_teach.sh (defaults to DAPO + combined val)
-    export KL_LEAKAGE_LAMBDA=3.0
-    export KL_LEAKAGE_ALPHA=0.01
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
 elif [ "$TASK" == "self_teach_filtered" ]; then
     # Self-Teach with informed teacher + A₁-correct filtering on DAPO
@@ -214,8 +212,6 @@ elif [ "$TASK" == "self_teach_filtered" ]; then
     export TRAIN_FILE="data/dapo/dapo_all_verl.parquet"
     export VAL_FILE="data/val/val_combined_verl.parquet"
     export EXPERIMENT_NAME="self_teach_filtered_dapo_qwen3"
-    export KL_LEAKAGE_LAMBDA=3.0
-    export KL_LEAKAGE_ALPHA=0.01
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
     EXTRA_ARGS="+self_teach.filter_a1_correct=True"
 elif [ "$TASK" == "self_teach_blind" ]; then
@@ -277,7 +273,6 @@ elif [ "$TASK" == "self_teach_teacher_only_conditioned_dense" ]; then
     export VAL_FILE="data/val/val_combined_verl.parquet"
     export EXPERIMENT_NAME="self_teach_teacher_only_conditioned_dense_dapo_qwen3"
     export USE_DENSE_REWARD=True
-    export KL_LEAKAGE_LAMBDA=0.0
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
     EXTRA_ARGS="+self_teach.filter_a1_correct=True +self_teach.train_teacher_only=True"
 elif [ "$TASK" == "self_teach_dapo" ]; then

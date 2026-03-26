@@ -2,40 +2,6 @@
 import torch
 
 
-def compute_kl_leakage_penalty(
-    informed_logprobs: torch.Tensor,
-    student_logprobs: torch.Tensor,
-    alpha: float = 0.01,
-) -> float:
-    """Compute KL-based leakage penalty for teacher feedback tokens.
-
-    Measures how much the feedback tokens depend on information only
-    available in the teacher's context (i.e., the ground truth answer).
-
-    Args:
-        informed_logprobs: Log-probs of feedback tokens under teacher-informed
-            context (question + student_attempt + ground_truth + feedback).
-        student_logprobs: Log-probs of feedback tokens under student-only
-            context (question + student_attempt + feedback).
-        alpha: Weight for the max-KL term (catches single-token spikes).
-
-    Returns:
-        Scalar penalty >= 0. Higher means more leakage.
-    """
-    # Per-token KL: log p_informed - log p_student
-    # When informed > student (teacher context helps predict token),
-    # this is positive — indicating the token carries GT information.
-    per_token_kl = informed_logprobs - student_logprobs
-
-    # Clamp to >= 0: we only penalize tokens where teacher context helps
-    per_token_kl = torch.clamp(per_token_kl, min=0.0)
-
-    mean_kl = per_token_kl.mean().item()
-    max_kl = per_token_kl.max().item()
-
-    return mean_kl + alpha * max_kl
-
-
 def compute_solution_understanding_reward(
     solution_logprobs: torch.Tensor,
     alpha: float = 0.01,

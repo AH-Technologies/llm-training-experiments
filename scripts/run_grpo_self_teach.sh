@@ -65,8 +65,9 @@ python3 -m src.self_teach.main \
     +self_teach.num_a2_per_feedback=6 \
     +self_teach.use_dense_reward=${USE_DENSE_REWARD:-False} \
     +self_teach.rss_alpha=${RSS_ALPHA:-0.01} \
-    +self_teach.kl_leakage_lambda=${KL_LEAKAGE_LAMBDA:-0.0} \
-    +self_teach.kl_leakage_alpha=${KL_LEAKAGE_ALPHA:-0.01} \
+    +self_teach.leakage_detector=${LEAKAGE_DETECTOR:-heuristic} \
+    +self_teach.llm_judge_api_base=${LLM_JUDGE_API_BASE:-} \
+    +self_teach.llm_judge_model=${LLM_JUDGE_MODEL:-gemini-2.5-flash-lite} \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rlvr-grokking' \
@@ -74,7 +75,7 @@ python3 -m src.self_teach.main \
     trainer.n_gpus_per_node=${SLURM_GPUS_ON_NODE:-4} \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=3 \
+    trainer.max_actor_ckpt_to_keep=1 \
     trainer.val_before_train=True \
     trainer.test_freq=20 \
     trainer.total_epochs=2000 \

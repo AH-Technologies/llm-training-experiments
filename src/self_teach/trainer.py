@@ -58,7 +58,7 @@ from .prompts import (
     BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED,
     STUDENT2_PROMPT_TEMPLATE,
 )
-from .rewards import compute_kl_leakage_penalty, compute_self_teach_rewards, compute_solution_understanding_reward
+from .rewards import compute_self_teach_rewards, compute_solution_understanding_reward
 
 
 def strip_think_blocks(text: str) -> str:
@@ -87,12 +87,17 @@ class SelfTeachConfig:
     num_feedbacks: int = 6  # k: number of teacher feedbacks per prompt
     num_a2_per_feedback: int = 6  # m: number of A₂ responses per feedback
     train_teacher_only: bool = False  # Only train on teacher feedback entries (skip student₂ from batch)
-    # Dense reward (RLT-inspired): teacher_reward = r_SS - lambda * r_KL
-    use_dense_reward: bool = False  # Use r^SS + r^KL instead of binary base reward
+    # Dense reward (RLT-inspired): use r^SS instead of binary improvement rate
+    use_dense_reward: bool = False
     rss_alpha: float = 0.01  # Weight for min term in r^SS (catches worst-case solution tokens)
-    # KL leakage penalty (replaces boxed{} heuristic)
-    kl_leakage_lambda: float = 0.0  # Weight for KL penalty in teacher reward. 0 = disabled.
-    kl_leakage_alpha: float = 0.01  # Weight for max-KL term within the penalty
+
+    # Leakage detection
+    leakage_detector: str = "heuristic"       # "heuristic" | "llm_judge"
+    llm_judge_api_base: str | None = None     # OpenAI-compatible endpoint
+    llm_judge_api_key: str | None = None      # falls back to LLM_JUDGE_API_KEY env var
+    llm_judge_model: str = "gemini-2.5-flash-lite"
+    llm_judge_max_workers: int = 32
+    llm_judge_timeout: float = 30.0
 
 
 class SelfTeachRayPPOTrainer(RayPPOTrainer):
@@ -126,6 +131,26 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 f"[SelfTeach Tree] Initialized. teacher={mode}, "
                 f"filter_a1_correct={filter_str}, k={k}, m={m}"
             )
+            # Initialize leakage detector
+            if self.self_teach_config.leakage_detector == "llm_judge":
+                from .leakage_judge import LLMJudgeLeakageDetector
+                api_key = self.self_teach_config.llm_judge_api_key or os.environ.get("LLM_JUDGE_API_KEY")
+                if not self.self_teach_config.llm_judge_api_base:
+                    raise ValueError("llm_judge_api_base must be set when leakage_detector='llm_judge'")
+                if not api_key:
+                    raise ValueError("LLM_JUDGE_API_KEY env var or llm_judge_api_key config must be set")
+                self.leakage_detector = LLMJudgeLeakageDetector(
+                    api_base=self.self_teach_config.llm_judge_api_base,
+                    api_key=api_key,
+                    model=self.self_teach_config.llm_judge_model,
+                    max_workers=self.self_teach_config.llm_judge_max_workers,
+                    timeout=self.self_teach_config.llm_judge_timeout,
+                )
+                print(f"[SelfTeach] Leakage detector: LLM judge ({self.self_teach_config.llm_judge_model})")
+            else:
+                from .leakage_judge import HeuristicLeakageDetector
+                self.leakage_detector = HeuristicLeakageDetector()
+                print("[SelfTeach] Leakage detector: heuristic (\\boxed{} check)")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -196,21 +221,19 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 "prompt_ids": torch.tensor(ctx_ids, dtype=torch.long),
                 "response_ids": torch.tensor(fb_ids, dtype=torch.long),
                 "reward": 0.0,
-                "uid": "kl_probe",
+                "uid": "logprob_probe",
             })
 
         if not entries:
             return []
 
         batch = self._build_combined_batch(entries, pad_id)
-        # Use the actor's log-prob computation (dispatches to ray workers)
         log_prob_output, _ = self._compute_old_log_prob(batch)
         old_log_probs = log_prob_output.batch["old_log_probs"]  # (n, max_response_len)
 
         result = []
         for i, entry in enumerate(entries):
             r_len = len(entry["response_ids"])
-            # Extract only the real (non-padded) log-probs
             result.append(old_log_probs[i, :r_len].detach().cpu())
 
         return result
@@ -473,6 +496,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         "self_teach/f_prompt_overflow_mean_tokens": metrics_dict.get("f_prompt_overflow_mean_tokens", 0.0),
                         "self_teach/a2_prompt_truncation_rate": a2_trunc,
                         "self_teach/a2_prompt_truncation_mean_tokens": metrics_dict.get("a2_prompt_truncation_mean_tokens", 0.0),
+                        "self_teach/judge_error_count": metrics_dict.get("judge_error_count", 0),
                     },
                     step=self.global_steps,
                 )
@@ -898,6 +922,14 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
 
                     f_texts = self._decode_responses(f_output) if f_output is not None else []
 
+                    # Submit leakage detection (async for LLM judge, immediate for heuristic)
+                    if f_texts:
+                        self.leakage_detector.submit_batch(
+                            feedbacks=[extract_feedback(strip_think_blocks(f)) for f in f_texts],
+                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices for _ in range(k)],
+                            questions=[question_texts[i] for i in teacher_prompt_indices for _ in range(k)],
+                        )
+
                     # ==========================================================
                     # Step 3: Generate A₂ — n_teacher * k * m entries
                     # Each feedback Fᵢ gets m A₂ responses. These serve dual
@@ -919,9 +951,16 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     a2_prompt_truncation_tokens = []
 
                     n_total_f = n_teacher_prompts * k  # total feedbacks
-                    n_total_a2 = n_total_f * m  # total A₂ responses
 
-                    if n_teacher_prompts > 0:
+                    # Skip A₂ generation when using dense reward + teacher-only training
+                    # (A₂ rollouts are only needed for binary teacher reward and student₂ training)
+                    skip_a2 = (
+                        self.self_teach_config.use_dense_reward
+                        and self.self_teach_config.train_teacher_only
+                    )
+                    n_total_a2 = 0 if skip_a2 else n_total_f * m
+
+                    if n_teacher_prompts > 0 and not skip_a2:
                         with marked_timer("gen_a2", timing_raw, color="blue"):
                             a2_raw_prompts = []
                             a2_data_sources = []
@@ -969,44 +1008,30 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 ground_truth=ground_truths[i],
                             )
                             a2_correct.append(score >= 0.5)
+                    elif n_teacher_prompts > 0 and skip_a2:
+                        print(
+                            f"[SelfTeach step {self.global_steps}] "
+                            f"Skipping A₂ generation (dense reward + teacher-only mode)"
+                        )
 
+                    if n_teacher_prompts > 0:
                         # ==========================================================
                         # Teacher reward computation
                         # ==========================================================
                         use_dense = self.self_teach_config.use_dense_reward
-                        kl_lambda = self.self_teach_config.kl_leakage_lambda
-                        kl_alpha = self.self_teach_config.kl_leakage_alpha
                         rss_alpha = self.self_teach_config.rss_alpha
-                        kl_penalties = []
                         rss_rewards = []
 
                         if use_dense and not self.self_teach_config.blind_teacher:
-                            # Dense reward: r_SS - lambda * r_KL
-                            # Builds contexts and runs forward passes for both terms.
-                            informed_contexts = []
-                            student_contexts = []
+                            # Dense reward: r^SS (solution understanding)
                             ss_contexts = []
-                            feedback_only_texts = []
                             gt_texts = []
 
                             for f_idx in range(n_total_f):
                                 j = f_idx // k
                                 i = teacher_prompt_indices[j]
                                 fb_text = extract_feedback(f_texts[f_idx])
-                                feedback_only_texts.append(fb_text)
                                 gt_texts.append(ground_truths[i])
-
-                                # r^KL contexts: informed (with GT) vs student (without GT)
-                                informed_contexts.append(
-                                    f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
-                                    f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
-                                    f"<ground_truth_answer>\n{ground_truths[i]}\n</ground_truth_answer>\n\n"
-                                )
-                                student_ctx = (
-                                    f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
-                                    f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
-                                )
-                                student_contexts.append(student_ctx)
 
                                 # r^SS context: student sees question + attempt + feedback
                                 ss_contexts.append(
@@ -1020,30 +1045,12 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 ss_contexts, gt_texts
                             )
 
-                            # r^KL: leakage detection
-                            if kl_lambda > 0.0:
-                                informed_lps = self._compute_feedback_logprobs(
-                                    informed_contexts, feedback_only_texts
-                                )
-                                student_lps = self._compute_feedback_logprobs(
-                                    student_contexts, feedback_only_texts
-                                )
-
                             for f_idx in range(n_total_f):
                                 r_ss = compute_solution_understanding_reward(
                                     ss_lps[f_idx], alpha=rss_alpha
                                 )
                                 rss_rewards.append(r_ss)
-
-                                if kl_lambda > 0.0:
-                                    r_kl = compute_kl_leakage_penalty(
-                                        informed_lps[f_idx], student_lps[f_idx], alpha=kl_alpha
-                                    )
-                                    kl_penalties.append(r_kl)
-                                else:
-                                    r_kl = 0.0
-
-                                teacher_rewards.append(r_ss - kl_lambda * r_kl)
+                                teacher_rewards.append(r_ss)
                         else:
                             # Binary reward: mean improvement rate per feedback
                             for f_idx in range(n_total_f):
@@ -1058,48 +1065,13 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                     rewards_for_f.append(t_r)
                                 teacher_rewards.append(sum(rewards_for_f) / m)
 
-                            # Leakage detection for binary mode
-                            if kl_lambda > 0.0 and not self.self_teach_config.blind_teacher:
-                                feedback_only_texts = []
-                                informed_contexts = []
-                                student_contexts = []
-                                for f_idx in range(n_total_f):
-                                    j = f_idx // k
-                                    i = teacher_prompt_indices[j]
-                                    fb_text = extract_feedback(f_texts[f_idx])
-                                    feedback_only_texts.append(fb_text)
-                                    informed_contexts.append(
-                                        f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
-                                        f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
-                                        f"<ground_truth_answer>\n{ground_truths[i]}\n</ground_truth_answer>\n\n"
-                                    )
-                                    student_contexts.append(
-                                        f"<problem_statement>\n{question_texts[i]}\n</problem_statement>\n\n"
-                                        f"<student_attempt>\n{a1_texts_clean[i]}\n</student_attempt>\n\n"
-                                    )
-                                informed_lps = self._compute_feedback_logprobs(
-                                    informed_contexts, feedback_only_texts
-                                )
-                                student_lps = self._compute_feedback_logprobs(
-                                    student_contexts, feedback_only_texts
-                                )
-                                for f_idx in range(n_total_f):
-                                    penalty = compute_kl_leakage_penalty(
-                                        informed_lps[f_idx], student_lps[f_idx], alpha=kl_alpha
-                                    )
-                                    teacher_rewards[f_idx] -= kl_lambda * penalty
-                                    kl_penalties.append(penalty)
-                            else:
-                                # Fallback: simple boxed{} heuristic
-                                for f_idx in range(n_total_f):
-                                    f_visible = strip_think_blocks(f_texts[f_idx])
-                                    feedback_match = re.search(
-                                        r"<feedback>(.*?)</feedback>", f_visible, re.DOTALL
-                                    )
-                                    feedback_text = feedback_match.group(1) if feedback_match else f_visible
-                                    if "\\boxed{" in feedback_text:
-                                        teacher_rewards[f_idx] = -1.0
-                                        teacher_leak_count += 1
+                        # Collect leakage detection results and apply penalties
+                        if f_texts:
+                            leak_flags = self.leakage_detector.collect_results()
+                            for f_idx, leaked in enumerate(leak_flags):
+                                if leaked:
+                                    teacher_rewards[f_idx] = -1.0
+                                    teacher_leak_count += 1
 
                         # Compute student₂ rewards: per A₂, binary
                         for a2_idx in range(n_total_a2):
@@ -1125,20 +1097,21 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             step=self.global_steps,
                         )
 
-                        # Log student₂ data for debugging
-                        self._log_student2_jsonl(
-                            question_texts=[question_texts[i] for i in teacher_prompt_indices],
-                            a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
-                            a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
-                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
-                            f_texts=f_texts,
-                            a2_texts=a2_texts,
-                            a2_correct=a2_correct,
-                            student2_rewards=student2_rewards,
-                            k=k,
-                            m=m,
-                            step=self.global_steps,
-                        )
+                        # Log student₂ data for debugging (skip if no A₂ generated)
+                        if not skip_a2:
+                            self._log_student2_jsonl(
+                                question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                                a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
+                                a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                                ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                                f_texts=f_texts,
+                                a2_texts=a2_texts,
+                                a2_correct=a2_correct,
+                                student2_rewards=student2_rewards,
+                                k=k,
+                                m=m,
+                                step=self.global_steps,
+                            )
 
                     # ==========================================================
                     # Build combined batch (teacher + student₂ sub-rollouts)
@@ -1165,6 +1138,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             "improvement_count": improvement_count,
                             "regression_count": regression_count,
                             "teacher_leak_count": teacher_leak_count,
+                            "judge_error_count": getattr(self.leakage_detector, "_error_count", 0),  # reset below
                             "teacher_mean_reward": sum(teacher_rewards) / max(len(teacher_rewards), 1),
                             "student2_mean_reward": sum(student2_rewards) / max(len(student2_rewards), 1),
                                 # Prompt overflow (verl-level silent truncation) and
@@ -1179,15 +1153,6 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             ),
                             **(
                                 {
-                                    "teacher/kl_leakage_mean": sum(kl_penalties) / len(kl_penalties),
-                                    "teacher/kl_leakage_max": max(kl_penalties),
-                                    "teacher/kl_leakage_min": min(kl_penalties),
-                                }
-                                if kl_penalties
-                                else {}
-                            ),
-                            **(
-                                {
                                     "teacher/rss_mean": sum(rss_rewards) / len(rss_rewards),
                                     "teacher/rss_max": max(rss_rewards),
                                     "teacher/rss_min": min(rss_rewards),
@@ -1198,23 +1163,43 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         }
                         self._log_self_teach_metrics(self_teach_metrics, max(n_total_a2, 1))
 
+                        # Reset per-step judge error counters
+                        if hasattr(self.leakage_detector, "_error_count"):
+                            self.leakage_detector._error_count = 0
+                            self.leakage_detector._call_count = 0
+
                         test_freq = self.config.trainer.test_freq
                         if n_teacher_prompts > 0 and test_freq > 0 and (
                             is_last_step or self.global_steps % test_freq == 0
                         ):
                             # Log first feedback per prompt for the sample table
-                            self._log_sample_table(
-                                question_texts=[question_texts[i] for i in teacher_prompt_indices],
-                                a1_texts=[truncated_a1_per_f[j * k] for j in range(n_teacher_prompts)],
-                                a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
-                                f_texts=[truncated_f_per_f[j * k] for j in range(n_teacher_prompts)],
-                                a2_texts=[a2_texts[j * k * m] for j in range(n_teacher_prompts)],
-                                a2_correct=[a2_correct[j * k * m] for j in range(n_teacher_prompts)],
-                                student_rewards=[student2_rewards[j * k * m] for j in range(n_teacher_prompts)],
-                                teacher_rewards=[teacher_rewards[j * k] for j in range(n_teacher_prompts)],
-                                ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
-                                n=1,  # one sample per prompt for the table
-                            )
+                            if skip_a2:
+                                # No A₂ data — log teacher-only samples
+                                self._log_sample_table(
+                                    question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                                    a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
+                                    a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                                    f_texts=[extract_feedback(f_texts[j * k]) for j in range(n_teacher_prompts)],
+                                    a2_texts=["(skipped)"] * n_teacher_prompts,
+                                    a2_correct=[False] * n_teacher_prompts,
+                                    student_rewards=[0.0] * n_teacher_prompts,
+                                    teacher_rewards=[teacher_rewards[j * k] for j in range(n_teacher_prompts)],
+                                    ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                                    n=1,
+                                )
+                            else:
+                                self._log_sample_table(
+                                    question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                                    a1_texts=[truncated_a1_per_f[j * k] for j in range(n_teacher_prompts)],
+                                    a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                                    f_texts=[truncated_f_per_f[j * k] for j in range(n_teacher_prompts)],
+                                    a2_texts=[a2_texts[j * k * m] for j in range(n_teacher_prompts)],
+                                    a2_correct=[a2_correct[j * k * m] for j in range(n_teacher_prompts)],
+                                    student_rewards=[student2_rewards[j * k * m] for j in range(n_teacher_prompts)],
+                                    teacher_rewards=[teacher_rewards[j * k] for j in range(n_teacher_prompts)],
+                                    ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                                    n=1,
+                                )
 
                         # Build teacher entries from F generation output
                         # Grouped by prompt: [p0_f0, p0_f1, ..., p0_f(k-1), p1_f0, ...]
@@ -1562,6 +1547,14 @@ class SelfTeachTaskRunner(TaskRunner):
             num_feedbacks=st_cfg_raw.get("num_feedbacks", 6),
             num_a2_per_feedback=st_cfg_raw.get("num_a2_per_feedback", 6),
             train_teacher_only=st_cfg_raw.get("train_teacher_only", False),
+            use_dense_reward=st_cfg_raw.get("use_dense_reward", False),
+            rss_alpha=st_cfg_raw.get("rss_alpha", 0.01),
+            leakage_detector=st_cfg_raw.get("leakage_detector", "heuristic"),
+            llm_judge_api_base=st_cfg_raw.get("llm_judge_api_base", None),
+            llm_judge_api_key=st_cfg_raw.get("llm_judge_api_key", None),
+            llm_judge_model=st_cfg_raw.get("llm_judge_model", "gemini-2.5-flash-lite"),
+            llm_judge_max_workers=st_cfg_raw.get("llm_judge_max_workers", 32),
+            llm_judge_timeout=st_cfg_raw.get("llm_judge_timeout", 30.0),
         )
         print(
             f"[SelfTeach] Config: enabled={self_teach_config.enabled}, "
