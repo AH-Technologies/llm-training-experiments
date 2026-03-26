@@ -70,7 +70,7 @@ python3 -m src.self_teach.main \
     trainer.n_gpus_per_node=${SLURM_GPUS_ON_NODE:-4} \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=3 \
+    trainer.max_actor_ckpt_to_keep=1 \
     trainer.val_before_train=True \
     trainer.test_freq=20 \
     trainer.total_epochs=2000 \
