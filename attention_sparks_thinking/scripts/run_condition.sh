@@ -12,7 +12,7 @@
 #   DRY_RUN     - if "1", run only 2 steps with diagnostics
 set -x
 
-RUN_TYPE=${1:?Usage: run_condition.sh <A|B|C>}
+RUN_TYPE=${1:?Usage: run_condition.sh <A|B|C|D|E|F|G|H>}
 shift
 
 MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
@@ -31,6 +31,13 @@ CUSTOM_ARGS="--run_type ${RUN_TYPE} --model_name ${MODEL}"
 
 if [ "${DRY_RUN}" = "1" ]; then
     CUSTOM_ARGS="${CUSTOM_ARGS} --dry_run"
+fi
+
+# EAP-IG reasoning heads path for methods D/E/G/H
+REASONING_HEADS_PATH=${REASONING_HEADS_PATH:-"attention_sparks_thinking/logs/head_importance_qwen3.pt"}
+NUM_REASONING_HEADS=${NUM_REASONING_HEADS:-200}
+if [[ "${RUN_TYPE}" =~ ^[DEGH]$ ]]; then
+    CUSTOM_ARGS="${CUSTOM_ARGS} --reasoning_heads_path ${REASONING_HEADS_PATH} --num_reasoning_heads ${NUM_REASONING_HEADS}"
 fi
 
 # Rhythm hyperparams (override via env)

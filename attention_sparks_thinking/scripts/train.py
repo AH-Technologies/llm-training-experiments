@@ -52,8 +52,10 @@ def parse_custom_args():
             i += 1
 
     parser = argparse.ArgumentParser(description="Attention-rhythm-guided GRPO training")
-    parser.add_argument("--run_type", type=str, required=True, choices=["A", "B", "C"],
-                        help="Run type: A=baseline, B=static rhythm, C=adaptive rhythm")
+    parser.add_argument("--run_type", type=str, required=True,
+                        choices=["A", "B", "C", "D", "E", "F", "G", "H"],
+                        help="Run type: A=baseline, B=static rhythm, C=adaptive rhythm, "
+                             "D=attention, E=FAI, F=FAI-allheads, G=FAI-asymmetric, H=anchor-credit")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Math-1.5B",
                         help="HF model path")
     parser.add_argument("--dry_run", action="store_true",
@@ -70,6 +72,10 @@ def parse_custom_args():
     parser.add_argument("--reclassify_K", type=int, default=20, help="Reclassification interval (Run C)")
     parser.add_argument("--head_quantile", type=float, default=0.3, help="Head classification quantile")
     parser.add_argument("--num_class_prompts", type=int, default=20, help="Prompts for head classification (generates responses, so keep modest)")
+    parser.add_argument("--reasoning_heads_path", type=str, default=None,
+                        help="Path to head_importance_qwen3.pt from EAP-IG (required for D/E/G/H)")
+    parser.add_argument("--num_reasoning_heads", type=int, default=200,
+                        help="Number of top EAP-IG heads to use (default 200)")
 
     args = parser.parse_args(custom_args)
     return args, verl_args
@@ -208,6 +214,39 @@ def main():
             args.model_name, args.num_class_prompts, args.head_quantile
         )
 
+    # EAP-IG reasoning heads for D/E/G/H
+    EAPIG_METHODS = {"D": "attention", "E": "fai", "F": "fai_allheads",
+                     "G": "fai_asymmetric", "H": "anchor_credit"}
+    reasoning_heads = None
+    head_scores = None
+    weighting_method = "rhythm"
+
+    if args.run_type in EAPIG_METHODS:
+        weighting_method = EAPIG_METHODS[args.run_type]
+
+        if args.run_type in ("D", "E", "G", "H"):
+            # These methods need reasoning heads from EAP-IG
+            heads_path = args.reasoning_heads_path
+            if heads_path is None:
+                heads_path = "attention_sparks_thinking/logs/head_importance_qwen3.pt"
+            logger.info(f"Loading EAP-IG reasoning heads from {heads_path}")
+            eapig_data = torch.load(heads_path, map_location="cpu", weights_only=False)
+            head_scores = eapig_data["importance"]  # (n_layers, n_heads)
+
+            # Select top N heads from full importance matrix
+            n_heads = min(args.num_reasoning_heads, head_scores.numel())
+            flat_scores = head_scores.flatten()
+            topk_indices = flat_scores.topk(n_heads).indices
+            n_heads_per_layer = head_scores.shape[1]
+            reasoning_heads = [
+                (int(idx // n_heads_per_layer), int(idx % n_heads_per_layer))
+                for idx in topk_indices
+            ]
+            min_score = flat_scores[topk_indices[-1]].item()
+            logger.info(f"Selected top {n_heads} reasoning heads from importance matrix "
+                        f"(shape {head_scores.shape}), min score: {min_score:.6f}")
+        # F (fai_allheads) needs no reasoning heads — uses all heads equally
+
     # Apply patches
     from attention_sparks_thinking.src.rhythm_trainer import apply_patches
 
@@ -228,6 +267,9 @@ def main():
         reclassify_every_K=args.reclassify_K,
         head_quantile=args.head_quantile,
         dry_run=args.dry_run,
+        reasoning_heads=reasoning_heads,
+        head_scores=head_scores,
+        weighting_method=weighting_method,
     )
 
     # Rewrite sys.argv for Hydra

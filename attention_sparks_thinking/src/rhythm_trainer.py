@@ -92,14 +92,27 @@ def apply_rhythm_weights(data) -> object:
     if gammas.shape[1] != resp_len:
         gammas = gammas[:, -resp_len:]
 
+    # Method G (asymmetric): invert weights for incorrect responses on driver side
+    weighting_method = cfg.get("weighting_method", "rhythm")
+    if weighting_method == "fai_asymmetric":
+        from attention_sparks_thinking.src.token_weighting import compute_asymmetric_weights
+        rmask = response_mask.float() if response_mask is not None else torch.ones_like(gammas)
+        gammas = compute_asymmetric_weights(gammas, advantages, rmask)
+
     gamma_mode = cfg.get("gamma_mode", "raw")  # "raw" or "normalized"
+
+    # For asymmetric (G), apply gammas to ALL tokens (both correct and incorrect)
+    apply_to_all = weighting_method == "fai_asymmetric"
 
     if gamma_mode == "normalized":
         # Normalize gamma per-response so mean(gamma * A) = mean(A)
         # This redistributes credit without changing total gradient magnitude.
         rmask = response_mask.float() if response_mask is not None else torch.ones_like(gammas)
-        positive_mask = (advantages >= 0).float()
-        apply_mask = positive_mask * rmask  # only positive-advantage, non-padding tokens
+        if apply_to_all:
+            apply_mask = rmask
+        else:
+            positive_mask = (advantages >= 0).float()
+            apply_mask = positive_mask * rmask
 
         for i in range(advantages.shape[0]):
             mask_i = apply_mask[i]
@@ -108,21 +121,25 @@ def apply_rhythm_weights(data) -> object:
                 continue
             g_i = gammas[i]
             a_i = advantages[i]
-            # mean(g * a * mask) should equal mean(a * mask)
             weighted_sum = (g_i * a_i * mask_i).sum()
             original_sum = (a_i * mask_i).sum()
             if weighted_sum.abs() > 1e-8:
                 scale = original_sum / weighted_sum
-                # Rescale gamma: new_g = 1 + scale * (g - 1)
                 gammas[i] = 1.0 + scale * (g_i - 1.0)
 
-        gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
-        data.batch["advantages"] = advantages * gamma_effective
+        if apply_to_all:
+            data.batch["advantages"] = advantages * gammas
+        else:
+            gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
+            data.batch["advantages"] = advantages * gamma_effective
     else:
-        # Raw mode: direct multiplication (original behavior)
-        positive_mask = (advantages >= 0).float()
-        gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
-        data.batch["advantages"] = advantages * gamma_effective
+        # Raw mode: direct multiplication
+        if apply_to_all:
+            data.batch["advantages"] = advantages * gammas
+        else:
+            positive_mask = (advantages >= 0).float()
+            gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
+            data.batch["advantages"] = advantages * gamma_effective
 
     # Compute stats
     _DRIVER_STEP_COUNTER += 1
@@ -191,7 +208,7 @@ def apply_rhythm_weights(data) -> object:
         "rhythm/n_pos_adv_tokens": n_pos,
         "rhythm/adv_mean_before": adv_before,
         "rhythm/adv_mean_after": adv_after,
-        "rhythm/run_type": {"A": 0, "B": 1, "C": 2}.get(cfg["run_type"], -1),
+        "rhythm/run_type": {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7}.get(cfg["run_type"], -1),
         "rhythm/gamma_mode": {"raw": 0, "normalized": 1}.get(gamma_mode, -1),
     }
 
@@ -254,8 +271,16 @@ def apply_patches(
     head_quantile: float = 0.3,
     gamma_mode: str = "raw",
     dry_run: bool = False,
+    # EAP-IG methods D-H
+    reasoning_heads: list[tuple[int, int]] | None = None,
+    head_scores: torch.Tensor | None = None,
+    weighting_method: str = "rhythm",
 ):
-    """Save rhythm config to disk for Ray workers to load."""
+    """Save rhythm config to disk for Ray workers to load.
+
+    weighting_method: "rhythm" (B/C), "attention" (D), "fai" (E),
+                      "fai_allheads" (F), "fai_asymmetric" (G), "anchor_credit" (H)
+    """
     config = {
         "run_type": run_type,
         "model_name": model_name,
@@ -274,19 +299,30 @@ def apply_patches(
         "gamma_mode": gamma_mode,
         "dry_run": dry_run,
         "step_counter": 0,
+        # EAP-IG methods D-H
+        "reasoning_heads": reasoning_heads,
+        "head_scores": head_scores,
+        "weighting_method": weighting_method,
     }
     torch.save(config, _CONFIG_PATH)
     logger.info(f"Saved rhythm_trainer config to {_CONFIG_PATH}")
-    logger.info(f"Run type: {run_type}, model: {model_name}")
+    logger.info(f"Run type: {run_type}, model: {model_name}, weighting_method: {weighting_method}")
     if H_loc is not None:
         logger.info(f"H_loc: {len(H_loc)} heads, H_glob: {len(H_glob)} heads")
+    if reasoning_heads is not None:
+        logger.info(f"Reasoning heads: {len(reasoning_heads)} heads (EAP-IG)")
 
 
 def needs_rhythm_dispatch() -> bool:
     """Check if rhythm gamma dispatch is needed (called from driver fit loop)."""
     try:
         _ensure_driver_config()
-        return _DRIVER_CONFIG["run_type"] in ("B", "C")
+        if _DRIVER_CONFIG["run_type"] in ("B", "C"):
+            return True
+        # EAP-IG methods D-H also need dispatch
+        return _DRIVER_CONFIG.get("weighting_method", "rhythm") in (
+            "attention", "fai", "fai_allheads", "fai_asymmetric", "anchor_credit"
+        )
     except FileNotFoundError:
         return False
 
@@ -307,9 +343,9 @@ def compute_gammas_on_worker(
     This is called from fsdp_workers.py's compute_rhythm_gammas method,
     which handles eager model loading and weight sync.
 
-    Sequences are batched into mini-batches for efficient forward passes
-    (8 sequences per pass instead of 1), sorted by length to minimize
-    padding overhead. Output is identical to the unbatched version.
+    Dispatches based on weighting_method:
+      - "rhythm" (B/C): existing WAAD/FAI/gamma path
+      - "attention"/"fai"/"fai_allheads"/"anchor_credit"/"fai_asymmetric": EAP-IG methods
 
     Args:
         input_ids: (bs, seq_len) input token ids
@@ -321,6 +357,15 @@ def compute_gammas_on_worker(
     Returns:
         gammas: (bs, seq_len) tensor with gamma values
     """
+    # Load config
+    cfg = torch.load(_CONFIG_PATH, map_location="cpu", weights_only=False)
+    weighting_method = cfg.get("weighting_method", "rhythm")
+
+    if weighting_method != "rhythm":
+        return _compute_eapig_gammas_on_worker(
+            input_ids, attention_mask, response_mask, eager_model, cfg, log_fn
+        )
+
     from attention_sparks_thinking.src.attention_rhythm import (
         compute_fai_vectorized as _compute_fai,
         compute_gamma as _compute_gamma,
@@ -331,8 +376,6 @@ def compute_gammas_on_worker(
         classify_heads as _classify,
     )
 
-    # Load config
-    cfg = torch.load(_CONFIG_PATH, map_location="cpu", weights_only=False)
     H_loc = cfg["H_loc"]
     H_glob = cfg["H_glob"]
 
@@ -479,6 +522,141 @@ def compute_gammas_on_worker(
             f"avg_anchors={avg_anchors:.1f}, avg_dominated={avg_dominated:.1f}, "
             f"gamma_mean={gammas.mean():.4f}, gamma_max={gammas.max():.4f}"
         )
+
+    return gammas
+
+
+def _compute_eapig_gammas_on_worker(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    response_mask: torch.Tensor,
+    eager_model,
+    cfg: dict,
+    log_fn=None,
+) -> torch.Tensor:
+    """Compute EAP-IG-based gammas (methods D-H) on a GPU worker.
+
+    Mini-batches sequences (sorted by length) for efficient forward passes.
+    """
+    from attention_sparks_thinking.src.token_weighting import (
+        compute_anchor_credit_weights,
+        compute_attention_weights,
+        compute_fai_weights,
+        compute_fai_weights_allheads,
+    )
+
+    method = cfg["weighting_method"]
+    reasoning_heads = cfg.get("reasoning_heads")
+    head_scores = cfg.get("head_scores")
+    device = input_ids.device
+
+    if head_scores is not None:
+        head_scores = head_scores.to(device)
+
+    bs, full_seq_len = input_ids.shape
+    resp_len = response_mask.shape[1]
+    gammas = torch.ones(bs, resp_len, device=device)
+
+    if log_fn:
+        log_fn(f"EAP-IG method={method}, bs={bs}, seq_len={full_seq_len}, resp_len={resp_len}")
+
+    # ── Pre-compute valid samples and strip padding ──
+    samples = []
+    for i in range(bs):
+        n_resp_tokens = int(response_mask[i].sum().item())
+        if n_resp_tokens == 0:
+            continue
+
+        nonzero_positions = (attention_mask[i] == 1).nonzero(as_tuple=True)[0]
+        if len(nonzero_positions) == 0:
+            continue
+        first_real = nonzero_positions[0].item()
+        last_real = nonzero_positions[-1].item()
+        actual_seq_len = last_real - first_real + 1
+
+        samples.append({
+            "batch_idx": i,
+            "ids": input_ids[i, first_real:last_real + 1],
+            "amask": attention_mask[i, first_real:last_real + 1],
+            "seq_len": actual_seq_len,
+            "n_resp_tokens": n_resp_tokens,
+            "resp_mask": response_mask[i],
+        })
+
+    if not samples:
+        return gammas
+
+    # ── Sort by length and process in mini-batches ──
+    samples.sort(key=lambda s: s["seq_len"])
+    MINI_BATCH = 4  # smaller batch for attention-heavy methods
+
+    with torch.no_grad():
+        for mb_start in range(0, len(samples), MINI_BATCH):
+            mb_samples = samples[mb_start:mb_start + MINI_BATCH]
+            mb_size = len(mb_samples)
+            max_len = max(s["seq_len"] for s in mb_samples)
+
+            # Pad mini-batch to max length
+            mb_ids = torch.zeros(mb_size, max_len, dtype=input_ids.dtype, device=device)
+            mb_amask = torch.zeros(mb_size, max_len, dtype=attention_mask.dtype, device=device)
+
+            # For token weighting, resp_len per sample varies; use max resp_len in mini-batch
+            mb_resp_lens = []
+            for j, s in enumerate(mb_samples):
+                L = s["seq_len"]
+                mb_ids[j, :L] = s["ids"].to(device)
+                mb_amask[j, :L] = 1
+                mb_resp_lens.append(s["n_resp_tokens"])
+
+            # Response mask for mini-batch: last resp_len tokens of each sequence
+            # Use the max resp tokens to build a uniform response mask
+            mb_max_resp = max(mb_resp_lens)
+            mb_rmask = torch.zeros(mb_size, mb_max_resp, device=device)
+            for j, n_resp in enumerate(mb_resp_lens):
+                mb_rmask[j, :n_resp] = 1.0
+
+            try:
+                if method == "attention":
+                    mb_gammas = compute_attention_weights(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                        reasoning_heads, head_scores,
+                    )
+                elif method in ("fai", "fai_asymmetric"):
+                    # For asymmetric, compute raw FAI on worker; inversion happens on driver
+                    mb_gammas = compute_fai_weights(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                        reasoning_heads, head_scores,
+                    )
+                elif method == "fai_allheads":
+                    mb_gammas = compute_fai_weights_allheads(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                    )
+                elif method == "anchor_credit":
+                    mb_gammas = compute_anchor_credit_weights(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                        reasoning_heads, head_scores,
+                    )
+                else:
+                    if log_fn:
+                        log_fn(f"Unknown weighting method: {method}")
+                    continue
+
+                # Map back to original batch positions
+                for j, s in enumerate(mb_samples):
+                    n_use = s["n_resp_tokens"]
+                    resp_positions = s["resp_mask"].nonzero(as_tuple=True)[0]
+                    g = mb_gammas[j, :n_use]
+                    gammas[s["batch_idx"], resp_positions[:n_use]] = g.to(gammas.device)
+
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"EAP-IG mini-batch failed at mb_start={mb_start}: {e}")
+                    import traceback
+                    log_fn(traceback.format_exc())
+
+    if log_fn:
+        log_fn(f"EAP-IG gammas: mean={gammas.mean():.4f}, max={gammas.max():.4f}, "
+               f"min={gammas.min():.4f}, frac>1={(gammas > 1).float().mean():.3f}")
 
     return gammas
 
