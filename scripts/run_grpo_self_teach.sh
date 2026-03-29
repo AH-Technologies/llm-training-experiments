@@ -65,8 +65,6 @@ python3 -m src.self_teach.main \
     +self_teach.num_a2_per_feedback=6 \
     +self_teach.use_dense_reward=${USE_DENSE_REWARD:-False} \
     +self_teach.rss_alpha=${RSS_ALPHA:-0.01} \
-    +self_teach.leakage_detector=${LEAKAGE_DETECTOR:-heuristic} \
-    +self_teach.llm_judge_api_base=${LLM_JUDGE_API_BASE:-} \
     +self_teach.llm_judge_model=${LLM_JUDGE_MODEL:-gemini-2.5-flash-lite} \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
@@ -77,7 +75,7 @@ python3 -m src.self_teach.main \
     trainer.save_freq=20 \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.val_before_train=True \
-    trainer.test_freq=20 \
+    trainer.test_freq=10 \
     trainer.total_epochs=2000 \
     trainer.total_training_steps=100 \
     "$@"

@@ -92,8 +92,8 @@ class SelfTeachConfig:
     rss_alpha: float = 0.01  # Weight for min term in r^SS (catches worst-case solution tokens)
 
     # Leakage detection
-    leakage_detector: str = "heuristic"       # "heuristic" | "llm_judge"
-    llm_judge_api_base: str | None = None     # OpenAI-compatible endpoint
+    leakage_detector: str = "llm_judge"       # "llm_judge" | "heuristic"
+    llm_judge_api_base: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     llm_judge_api_key: str | None = None      # falls back to LLM_JUDGE_API_KEY env var
     llm_judge_model: str = "gemini-2.5-flash-lite"
     llm_judge_max_workers: int = 32
@@ -625,8 +625,14 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         ground_truth=ground_truths[i],
                     )
                 # Collect per-A₂ correctness for this feedback
-                a2_start = f_idx * m
-                a2_outcomes = [a2_correct[a2_start + off] for off in range(m)]
+                if a2_correct:
+                    a2_start = f_idx * m
+                    a2_outcomes = [a2_correct[a2_start + off] for off in range(m)]
+                    a2_correct_count = sum(a2_outcomes)
+                    a2_total = m
+                else:
+                    a2_correct_count = 0
+                    a2_total = 0
                 record = {
                     "step": step,
                     "prompt_idx": i,
@@ -639,8 +645,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     "teacher_prompt": teacher_prompt,
                     "teacher_response": f_texts[f_idx],
                     "teacher_reward": teacher_rewards[f_idx],
-                    "a2_correct_count": sum(a2_outcomes),
-                    "a2_total": m,
+                    "a2_correct_count": a2_correct_count,
+                    "a2_total": a2_total,
                 }
                 f.write(json.dumps(record) + "\n")
 
@@ -692,6 +698,200 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     "student2_reward": student2_rewards[a2_idx],
                 }
                 f.write(json.dumps(record) + "\n")
+
+    # ------------------------------------------------------------------
+    # Multi-turn self-correction validation
+    # ------------------------------------------------------------------
+
+    def _validate(self):
+        """Override validation to add multi-turn self-correction evaluation.
+
+        After standard single-turn validation, runs a second pass where the
+        model attempts to self-correct wrong answers:
+        1. Generate A₁ for all val prompts
+        2. Grade A₁
+        3. For incorrect A₁: generate blind self-feedback, then A₂
+        4. Grade A₂
+        5. Report cumulative turn-1 and turn-2 accuracy
+        """
+        # Run standard single-turn validation first
+        metric_dict = super()._validate()
+
+        if not self.self_teach_config.enabled:
+            return metric_dict
+
+        # Multi-turn self-correction pass
+        try:
+            multiturn_metrics = self._validate_multiturn()
+            metric_dict.update(multiturn_metrics)
+        except Exception as e:
+            print(f"[SelfTeach] Multi-turn validation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return metric_dict
+
+    def _validate_multiturn(self) -> dict:
+        """Run 2-turn self-correction evaluation on the validation set."""
+        print("[SelfTeach] Starting multi-turn self-correction validation...")
+
+        temperature = self.config.actor_rollout_ref.rollout.temperature
+
+        all_question_texts = []
+        all_system_prompts = []
+        all_ground_truths = []
+        all_data_sources = []
+        all_raw_prompts = []
+
+        for val_data in self.val_dataloader:
+            batch = DataProto.from_single_dict(val_data)
+            bs = len(batch)
+
+            for i in range(bs):
+                raw_prompt = batch.non_tensor_batch["raw_prompt"][i]
+                q, sp = "", ""
+                for msg in raw_prompt:
+                    if msg.get("role") == "system":
+                        sp = msg.get("content", "")
+                    elif msg.get("role") == "user":
+                        q = msg.get("content", "")
+                        break
+                all_question_texts.append(q)
+                all_system_prompts.append(sp)
+                all_raw_prompts.append(raw_prompt)
+
+                gt, ds = "", "math"
+                if "reward_model" in batch.non_tensor_batch:
+                    rm = batch.non_tensor_batch["reward_model"][i]
+                    if isinstance(rm, dict):
+                        gt = rm.get("ground_truth", "")
+                if "data_source" in batch.non_tensor_batch:
+                    ds = batch.non_tensor_batch["data_source"][i]
+                all_ground_truths.append(gt)
+                all_data_sources.append(ds)
+
+        n_total = len(all_question_texts)
+        if n_total == 0:
+            return {}
+
+        # --- Turn 1: Generate A₁ ---
+        print(f"[SelfTeach multiturn] Generating A₁ for {n_total} prompts...")
+        a1_output = self._generate_padded(
+            all_raw_prompts, temperature, self.global_steps,
+            data_sources=all_data_sources, ground_truths=all_ground_truths,
+        )
+        a1_texts = self._decode_responses(a1_output)
+
+        # Grade A₁
+        a1_correct = []
+        for i in range(n_total):
+            score = grade_solution(
+                data_source=all_data_sources[i],
+                solution_str=strip_think_blocks(a1_texts[i]),
+                ground_truth=all_ground_truths[i],
+            )
+            a1_correct.append(score >= 0.5)
+
+        turn_1_correct = sum(a1_correct)
+        wrong_indices = [i for i, c in enumerate(a1_correct) if not c]
+        n_wrong = len(wrong_indices)
+
+        print(
+            f"[SelfTeach multiturn] Turn 1: {turn_1_correct}/{n_total} correct, "
+            f"{n_wrong} to retry"
+        )
+
+        if n_wrong == 0:
+            # Perfect score, no self-correction needed
+            return {
+                "val-multiturn/turn_1_accuracy": turn_1_correct / n_total,
+                "val-multiturn/turn_2_accuracy": turn_1_correct / n_total,
+                "val-multiturn/n_corrections": 0,
+            }
+
+        # --- Turn 2a: Generate blind self-feedback for wrong A₁s ---
+        print(f"[SelfTeach multiturn] Generating self-feedback for {n_wrong} wrong answers...")
+        feedback_raw_prompts = []
+        feedback_data_sources = []
+        feedback_ground_truths = []
+
+        for i in wrong_indices:
+            a1_clean = strip_think_blocks(a1_texts[i])
+            feedback_prompt = BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED.format(
+                question=all_question_texts[i],
+                student_attempt=a1_clean,
+            )
+            base_msgs = (
+                [{"role": "system", "content": all_system_prompts[i]}]
+                if all_system_prompts[i] else []
+            )
+            base_msgs.append({"role": "user", "content": feedback_prompt})
+            feedback_raw_prompts.append(base_msgs)
+            feedback_data_sources.append(all_data_sources[i])
+            feedback_ground_truths.append(all_ground_truths[i])
+
+        f_output = self._generate_padded(
+            feedback_raw_prompts, temperature, self.global_steps,
+            data_sources=feedback_data_sources, ground_truths=feedback_ground_truths,
+        )
+        f_texts = self._decode_responses(f_output)
+
+        # --- Turn 2b: Generate A₂ conditioned on feedback ---
+        print(f"[SelfTeach multiturn] Generating A₂ for {n_wrong} prompts...")
+        a2_raw_prompts = []
+        a2_data_sources = []
+        a2_ground_truths = []
+
+        for j, i in enumerate(wrong_indices):
+            a1_clean = strip_think_blocks(a1_texts[i])
+            fb_text = extract_feedback(f_texts[j])
+            a1_t, f_t, _ = self._truncate_for_a2(
+                a1_clean, fb_text, all_question_texts[i]
+            )
+            s2_prompt = STUDENT2_PROMPT_TEMPLATE.format(
+                question=all_question_texts[i],
+                first_attempt=a1_t,
+                feedback=f_t,
+            )
+            base_msgs = (
+                [{"role": "system", "content": all_system_prompts[i]}]
+                if all_system_prompts[i] else []
+            )
+            base_msgs.append({"role": "user", "content": s2_prompt})
+            a2_raw_prompts.append(base_msgs)
+            a2_data_sources.append(all_data_sources[i])
+            a2_ground_truths.append(all_ground_truths[i])
+
+        a2_output = self._generate_padded(
+            a2_raw_prompts, temperature, self.global_steps,
+            data_sources=a2_data_sources, ground_truths=a2_ground_truths,
+        )
+        a2_texts = self._decode_responses(a2_output)
+
+        # Grade A₂
+        n_corrections = 0
+        for j in range(n_wrong):
+            i = wrong_indices[j]
+            score = grade_solution(
+                data_source=all_data_sources[i],
+                solution_str=strip_think_blocks(a2_texts[j]),
+                ground_truth=all_ground_truths[i],
+            )
+            if score >= 0.5:
+                n_corrections += 1
+
+        turn_2_correct = turn_1_correct + n_corrections
+
+        print(
+            f"[SelfTeach multiturn] Turn 2: {n_corrections}/{n_wrong} self-corrections, "
+            f"cumulative {turn_2_correct}/{n_total}"
+        )
+
+        return {
+            "val-multiturn/turn_1_accuracy": turn_1_correct / n_total,
+            "val-multiturn/turn_2_accuracy": turn_2_correct / n_total,
+            "val-multiturn/n_corrections": n_corrections,
+        }
 
     # ------------------------------------------------------------------
     # fit() override — tree-structured generation flow
@@ -1066,12 +1266,31 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 teacher_rewards.append(sum(rewards_for_f) / m)
 
                         # Collect leakage detection results and apply penalties
+                        # Penalty is per GRPO group (k feedbacks per prompt) so
+                        # leaked samples always get the worst advantage in their group.
                         if f_texts:
                             leak_flags = self.leakage_detector.collect_results()
-                            for f_idx, leaked in enumerate(leak_flags):
-                                if leaked:
-                                    teacher_rewards[f_idx] = -1.0
-                                    teacher_leak_count += 1
+                            if any(leak_flags):
+                                batch_min = min(teacher_rewards)
+                                for j in range(n_teacher_prompts):
+                                    group_start = j * k
+                                    group_end = group_start + k
+                                    group_leaked = [leak_flags[f] for f in range(group_start, group_end)]
+                                    if not any(group_leaked):
+                                        continue
+                                    # Non-leaked rewards in this group
+                                    non_leaked = [
+                                        teacher_rewards[f]
+                                        for f in range(group_start, group_end)
+                                        if not leak_flags[f]
+                                    ]
+                                    # If all k leaked, fall back to batch min
+                                    group_min = min(non_leaked) if non_leaked else batch_min
+                                    leak_penalty = group_min * 1.5
+                                    for f in range(group_start, group_end):
+                                        if leak_flags[f]:
+                                            teacher_rewards[f] = leak_penalty
+                                            teacher_leak_count += 1
 
                         # Compute student₂ rewards: per A₂, binary
                         for a2_idx in range(n_total_a2):
@@ -1161,7 +1380,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                                 else {}
                             ),
                         }
-                        self._log_self_teach_metrics(self_teach_metrics, max(n_total_a2, 1))
+                        self._log_self_teach_metrics(self_teach_metrics, max(n_total_f, 1))
 
                         # Reset per-step judge error counters
                         if hasattr(self.leakage_detector, "_error_count"):
@@ -1549,8 +1768,8 @@ class SelfTeachTaskRunner(TaskRunner):
             train_teacher_only=st_cfg_raw.get("train_teacher_only", False),
             use_dense_reward=st_cfg_raw.get("use_dense_reward", False),
             rss_alpha=st_cfg_raw.get("rss_alpha", 0.01),
-            leakage_detector=st_cfg_raw.get("leakage_detector", "heuristic"),
-            llm_judge_api_base=st_cfg_raw.get("llm_judge_api_base", None),
+            leakage_detector=st_cfg_raw.get("leakage_detector", "llm_judge"),
+            llm_judge_api_base=st_cfg_raw.get("llm_judge_api_base", "https://generativelanguage.googleapis.com/v1beta/openai"),
             llm_judge_api_key=st_cfg_raw.get("llm_judge_api_key", None),
             llm_judge_model=st_cfg_raw.get("llm_judge_model", "gemini-2.5-flash-lite"),
             llm_judge_max_workers=st_cfg_raw.get("llm_judge_max_workers", 32),
