@@ -9,30 +9,10 @@ entity = "alexauren-ntnu"
 project = "attention-illuminates-qwen3"
 
 run_names = [
-    "rhythm_runA_qwen3_entropy_v3",
-    "rhythm_runA_qwen3_base_v3",
-    "rhythm_runB_qwen3_illuminates_v4",
-    "rhythm_runC_qwen3_rediscovery_v4",
     "rhythm_runA_qwen3_base_v6",
-    "rhythm_runA_qwen3_entropy_v6",
     "rhythm_runC_qwen3_rediscovery_v6",
     "rhythm_runB_qwen3_illuminates_v6",
 ]
-
-groups = {
-    "v3_v4": [
-        "rhythm_runA_qwen3_entropy_v3",
-        "rhythm_runA_qwen3_base_v3",
-        "rhythm_runB_qwen3_illuminates_v4",
-        "rhythm_runC_qwen3_rediscovery_v4",
-    ],
-    "v6": [
-        "rhythm_runA_qwen3_base_v6",
-        "rhythm_runA_qwen3_entropy_v6",
-        "rhythm_runC_qwen3_rediscovery_v6",
-        "rhythm_runB_qwen3_illuminates_v6",
-    ],
-}
 
 metrics = [
     "val-core/simplerl/math500/acc/mean@1",
@@ -55,7 +35,6 @@ def ema_ratchet(values, alpha=0.3):
     return out
 
 
-# Fetch all run histories
 print("Fetching runs...")
 all_runs = api.runs("{}/{}".format(entity, project))
 run_map = {}
@@ -82,38 +61,34 @@ for name in run_names:
     run_data[name] = rows
     print("  {} : {} data points".format(name, len(rows)))
 
-# Plot each group
 alpha = 0.3
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+colors = plt.cm.tab10(np.linspace(0, 1, len(run_names)))
 
-for group_name, group_runs in groups.items():
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(group_runs)))
+for ax, metric, label in zip(axes, metrics, metric_labels):
+    for i, name in enumerate(run_names):
+        if name not in run_data or not run_data[name]:
+            continue
+        rows = run_data[name]
+        max_step = 280
+        steps = [r["step"] for r in rows if r["step"] <= max_step and r.get(metric) is not None and not (isinstance(r[metric], float) and np.isnan(r[metric]))]
+        vals = [r[metric] for r in rows if r["step"] <= max_step and r.get(metric) is not None and not (isinstance(r[metric], float) and np.isnan(r[metric]))]
+        if not vals:
+            continue
+        smoothed = ema_ratchet(np.array(vals, dtype=float), alpha=alpha)
+        ax.plot(steps, smoothed, label=display_name(name), color=colors[i], linewidth=2)
+        ax.plot(steps, vals, color=colors[i], alpha=0.15, linewidth=0.8)
 
-    for ax, metric, label in zip(axes, metrics, metric_labels):
-        for i, name in enumerate(group_runs):
-            if name not in run_data or not run_data[name]:
-                continue
-            rows = run_data[name]
-            steps = [r["step"] for r in rows if r.get(metric) is not None and not (isinstance(r[metric], float) and np.isnan(r[metric]))]
-            vals = [r[metric] for r in rows if r.get(metric) is not None and not (isinstance(r[metric], float) and np.isnan(r[metric]))]
-            if not vals:
-                continue
-            smoothed = ema_ratchet(np.array(vals, dtype=float), alpha=alpha)
-            ax.plot(steps, smoothed, label=display_name(name), color=colors[i], linewidth=2)
-            ax.plot(steps, vals, color=colors[i], alpha=0.15, linewidth=0.8)
+    ax.set_title(label, fontsize=13)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Accuracy")
+    ax.grid(True, alpha=0.3)
 
-        ax.set_title(label, fontsize=13)
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Accuracy")
-        ax.grid(True, alpha=0.3)
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="lower center", ncol=len(run_names), fontsize=10, bbox_to_anchor=(0.5, -0.02))
+fig.suptitle("EMA-ratchet smoothed test accuracy - v6 runs (alpha={})".format(alpha), fontsize=14, y=1.01)
+fig.tight_layout()
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=len(group_runs), fontsize=10, bbox_to_anchor=(0.5, -0.02))
-
-    title = "v3/v4 runs" if group_name == "v3_v4" else "v6 runs"
-    fig.suptitle("EMA-ratchet smoothed test accuracy - {} (alpha={})".format(title, alpha), fontsize=14, y=1.01)
-    fig.tight_layout()
-
-    out_path = "attention_sparks_thinking/logs/test_accuracy_ema_{}.png".format(group_name)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    print("\nSaved to {}".format(out_path))
+out_path = "attention_sparks_thinking/logs/test_accuracy_ema_v6.png"
+fig.savefig(out_path, dpi=150, bbox_inches="tight")
+print("\nSaved to {}".format(out_path))

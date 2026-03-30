@@ -6,8 +6,8 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=16G
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=800G
 #SBATCH --output=attention_sparks_thinking/logs/rhythm_%x_%j.log
 #SBATCH --error=attention_sparks_thinking/logs/rhythm_%x_%j.err
 
@@ -36,6 +36,7 @@ mkdir -p attention_sparks_thinking/logs
 # Load modules
 module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
+module load aws-ofi-nccl/1.14.1-GCCcore-13.3.0-CUDA-12.6.0
 
 # Project directory
 PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
@@ -55,13 +56,15 @@ fi
 export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PROJECT_DIR:$PYTHONPATH
 
-# NCCL settings
+# NCCL settings (critical for multi-node Slingshot/CXI communication)
 export NCCL_DEBUG=WARN
-export NCCL_IB_DISABLE=0
+export NCCL_NET=ofi
 export NCCL_SOCKET_IFNAME=bond0
 export GLOO_SOCKET_IFNAME=bond0
 export FI_PROVIDER=cxi
@@ -69,14 +72,20 @@ export FI_CXI_DISABLE_HOST_REGISTER=1
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_CXI_DEFAULT_TX_SIZE=16384
 export FI_CXI_RX_MATCH_MODE=software
+export FI_CXI_RDZV_GET_MIN=0
+export FI_CXI_RDZV_THRESHOLD=0
+export FI_CXI_RDZV_EAGER_SIZE=0
 export FI_MR_CACHE_MONITOR=userfaultfd
 export NCCL_CUMEM_HOST_ENABLE=0
 export NCCL_CUMEM_ENABLE=0
 export NCCL_CROSS_NIC=1
 export LD_LIBRARY_PATH=/opt/cray/libfabric/1.22.0/lib64:/usr/lib64:${LD_LIBRARY_PATH}
+export CPATH=/opt/cray/libfabric/1.22.0/include:${CPATH}
 
 # vLLM settings
 export VLLM_USE_V1=1
+export VLLM_USE_RAY_COMPILED_DAG=0
+export VLLM_USE_RAY_WRAPPED_PP_COMM=0
 
 # Allow TaskRunner (num_gpus=0) to see GPUs for eager attention model
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
@@ -109,36 +118,56 @@ for i in range(torch.cuda.device_count()):
 echo ""
 
 # ── Multi-node Ray cluster setup ──
-NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
-HEAD_NODE=${NODES[0]}
-HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname --ip-address | head -1)
+# Use single srun step so all nodes share Slingshot VNI/SVC_ID credentials
+HEAD_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+HEAD_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname -i | awk '{print $1}')
 RAY_PORT=6379
+RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}"
 
-echo "Ray cluster: head=${HEAD_NODE} (${HEAD_NODE_IP}:${RAY_PORT}), nodes=${NODES[*]}"
+echo "Ray cluster: head=${HEAD_NODE} (${HEAD_IP}:${RAY_PORT}), all nodes: $SLURM_JOB_NODELIST"
 
-# Start Ray head on first node
-srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-    ray start --head --port=$RAY_PORT \
-    --num-gpus=$SLURM_GPUS_ON_NODE \
-    --block &
-sleep 10
+# Clean stale Ray state on all nodes
+srun --nodes=$SLURM_JOB_NUM_NODES --ntasks=$SLURM_JOB_NUM_NODES \
+    ray stop 2>/dev/null || true
+sleep 5
 
-# Start Ray workers on remaining nodes
-for ((i=1; i<${#NODES[@]}; i++)); do
-    echo "Starting Ray worker on ${NODES[$i]}"
-    srun --nodes=1 --ntasks=1 -w "${NODES[$i]}" \
-        ray start --address="${HEAD_NODE_IP}:${RAY_PORT}" \
-        --num-gpus=$SLURM_GPUS_ON_NODE \
-        --block &
-    sleep 5
-done
+# Start Ray cluster in a SINGLE srun step (critical for Slingshot credentials)
+echo "Starting Ray cluster (all nodes in single srun step)..."
+srun --nodes=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 --export=ALL \
+    bash -c "
+        unset ROCR_VISIBLE_DEVICES
+        if [ \"\$SLURM_NODEID\" -eq 0 ]; then
+            echo \"[Ray] Starting head on \$(hostname) (\$SLURM_NODEID)\"
+            ray start --head \
+                --node-ip-address='$HEAD_IP' \
+                --port=$RAY_PORT \
+                --temp-dir='$RAY_TEMP_DIR' \
+                --num-cpus=72 --num-gpus=4 --block
+        else
+            echo \"[Ray] Starting worker on \$(hostname) (\$SLURM_NODEID), waiting for head...\"
+            sleep 20
+            ray start --address='$HEAD_IP:$RAY_PORT' \
+                --temp-dir='$RAY_TEMP_DIR' \
+                --num-cpus=72 --num-gpus=4 --block
+        fi
+    " &
+RAY_PIDS=$!
+sleep 30
 
-# Wait for all workers to join
-sleep 10
-echo "Ray cluster initialized. Checking resources..."
-python -c "import ray; ray.init(address='auto'); print(ray.cluster_resources())"
+echo "Ray cluster status (expecting 2 nodes, 8 GPUs):"
+ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed"
+python -c "
+import ray
+ray.init(address='$HEAD_IP:$RAY_PORT')
+resources = ray.cluster_resources()
+print(f'Cluster resources: {resources}')
+num_gpus = resources.get('GPU', 0)
+assert num_gpus >= 8, f'Expected 8 GPUs, got {num_gpus}'
+print(f'Total GPUs: {num_gpus} -- OK')
+ray.shutdown()
+"
 
-export RAY_ADDRESS="${HEAD_NODE_IP}:${RAY_PORT}"
+export RAY_ADDRESS="${HEAD_IP}:${RAY_PORT}"
 
 # Prepare data if needed
 python attention_sparks_thinking/scripts/prepare_data.py
@@ -157,6 +186,8 @@ bash attention_sparks_thinking/scripts/run_condition.sh ${RUN_TYPE}
 
 # Cleanup
 kill $MONITOR_PID 2>/dev/null || true
+kill $RAY_PIDS 2>/dev/null || true
+ray stop 2>/dev/null || true
 wait
 
 echo ""

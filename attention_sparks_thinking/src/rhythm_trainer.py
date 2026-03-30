@@ -100,16 +100,33 @@ def apply_rhythm_weights(data) -> object:
         gammas = compute_asymmetric_weights(gammas, advantages, rmask)
 
     gamma_mode = cfg.get("gamma_mode", "raw")  # "raw" or "normalized"
+    positive_rollouts_only = cfg.get("positive_rollouts_only", False)
 
     # For asymmetric (G), apply gammas to ALL tokens (both correct and incorrect)
     apply_to_all = weighting_method == "fai_asymmetric"
+
+    # Determine which sequences/tokens get gamma applied
+    if apply_to_all:
+        apply_seq_mask = torch.ones(advantages.shape[0], 1, device=advantages.device)
+    elif positive_rollouts_only:
+        # Use reward signal: only apply gammas to correct (reward > 0) rollouts
+        token_level_scores = data.batch.get("token_level_scores", None)
+        if token_level_scores is not None:
+            seq_reward = token_level_scores.sum(dim=-1)  # (bs,)
+            apply_seq_mask = (seq_reward > 0).float().unsqueeze(1)  # (bs, 1)
+        else:
+            logger.warning("positive_rollouts_only=True but no token_level_scores in batch, "
+                           "falling back to advantages >= 0")
+            apply_seq_mask = None
+    else:
+        apply_seq_mask = None  # will use per-token positive_mask below
 
     if gamma_mode == "normalized":
         # Normalize gamma per-response so mean(gamma * A) = mean(A)
         # This redistributes credit without changing total gradient magnitude.
         rmask = response_mask.float() if response_mask is not None else torch.ones_like(gammas)
-        if apply_to_all:
-            apply_mask = rmask
+        if apply_seq_mask is not None:
+            apply_mask = apply_seq_mask * rmask
         else:
             positive_mask = (advantages >= 0).float()
             apply_mask = positive_mask * rmask
@@ -127,19 +144,19 @@ def apply_rhythm_weights(data) -> object:
                 scale = original_sum / weighted_sum
                 gammas[i] = 1.0 + scale * (g_i - 1.0)
 
-        if apply_to_all:
-            data.batch["advantages"] = advantages * gammas
+        if apply_seq_mask is not None:
+            gamma_effective = gammas * apply_seq_mask + (1.0 - apply_seq_mask)
         else:
             gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
-            data.batch["advantages"] = advantages * gamma_effective
+        data.batch["advantages"] = advantages * gamma_effective
     else:
         # Raw mode: direct multiplication
-        if apply_to_all:
-            data.batch["advantages"] = advantages * gammas
+        if apply_seq_mask is not None:
+            gamma_effective = gammas * apply_seq_mask + (1.0 - apply_seq_mask)
         else:
             positive_mask = (advantages >= 0).float()
             gamma_effective = gammas * positive_mask + (1.0 - positive_mask)
-            data.batch["advantages"] = advantages * gamma_effective
+        data.batch["advantages"] = advantages * gamma_effective
 
     # Compute stats
     _DRIVER_STEP_COUNTER += 1
@@ -208,7 +225,7 @@ def apply_rhythm_weights(data) -> object:
         "rhythm/n_pos_adv_tokens": n_pos,
         "rhythm/adv_mean_before": adv_before,
         "rhythm/adv_mean_after": adv_after,
-        "rhythm/run_type": {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7}.get(cfg["run_type"], -1),
+        "rhythm/run_type": {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7, "I": 8, "J": 9}.get(cfg["run_type"], -1),
         "rhythm/gamma_mode": {"raw": 0, "normalized": 1}.get(gamma_mode, -1),
     }
 
@@ -223,6 +240,16 @@ def apply_rhythm_weights(data) -> object:
             "rhythm/reclass_glob_jaccard": reclass["glob_jaccard"],
             "rhythm/reclass_n_loc": reclass["n_loc"],
             "rhythm/reclass_n_glob": reclass["n_glob"],
+        })
+
+    # Check for EAP-IG rediscovery stats
+    eapig_reclass = _DRIVER_CONFIG.get("_last_eapig_rediscovery")
+    if eapig_reclass and eapig_reclass.get("step") == _DRIVER_STEP_COUNTER:
+        _RHYTHM_METRICS.update({
+            "rhythm/eapig_turnover": eapig_reclass["turnover"],
+            "rhythm/eapig_jaccard": eapig_reclass["jaccard"],
+            "rhythm/eapig_n_heads": eapig_reclass["n_heads"],
+            "rhythm/eapig_elapsed_s": eapig_reclass["elapsed_s"],
         })
 
     log_msg = (
@@ -275,11 +302,19 @@ def apply_patches(
     reasoning_heads: list[tuple[int, int]] | None = None,
     head_scores: torch.Tensor | None = None,
     weighting_method: str = "rhythm",
+    num_reasoning_heads: int = 200,
+    eapig_rediscovery_K: int = 0,
+    eapig_rediscovery_problems: int = 50,
+    positive_rollouts_only: bool = False,
 ):
     """Save rhythm config to disk for Ray workers to load.
 
     weighting_method: "rhythm" (B/C), "attention" (D), "fai" (E),
-                      "fai_allheads" (F), "fai_asymmetric" (G), "anchor_credit" (H)
+                      "fai_allheads" (F), "fai_asymmetric" (G), "anchor_credit" (H),
+                      "fai_discrete" (I), "fai_allheads_discrete" (J)
+    eapig_rediscovery_K: re-run EAP-IG every K steps (0 = disabled)
+    eapig_rediscovery_problems: number of problems for rediscovery
+    positive_rollouts_only: only apply gamma weighting to correct (reward > 0) rollouts
     """
     config = {
         "run_type": run_type,
@@ -299,10 +334,14 @@ def apply_patches(
         "gamma_mode": gamma_mode,
         "dry_run": dry_run,
         "step_counter": 0,
-        # EAP-IG methods D-H
+        # EAP-IG methods D-J
         "reasoning_heads": reasoning_heads,
         "head_scores": head_scores,
         "weighting_method": weighting_method,
+        "num_reasoning_heads": num_reasoning_heads,
+        "eapig_rediscovery_K": eapig_rediscovery_K,
+        "eapig_rediscovery_problems": eapig_rediscovery_problems,
+        "positive_rollouts_only": positive_rollouts_only,
     }
     torch.save(config, _CONFIG_PATH)
     logger.info(f"Saved rhythm_trainer config to {_CONFIG_PATH}")
@@ -319,9 +358,10 @@ def needs_rhythm_dispatch() -> bool:
         _ensure_driver_config()
         if _DRIVER_CONFIG["run_type"] in ("B", "C"):
             return True
-        # EAP-IG methods D-H also need dispatch
+        # EAP-IG methods D-J also need dispatch
         return _DRIVER_CONFIG.get("weighting_method", "rhythm") in (
-            "attention", "fai", "fai_allheads", "fai_asymmetric", "anchor_credit"
+            "attention", "fai", "fai_allheads", "fai_asymmetric", "anchor_credit",
+            "fai_discrete", "fai_allheads_discrete",
         )
     except FileNotFoundError:
         return False
@@ -534,13 +574,15 @@ def _compute_eapig_gammas_on_worker(
     cfg: dict,
     log_fn=None,
 ) -> torch.Tensor:
-    """Compute EAP-IG-based gammas (methods D-H) on a GPU worker.
+    """Compute EAP-IG-based gammas (methods D-J) on a GPU worker.
 
     Mini-batches sequences (sorted by length) for efficient forward passes.
     """
     from attention_sparks_thinking.src.token_weighting import (
         compute_anchor_credit_weights,
         compute_attention_weights,
+        compute_fai_discrete_allheads_weights,
+        compute_fai_discrete_weights,
         compute_fai_weights,
         compute_fai_weights_allheads,
     )
@@ -631,6 +673,15 @@ def _compute_eapig_gammas_on_worker(
                     mb_gammas = compute_fai_weights_allheads(
                         mb_ids, mb_amask, mb_rmask, eager_model,
                     )
+                elif method == "fai_discrete":
+                    mb_gammas = compute_fai_discrete_weights(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                        reasoning_heads, head_scores,
+                    )
+                elif method == "fai_allheads_discrete":
+                    mb_gammas = compute_fai_discrete_allheads_weights(
+                        mb_ids, mb_amask, mb_rmask, eager_model,
+                    )
                 elif method == "anchor_credit":
                     mb_gammas = compute_anchor_credit_weights(
                         mb_ids, mb_amask, mb_rmask, eager_model,
@@ -659,6 +710,218 @@ def _compute_eapig_gammas_on_worker(
                f"min={gammas.min():.4f}, frac>1={(gammas > 1).float().mean():.3f}")
 
     return gammas
+
+
+def rediscover_eapig_heads_on_worker(eager_model, tokenizer, step, log_fn=None):
+    """Re-run EAP-IG head importance analysis on the worker using current weights.
+
+    Updates reasoning_heads and head_scores in the config file.
+    Logs turnover metrics so the driver can pick them up for wandb.
+    """
+    import json
+    import random
+    import time
+
+    import pandas as pd
+    import torch.nn.functional as F
+
+    cfg = torch.load(_CONFIG_PATH, map_location="cpu", weights_only=False)
+    num_problems = cfg.get("eapig_rediscovery_problems", 50)
+    num_reasoning_heads = cfg.get("num_reasoning_heads", 200)
+    device = next(eager_model.parameters()).device
+
+    if log_fn:
+        log_fn(f"EAP-IG rediscovery: {num_problems} problems, top {num_reasoning_heads} heads")
+
+    # ── Load problems ──
+    data_path = "/cluster/projects/nn12068k/haaklau/llm-training-experiments/attention_sparks_thinking/data/dapo_math_17k.parquet"
+    try:
+        df = pd.read_parquet(data_path)
+    except FileNotFoundError:
+        data_path = "/cluster/projects/nn12068k/haaklau/llm-training-experiments/attention_based_rewards/data/dapo_math_17k.parquet"
+        df = pd.read_parquet(data_path)
+
+    problems = []
+    for _, row in df.iterrows():
+        prompt_msgs = row["prompt"]
+        if isinstance(prompt_msgs, str):
+            prompt_msgs = json.loads(prompt_msgs)
+        user_msg = next((m["content"] for m in prompt_msgs if m["role"] == "user"), "")
+        if 20 < len(user_msg) < 500:
+            problems.append(user_msg)
+        if len(problems) >= num_problems:
+            break
+
+    if log_fn:
+        log_fn(f"Loaded {len(problems)} problems for rediscovery")
+
+    # ── Run attribution patching ──
+    system_prompt = r"Please reason step by step, and put your final answer within \boxed{}."
+    n_layers = eager_model.config.num_hidden_layers
+    n_heads = eager_model.config.num_attention_heads
+    head_dim = getattr(eager_model.config, "head_dim", None) or \
+        eager_model.model.layers[0].self_attn.o_proj.in_features // n_heads
+
+    importance = torch.zeros(n_layers, n_heads, device=device)
+    n_valid = 0
+    t_start = time.time()
+
+    for prob_idx, question in enumerate(problems):
+        # Format prompts
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+        try:
+            clean_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            clean_prompt = system_prompt + "\n\nProblem: " + question + "\n\nSolution:\n"
+
+        words = question.split()
+        rng = random.Random(42 + prob_idx)
+        rng.shuffle(words)
+        scrambled = " ".join(words)
+        corrupt_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": scrambled},
+        ]
+        try:
+            corrupt_prompt = tokenizer.apply_chat_template(
+                corrupt_messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            corrupt_prompt = system_prompt + "\n\nProblem: " + scrambled + "\n\nSolution:\n"
+
+        clean_prompt_ids = tokenizer(clean_prompt, return_tensors="pt").input_ids.to(device)
+        corrupt_prompt_ids = tokenizer(corrupt_prompt, return_tensors="pt").input_ids.to(device)
+
+        # Generate short prefix for reasoning context
+        with torch.no_grad():
+            clean_with_prefix = eager_model.generate(
+                clean_prompt_ids, max_new_tokens=50, do_sample=False,
+            )
+            corrupt_with_prefix = eager_model.generate(
+                corrupt_prompt_ids, max_new_tokens=50, do_sample=False,
+            )
+
+        min_len = min(clean_with_prefix.shape[1], corrupt_with_prefix.shape[1])
+        clean_ids = clean_with_prefix[:, :min_len]
+        corrupt_ids = corrupt_with_prefix[:, :min_len]
+
+        try:
+            # Attribution patching
+            clean_raw = {}
+            handles = []
+
+            def make_capture_hook(layer_idx):
+                def hook_fn(module, args):
+                    clean_raw[layer_idx] = args[0]
+                return hook_fn
+
+            for layer_idx in range(n_layers):
+                o_proj = eager_model.model.layers[layer_idx].self_attn.o_proj
+                handle = o_proj.register_forward_pre_hook(make_capture_hook(layer_idx))
+                handles.append(handle)
+
+            output = eager_model(clean_ids)
+            logits_last = output.logits[0, -1]
+            target_token = logits_last.argmax()
+            loss = -F.log_softmax(logits_last, dim=-1)[target_token]
+
+            for handle in handles:
+                handle.remove()
+
+            grad_targets = [clean_raw[i] for i in range(n_layers)]
+            grads = torch.autograd.grad(loss, grad_targets, allow_unused=True)
+
+            # Corrupt forward
+            corrupt_raw = {}
+            handles2 = []
+
+            def make_capture_hook_nograd(layer_idx):
+                def hook_fn(module, args):
+                    corrupt_raw[layer_idx] = args[0].detach()
+                return hook_fn
+
+            for layer_idx in range(n_layers):
+                o_proj = eager_model.model.layers[layer_idx].self_attn.o_proj
+                handle = o_proj.register_forward_pre_hook(make_capture_hook_nograd(layer_idx))
+                handles2.append(handle)
+
+            with torch.no_grad():
+                eager_model(corrupt_ids)
+
+            for handle in handles2:
+                handle.remove()
+
+            # Compute per-head importance
+            for layer_idx in range(n_layers):
+                grad_act = grads[layer_idx]
+                if grad_act is None:
+                    continue
+                clean_act = clean_raw[layer_idx].detach().view(-1, min_len, n_heads, head_dim)
+                corrupt_act = corrupt_raw[layer_idx].view(-1, min_len, n_heads, head_dim)
+                grad_heads = grad_act.view(-1, min_len, n_heads, head_dim)
+                attr = ((clean_act - corrupt_act) * grad_heads).sum(dim=(0, 1, 3)).abs()
+                importance[layer_idx] += attr
+
+            n_valid += 1
+
+        except torch.cuda.OutOfMemoryError:
+            if log_fn:
+                log_fn(f"OOM on problem {prob_idx}, skipping")
+            torch.cuda.empty_cache()
+            eager_model.zero_grad()
+            continue
+
+        torch.cuda.empty_cache()
+        eager_model.zero_grad()
+
+    if n_valid == 0:
+        if log_fn:
+            log_fn("EAP-IG rediscovery: no valid problems processed!")
+        return
+
+    importance /= n_valid
+    elapsed = time.time() - t_start
+
+    # ── Select top N heads ──
+    flat_scores = importance.flatten()
+    topk_indices = flat_scores.topk(min(num_reasoning_heads, flat_scores.numel())).indices
+    new_heads = [
+        (int(idx // n_heads), int(idx % n_heads))
+        for idx in topk_indices
+    ]
+
+    # ── Compute turnover vs old heads ──
+    old_heads = set(tuple(h) for h in cfg.get("reasoning_heads", []))
+    new_heads_set = set(tuple(h) for h in new_heads)
+
+    intersection = old_heads & new_heads_set
+    union = old_heads | new_heads_set
+    turnover = 1.0 - len(intersection) / max(len(union), 1)
+    jaccard = len(intersection) / max(len(union), 1)
+
+    # ── Update config ──
+    cfg["reasoning_heads"] = new_heads
+    cfg["head_scores"] = importance.cpu()
+    cfg["_last_eapig_rediscovery"] = {
+        "step": step,
+        "turnover": turnover,
+        "jaccard": jaccard,
+        "n_heads": len(new_heads),
+        "n_problems": n_valid,
+        "elapsed_s": elapsed,
+    }
+    torch.save(cfg, _CONFIG_PATH)
+
+    if log_fn:
+        log_fn(
+            f"EAP-IG rediscovery done: {n_valid} problems in {elapsed:.1f}s | "
+            f"{len(new_heads)} heads | turnover={turnover:.3f} jaccard={jaccard:.3f}"
+        )
 
 
 def reclassify_heads_on_worker(eager_model, tokenizer, step, log_fn=None):

@@ -53,9 +53,10 @@ def parse_custom_args():
 
     parser = argparse.ArgumentParser(description="Attention-rhythm-guided GRPO training")
     parser.add_argument("--run_type", type=str, required=True,
-                        choices=["A", "B", "C", "D", "E", "F", "G", "H"],
+                        choices=["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
                         help="Run type: A=baseline, B=static rhythm, C=adaptive rhythm, "
-                             "D=attention, E=FAI, F=FAI-allheads, G=FAI-asymmetric, H=anchor-credit")
+                             "D=attention, E=FAI, F=FAI-allheads, G=FAI-asymmetric, H=anchor-credit, "
+                             "I=FAI-discrete, J=FAI-allheads-discrete")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Math-1.5B",
                         help="HF model path")
     parser.add_argument("--dry_run", action="store_true",
@@ -76,6 +77,12 @@ def parse_custom_args():
                         help="Path to head_importance_qwen3.pt from EAP-IG (required for D/E/G/H)")
     parser.add_argument("--num_reasoning_heads", type=int, default=200,
                         help="Number of top EAP-IG heads to use (default 200)")
+    parser.add_argument("--eapig_rediscovery_K", type=int, default=0,
+                        help="Re-run EAP-IG every K steps (0=disabled, e.g. 50)")
+    parser.add_argument("--eapig_rediscovery_problems", type=int, default=50,
+                        help="Number of problems for EAP-IG rediscovery")
+    parser.add_argument("--positive_rollouts_only", action="store_true",
+                        help="Only apply gamma weighting to correct (reward > 0) rollouts")
 
     args = parser.parse_args(custom_args)
     return args, verl_args
@@ -214,9 +221,10 @@ def main():
             args.model_name, args.num_class_prompts, args.head_quantile
         )
 
-    # EAP-IG reasoning heads for D/E/G/H
+    # EAP-IG reasoning heads for D-J
     EAPIG_METHODS = {"D": "attention", "E": "fai", "F": "fai_allheads",
-                     "G": "fai_asymmetric", "H": "anchor_credit"}
+                     "G": "fai_asymmetric", "H": "anchor_credit",
+                     "I": "fai_discrete", "J": "fai_allheads_discrete"}
     reasoning_heads = None
     head_scores = None
     weighting_method = "rhythm"
@@ -224,7 +232,7 @@ def main():
     if args.run_type in EAPIG_METHODS:
         weighting_method = EAPIG_METHODS[args.run_type]
 
-        if args.run_type in ("D", "E", "G", "H"):
+        if args.run_type in ("D", "E", "G", "H", "I"):
             # These methods need reasoning heads from EAP-IG
             heads_path = args.reasoning_heads_path
             if heads_path is None:
@@ -270,6 +278,10 @@ def main():
         reasoning_heads=reasoning_heads,
         head_scores=head_scores,
         weighting_method=weighting_method,
+        num_reasoning_heads=args.num_reasoning_heads,
+        eapig_rediscovery_K=args.eapig_rediscovery_K,
+        eapig_rediscovery_problems=args.eapig_rediscovery_problems,
+        positive_rollouts_only=args.positive_rollouts_only,
     )
 
     # Rewrite sys.argv for Hydra

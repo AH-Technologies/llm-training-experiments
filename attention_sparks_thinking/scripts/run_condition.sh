@@ -12,7 +12,7 @@
 #   DRY_RUN     - if "1", run only 2 steps with diagnostics
 set -x
 
-RUN_TYPE=${1:?Usage: run_condition.sh <A|B|C|D|E|F|G|H>}
+RUN_TYPE=${1:?Usage: run_condition.sh <A|B|C|D|E|F|G|H|I|J>}
 shift
 
 MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
@@ -33,11 +33,23 @@ if [ "${DRY_RUN}" = "1" ]; then
     CUSTOM_ARGS="${CUSTOM_ARGS} --dry_run"
 fi
 
-# EAP-IG reasoning heads path for methods D/E/G/H
+# EAP-IG reasoning heads path for methods D/E/G/H/I
 REASONING_HEADS_PATH=${REASONING_HEADS_PATH:-"attention_sparks_thinking/logs/head_importance_qwen3.pt"}
 NUM_REASONING_HEADS=${NUM_REASONING_HEADS:-200}
-if [[ "${RUN_TYPE}" =~ ^[DEGH]$ ]]; then
+if [[ "${RUN_TYPE}" =~ ^[DEGHI]$ ]]; then
     CUSTOM_ARGS="${CUSTOM_ARGS} --reasoning_heads_path ${REASONING_HEADS_PATH} --num_reasoning_heads ${NUM_REASONING_HEADS}"
+fi
+
+# Positive rollouts only (apply gamma weighting only to correct responses)
+if [ "${POSITIVE_ROLLOUTS_ONLY:-}" = "1" ]; then
+    CUSTOM_ARGS="${CUSTOM_ARGS} --positive_rollouts_only"
+fi
+# EAP-IG rediscovery (optional, set EAPIG_REDISCOVERY_K>0 to enable)
+if [ -n "${EAPIG_REDISCOVERY_K:-}" ] && [ "${EAPIG_REDISCOVERY_K}" != "0" ]; then
+    CUSTOM_ARGS="${CUSTOM_ARGS} --eapig_rediscovery_K ${EAPIG_REDISCOVERY_K}"
+    if [ -n "${EAPIG_REDISCOVERY_PROBLEMS:-}" ]; then
+        CUSTOM_ARGS="${CUSTOM_ARGS} --eapig_rediscovery_problems ${EAPIG_REDISCOVERY_PROBLEMS}"
+    fi
 fi
 
 # Rhythm hyperparams (override via env)
@@ -101,7 +113,7 @@ python3 -m attention_sparks_thinking.scripts.train \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     algorithm.kl_ctrl.kl_coef=0.0 \
     algorithm.use_kl_in_reward=False \
-    +algorithm.filter_groups.enable=True \
+    +algorithm.filter_groups.enable=False \
     custom_reward_function.path=${REWARD_FN_PATH} \
     custom_reward_function.name=${REWARD_FN_NAME} \
     trainer.critic_warmup=0 \
@@ -109,7 +121,7 @@ python3 -m attention_sparks_thinking.scripts.train \
     trainer.project_name='attention-sparks-thinking' \
     trainer.experiment_name="rhythm_run${RUN_TYPE}${EXP_SUFFIX:-}" \
     trainer.n_gpus_per_node=4 \
-    trainer.nnodes=1 \
+    trainer.nnodes=2 \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=0 \

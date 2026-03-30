@@ -199,6 +199,80 @@ def compute_asymmetric_weights(
     return weights
 
 
+def _discretize_weights(
+    weights: Tensor,
+    mask: Tensor,
+    top_fraction: float = 0.2,
+    boost: float = 1.5,
+) -> Tensor:
+    """Convert smooth weights to discrete: top_fraction of tokens get `boost`, rest get 1.0.
+
+    Per-sequence: selects top `top_fraction` tokens by weight value and assigns
+    them the boost factor. All other tokens get weight 1.0.
+    """
+    bs, resp_len = weights.shape
+    device = weights.device
+    discrete = torch.ones(bs, resp_len, device=device, dtype=torch.float32)
+
+    for b in range(bs):
+        valid = mask[b].bool()
+        n_valid = valid.sum().item()
+        if n_valid < 2:
+            continue
+        n_top = max(1, int(n_valid * top_fraction))
+        valid_weights = weights[b][valid]
+        _, top_idx = valid_weights.topk(n_top)
+        # Map back to full sequence positions
+        valid_positions = valid.nonzero(as_tuple=True)[0]
+        discrete[b, valid_positions[top_idx]] = boost
+
+    return discrete * mask.float()
+
+
+def compute_fai_discrete_weights(
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    response_mask: Tensor,
+    attn_model: "torch.nn.Module",
+    reasoning_heads: list[tuple[int, int]],
+    head_scores: Tensor,
+    top_fraction: float = 0.2,
+    boost: float = 1.5,
+) -> Tensor:
+    """Method I: Discrete FAI on reasoning heads.
+
+    Computes smooth FAI, then selects top `top_fraction` tokens and assigns
+    them `boost` weight. Rest get 1.0.
+    """
+    smooth = compute_fai_weights(
+        input_ids, attention_mask, response_mask, attn_model,
+        reasoning_heads, head_scores,
+    )
+    return _discretize_weights(smooth, response_mask, top_fraction, boost)
+
+
+def compute_fai_discrete_allheads_weights(
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    response_mask: Tensor,
+    attn_model: "torch.nn.Module",
+    n_layers: int = 36,
+    n_heads: int = 32,
+    top_fraction: float = 0.2,
+    boost: float = 1.5,
+) -> Tensor:
+    """Method J: Discrete FAI across ALL heads.
+
+    Computes smooth FAI over all heads, then selects top `top_fraction` tokens
+    and assigns them `boost` weight. Rest get 1.0.
+    """
+    smooth = compute_fai_weights_allheads(
+        input_ids, attention_mask, response_mask, attn_model,
+        n_layers, n_heads,
+    )
+    return _discretize_weights(smooth, response_mask, top_fraction, boost)
+
+
 def compute_anchor_credit_weights(
     input_ids: Tensor,
     attention_mask: Tensor,
