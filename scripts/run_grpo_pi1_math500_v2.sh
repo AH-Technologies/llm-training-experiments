@@ -83,8 +83,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name='grpo_pi1_math500_lr_increased_multi_val' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=3 \
+    trainer.save_freq=100 \
+    trainer.max_actor_ckpt_to_keep=-1 \
     trainer.val_before_train=True \
     trainer.test_freq=20 \
     trainer.total_epochs=2000 \

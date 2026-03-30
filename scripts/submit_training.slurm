@@ -261,9 +261,17 @@ elif [ "$TASK" == "self_teach_dapo" ]; then
     export VAL_FILE="data/val/val_combined_verl.parquet"
     export EXPERIMENT_NAME="self_teach_dapo_qwen3"
     TRAIN_SCRIPT="scripts/run_grpo_self_teach.sh"
+elif [ "$TASK" == "s1_sft" ]; then
+    # S1 SFT: Qwen2.5-32B-Instruct on s1K dataset
+    # NOTE: This task needs 4 nodes (16 GPUs). Use submit_s1_sft.slurm for correct SLURM settings.
+    if [ ! -f "data/s1K/s1k_sft.parquet" ]; then
+        echo "Preparing s1K SFT data..."
+        python scripts/prepare_s1k_sft.py
+    fi
+    TRAIN_SCRIPT="scripts/run_sft_s1k.sh"
 else
     echo "Unknown task: $TASK"
-    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach, self_teach_filtered, self_teach_blind, self_teach_blind_filtered, self_teach_teacher_only, self_teach_dapo"
+    echo "Available tasks: pi13_math500, pi13_math500_medium_wd, pi13_math500_high_wd, pi13_math500_pos_ent, pi13_math500_high_ent, pi13_math500_v2, pi1_math500_v2, ber, astar_sft, self_teach, self_teach_filtered, self_teach_blind, self_teach_blind_filtered, self_teach_teacher_only, self_teach_dapo, s1_sft"
     exit 1
 fi
 
