@@ -29,6 +29,7 @@ SEQ_LENGTH=${SEQ_LENGTH:-32768}
 NUM_EPOCHS=${NUM_EPOCHS:-5}
 TP_DEGREE=${TP_DEGREE:-4}
 SAVE_EVERY=${SAVE_EVERY:-1}
+HF_REPO=${HF_REPO:-""}
 
 PROJECT_DIR=${PROJECT_DIR:-"/cluster/projects/nn12068k/alexaau/llm-training-experiments"}
 
@@ -62,7 +63,9 @@ TRAINER_ARGS="\
     --tp-degree ${TP_DEGREE} \
     --save-every-n-epochs ${SAVE_EVERY} \
     --log-every-n-steps 1 \
-    --seed 42"
+    --seed 42 \
+    ${HF_REPO:+--hf-repo ${HF_REPO} --delete-local-checkpoints} \
+    $@"
 
 # Launch trainer
 # For multi-node: srun launches torchrun on each node

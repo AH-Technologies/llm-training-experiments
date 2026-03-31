@@ -1,38 +1,35 @@
 #!/bin/bash
-#SBATCH --job-name=s1-sft-32b
+#SBATCH --job-name=s1-grok-32b
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=logs/s1-sft-%j.out
-#SBATCH --error=logs/s1-sft-%j.err
+#SBATCH --output=logs/s1-grok-%j.out
+#SBATCH --error=logs/s1-grok-%j.err
 
-# S1 SFT: Qwen2.5-32B-Instruct on s1K (4 nodes x 4 H200 GPUs)
+# S1 Grokking: Qwen2.5-32B-Instruct on s1K — 150 epochs (30x paper run)
+# Tests whether extended training produces a grokking-like effect.
+#
+# Saves 10 checkpoints (every 15 epochs) for post-hoc eval.
 #
 # Usage:
-#   sbatch scripts/submit_s1_sft.slurm
-#   sbatch scripts/submit_s1_sft.slurm   # uses defaults
-#
-# To override hyperparameters, set env vars before sbatch:
-#   NUM_EPOCHS=50 BATCH_SIZE=16 sbatch scripts/submit_s1_sft.slurm
+#   sbatch scripts/submit_s1_sft_grokking.slurm
 
 set -e
 
 echo "=========================================="
-echo "S1 SFT: Qwen2.5-32B on s1K"
+echo "S1 Grokking: Qwen2.5-32B on s1K (150 epochs)"
 echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "GPUs per node: $SLURM_GPUS_ON_NODE"
-echo "Architecture: $(uname -m)"
 echo "Start time: $(date)"
 echo "=========================================="
 
-# Create directories
 mkdir -p logs checkpoints data
 
 # Load modules
@@ -40,16 +37,13 @@ module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 module load aws-ofi-nccl/1.14.1-GCCcore-13.3.0-CUDA-12.6.0
 
-# Project directory
 PROJECT_DIR=/cluster/projects/nn12068k/alexaau/llm-training-experiments
 cd $PROJECT_DIR
 
-# Activate venv
 if [ -d "$PROJECT_DIR/venv" ]; then
     source $PROJECT_DIR/venv/bin/activate
 fi
 
-# Load .env (WANDB_API_KEY, HF_TOKEN, etc.)
 if [ -f "$PROJECT_DIR/.env" ]; then
     set -a
     source "$PROJECT_DIR/.env"
@@ -105,12 +99,12 @@ echo "Master: $MASTER_ADDR:$MASTER_PORT"
 echo "HF cache: $HF_HOME"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-# ---- Background GPU/memory monitor (every 60s) ----
+# ---- Background GPU/memory monitor (every 120s) ----
 (while true; do
     echo "--- GPU monitor $(date) ---"
     nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu --format=csv,noheader
     echo "CPU mem: $(free -g | awk '/^Mem:/{print $3"/"$2" GB"}')"
-    sleep 60
+    sleep 120
 done) &
 MONITOR_PID=$!
 
@@ -121,11 +115,14 @@ if [ ! -f "data/s1K/s1k_sft.parquet" ]; then
 fi
 
 # ---- Run training ----
-echo "Starting S1 SFT training..."
-bash scripts/run_sft_s1k.sh "$@"
+echo "Starting S1 grokking training (150 epochs)..."
+export NUM_EPOCHS=150
+export SAVE_EVERY=15
+export OUTPUT_DIR="checkpoints/s1_grokking_qwen32b"
+export HF_REPO="alexaau/s1-grokking-qwen32b"
+bash scripts/run_sft_s1k.sh --wandb-run-name "s1_grokking_150ep"
 
 # Cleanup
-echo "Cleaning up..."
 kill $MONITOR_PID 2>/dev/null || true
 wait
 

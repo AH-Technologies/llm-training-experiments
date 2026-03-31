@@ -141,16 +141,25 @@ def build_dataset(
 # Checkpoint saving
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, tokenizer, output_dir: str, step: int, epoch: int, rank: int):
-    """Save model checkpoint in HuggingFace format (rank 0 only)."""
+def save_checkpoint(
+    model, tokenizer, output_dir: str, step: int, epoch: int, rank: int,
+    hf_repo: str | None = None, delete_local: bool = False,
+):
+    """Save model checkpoint and optionally upload to HF Hub.
+
+    Args:
+        hf_repo: HF Hub repo ID (e.g. "alexaau/s1-grokking-qwen32b"). If set,
+                 uploads the checkpoint and optionally deletes the local copy.
+        delete_local: If True and hf_repo is set, delete local files after upload.
+    """
     if rank != 0:
         return
 
-    ckpt_dir = os.path.join(output_dir, f"checkpoint-epoch{epoch}-step{step}")
+    ckpt_name = f"checkpoint-epoch{epoch}-step{step}"
+    ckpt_dir = os.path.join(output_dir, ckpt_name)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # Gather full state dict from FSDP2
-    from torch.distributed.fsdp import FullyShardedDataParallel
     from torch.distributed._tensor import DTensor
 
     state_dict = {}
@@ -168,6 +177,27 @@ def save_checkpoint(model, tokenizer, output_dir: str, step: int, epoch: int, ra
         json.dump(meta, f, indent=2)
 
     print(f"[s1] Checkpoint saved: {ckpt_dir}")
+
+    # Upload to HF Hub
+    if hf_repo:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.create_repo(hf_repo, exist_ok=True, private=True)
+            api.upload_folder(
+                folder_path=ckpt_dir,
+                repo_id=hf_repo,
+                path_in_repo=ckpt_name,
+                commit_message=f"Checkpoint epoch {epoch} step {step}",
+            )
+            print(f"[s1] Uploaded to HF Hub: {hf_repo}/{ckpt_name}")
+
+            if delete_local:
+                import shutil
+                shutil.rmtree(ckpt_dir)
+                print(f"[s1] Deleted local checkpoint: {ckpt_dir}")
+        except Exception as e:
+            print(f"[s1] WARNING: HF upload failed (keeping local): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +223,8 @@ def main() -> None:
     parser.add_argument("--log-every-n-steps", type=int, default=1)
     parser.add_argument("--wandb-project", default="s1-qwen32b-sft")
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--hf-repo", default=None, help="HF Hub repo for checkpoint upload (e.g. alexaau/s1-grokking-qwen32b)")
+    parser.add_argument("--delete-local-checkpoints", action="store_true", help="Delete local checkpoints after HF upload")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -436,7 +468,10 @@ def main() -> None:
         # Save checkpoint
         if (epoch + 1) % args.save_every_n_epochs == 0 or (epoch + 1) == args.num_epochs:
             dist.barrier()
-            save_checkpoint(model, tokenizer, args.output_dir, global_step, epoch + 1, rank)
+            save_checkpoint(
+                model, tokenizer, args.output_dir, global_step, epoch + 1, rank,
+                hf_repo=args.hf_repo, delete_local=args.delete_local_checkpoints,
+            )
             dist.barrier()
 
     # Final summary
