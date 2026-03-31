@@ -119,7 +119,7 @@ echo "Starting S1 grokking training (150 epochs)..."
 export NUM_EPOCHS=150
 export SAVE_EVERY=15
 export OUTPUT_DIR="checkpoints/s1_grokking_qwen32b"
-export HF_REPO="alexaau/s1-grokking-qwen32b"
+export HF_REPO="alexauren/s1-grokking-qwen32b"
 bash scripts/run_sft_s1k.sh --wandb-run-name "s1_grokking_150ep"
 
 # Cleanup
