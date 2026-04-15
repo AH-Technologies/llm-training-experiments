@@ -1,39 +1,59 @@
 #!/bin/bash
-# Setup script for RLVR Grokking environment on NRIS HPC (GH200 ARM)
+# Unified environment setup for both Olivia (GH200 ARM) and IDUN (H100/A100 x86).
 #
-# IMPORTANT: This must be run on a GPU node (via srun), NOT on login node!
-# The GPU nodes are ARM (aarch64) while login nodes are x86_64.
+# IMPORTANT: Must be run on a GPU node (via srun), NOT on login node!
 #
 # Usage:
+#   # Olivia:
 #   srun --account=nn12068k --time=00:30:00 --partition=accel --gpus=1 \
-#        --cpus-per-task=4 --mem-per-cpu=16G ./scripts/setup_env.sh
+#        --cpus-per-task=4 --mem-per-cpu=16G bash scripts/setup_env.sh
+#
+#   # IDUN:
+#   srun --account=share-ie-idi --time=00:30:00 --partition=GPUQ --gpus=1 \
+#        --cpus-per-task=4 --mem-per-cpu=16G bash scripts/setup_env.sh
+#
+# Options:
+#   --s1-only    Skip vLLM/verl/ray (not needed for S1 SFT)
+#   --full       Install the full RLVR stack (vLLM, verl, ray) [default]
 
 set -e
 
+# Parse flags
+S1_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --s1-only) S1_ONLY=true ;;
+        --full)    S1_ONLY=false ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/cluster_config.sh"
+
 echo "=========================================="
-echo "RLVR Grokking Environment Setup"
+echo "Environment Setup ($CLUSTER_NAME)"
 echo "=========================================="
 echo "Architecture: $(uname -m)"
 echo "Hostname: $(hostname)"
+echo "S1-only mode: $S1_ONLY"
 echo ""
 
-# Check we're on ARM (GPU node)
-if [ "$(uname -m)" != "aarch64" ]; then
-    echo "ERROR: This script must be run on a GPU node (ARM architecture)!"
-    echo "Use: srun --account=nn12068k --time=00:30:00 --partition=accel --gpus=1 --cpus-per-task=4 --mem-per-cpu=16G $0"
+# Check we're on a GPU node
+if ! nvidia-smi &>/dev/null; then
+    echo "ERROR: This script must be run on a GPU node!"
+    if [ "$CLUSTER_NAME" = "olivia" ]; then
+        echo "Use: srun --account=nn12068k --time=00:30:00 --partition=accel --gpus=1 --cpus-per-task=4 --mem-per-cpu=16G $0"
+    else
+        echo "Use: srun --account=share-ie-idi --time=00:30:00 --partition=GPUQ --gpus=1 --cpus-per-task=4 --mem-per-cpu=16G $0"
+    fi
     exit 1
 fi
 
-# Load modules - Python only, NOT PyTorch (we'll install our own)
-echo "Loading modules..."
-module load NRIS/GPU
-module load Python/3.12.3-GCCcore-13.3.0
-
+# Load modules
+load_cluster_modules
 echo "Python: $(python3 --version)"
 
-# Set project directory
-PROJECT_DIR=/cluster/projects/nn12068k/haaklau/llm-training-experiments
-cd $PROJECT_DIR
+cd "$PROJECT_DIR"
 
 # Remove old venv if exists
 if [ -d "venv" ]; then
@@ -46,44 +66,57 @@ echo "Creating virtual environment..."
 python3 -m venv venv
 source venv/bin/activate
 
-# Upgrade pip
 echo "Upgrading pip..."
 pip install --upgrade pip
 
-# Install vLLM 0.12.0 first (has ARM wheels AND is compatible with verl 0.7.0)
-# Note: vLLM 0.14.x has API changes that break verl 0.7.0
-echo "Installing vLLM 0.12.0..."
-pip install vllm==0.12.0
+# IDUN needs CUDA module for nvcc
+if [ "$CLUSTER_NAME" = "idun" ]; then
+    export CUDA_HOME=$EBROOTCUDA
+fi
 
-# Reinstall PyTorch with CUDA support - vLLM installs CPU-only version
-# Must use --force-reinstall because version numbers match but builds differ
-echo "Reinstalling PyTorch 2.9.0 with CUDA 12.8 (ARM compatible)..."
-pip install --force-reinstall torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
-    --index-url https://download.pytorch.org/whl/cu128
+if [ "$S1_ONLY" = "false" ]; then
+    # Full stack: install vLLM first, then force-reinstall PyTorch with CUDA
+    echo "Installing vLLM 0.12.0..."
+    pip install vllm==0.12.0
 
-# Fix numpy and setuptools versions
-echo "Fixing numpy and setuptools versions..."
-pip install "numpy>=2.0,<2.3" "setuptools>=77.0.3,<81.0.0"
+    echo "Reinstalling PyTorch 2.9.0 with CUDA ($CUDA_TAG)..."
+    pip install --force-reinstall torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+        --index-url "$CUDA_INDEX_URL"
 
-# Install verl
-echo "Installing verl..."
-pip install verl
+    echo "Fixing numpy and setuptools versions..."
+    pip install "numpy>=2.0,<2.3" "setuptools>=77.0.3,<81.0.0"
 
-# Install FlashAttention2 from pre-built ARM wheel
-echo "Installing FlashAttention2 (pre-built ARM wheel)..."
-FLASH_ATTN_WHEEL="flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
-FLASH_ATTN_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/${FLASH_ATTN_WHEEL}"
-curl -L -o "/tmp/${FLASH_ATTN_WHEEL}" "$FLASH_ATTN_URL"
-pip install "/tmp/${FLASH_ATTN_WHEEL}"
-rm -f "/tmp/${FLASH_ATTN_WHEEL}"
+    echo "Installing verl..."
+    pip install verl
+else
+    # S1-only: just PyTorch + torchtune deps
+    echo "Installing PyTorch 2.9.0 with CUDA ($CUDA_TAG)..."
+    pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+        --index-url "$CUDA_INDEX_URL"
 
-# Download tiktoken encodings for offline use (compute nodes have no internet)
-# Required by vLLM's openai_harmony module
+    echo "Installing torchtune + torchao..."
+    pip install torchao==0.9.0 torchtune
+fi
+
+# Install FlashAttention2 from pre-built wheel (arch-aware)
+echo "Installing FlashAttention2..."
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    FA_WHEEL="flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+else
+    FA_WHEEL="flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
+fi
+curl -L -o "/tmp/$FA_WHEEL" \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/$FA_WHEEL"
+pip install "/tmp/$FA_WHEEL"
+rm -f "/tmp/$FA_WHEEL"
+
+# Download tiktoken encodings for offline use (compute nodes may have no internet)
 echo "Downloading tiktoken encodings for offline use..."
-mkdir -p $PROJECT_DIR/tiktoken_encodings
-curl -L -o $PROJECT_DIR/tiktoken_encodings/o200k_base.tiktoken \
+mkdir -p "$PROJECT_DIR/tiktoken_encodings"
+curl -L -o "$PROJECT_DIR/tiktoken_encodings/o200k_base.tiktoken" \
     "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
-curl -L -o $PROJECT_DIR/tiktoken_encodings/cl100k_base.tiktoken \
+curl -L -o "$PROJECT_DIR/tiktoken_encodings/cl100k_base.tiktoken" \
     "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 
 # Install additional dependencies
@@ -91,24 +124,24 @@ echo "Installing additional dependencies..."
 pip install pandas pyarrow wandb hydra-core omegaconf
 
 # Install project in editable mode
-echo "Installing rlvr-grokking package..."
+echo "Installing project package..."
 pip install -e . --no-deps
 
 # Create directories
 mkdir -p logs checkpoints data
 
-# Set HuggingFace cache (shared location for interactive setup only;
-# job scripts use per-job caches via huggingface_$SLURM_JOB_ID)
-export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
-mkdir -p $HF_HOME
+# Set HuggingFace cache
+export HF_HOME=${HF_CACHE_BASE}/huggingface
+mkdir -p "$HF_HOME"
 
 echo ""
 echo "=========================================="
-echo "Setup complete!"
+echo "Setup complete! ($CLUSTER_NAME)"
 echo "=========================================="
 echo ""
 echo "Installed versions:"
-python -c "
+if [ "$S1_ONLY" = "false" ]; then
+    python -c "
 import torch
 import vllm
 import verl
@@ -121,17 +154,20 @@ print(f'  verl:         {verl.__version__}')
 print(f'  Ray:          {ray.__version__}')
 print(f'  Transformers: {transformers.__version__}')
 "
+else
+    python -c "
+import torch
+import transformers
+print(f'  PyTorch:      {torch.__version__}')
+print(f'  CUDA:         {torch.cuda.is_available()} (version {torch.version.cuda})')
+print(f'  Transformers: {transformers.__version__}')
+"
+fi
 echo ""
 echo "To use this environment in future sessions:"
-echo "  module load NRIS/GPU"
-echo "  module load Python/3.12.3-GCCcore-13.3.0"
 echo "  source $PROJECT_DIR/venv/bin/activate"
 echo ""
-echo "To configure wandb (required for logging):"
-echo "  srun --account=nn12068k --time=00:05:00 --partition=accel --gpus=1 \\"
-echo "       --cpus-per-task=4 --mem-per-cpu=8G --pty bash -c '\\"
-echo "       source $PROJECT_DIR/venv/bin/activate && wandb login'"
-echo ""
-echo "To run training:"
-echo "  sbatch scripts/submit_training.slurm pi13_math500"
+echo "To submit S1 SFT training:"
+echo "  bash scripts/submit_s1_sft.sh"
+echo "  bash scripts/submit_s1_sft_grokking.sh"
 echo ""

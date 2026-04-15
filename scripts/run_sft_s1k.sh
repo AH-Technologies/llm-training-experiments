@@ -29,9 +29,12 @@ SEQ_LENGTH=${SEQ_LENGTH:-16384}
 NUM_EPOCHS=${NUM_EPOCHS:-5}
 TP_DEGREE=${TP_DEGREE:-4}
 SAVE_EVERY=${SAVE_EVERY:-1}
+WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 HF_REPO=${HF_REPO:-""}
 
-PROJECT_DIR=${PROJECT_DIR:-"/cluster/projects/nn12068k/alexaau/llm-training-experiments"}
+if [ -z "$PROJECT_DIR" ]; then
+    source "$(dirname "${BASH_SOURCE[0]}")/cluster_config.sh"
+fi
 
 # Ensure src/ is on PYTHONPATH for s1.sft_trainer
 export PYTHONPATH=${PROJECT_DIR}/src:${PROJECT_DIR}:${PYTHONPATH}
@@ -59,7 +62,7 @@ TRAINER_ARGS="\
     --sequence-length ${SEQ_LENGTH} \
     --lr 1e-5 \
     --warmup-ratio 0.05 \
-    --weight-decay 1e-4 \
+    --weight-decay ${WEIGHT_DECAY} \
     --tp-degree ${TP_DEGREE} \
     --save-every-n-epochs ${SAVE_EVERY} \
     --log-every-n-steps 1 \

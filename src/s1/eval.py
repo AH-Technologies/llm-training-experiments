@@ -304,6 +304,10 @@ def main():
     )
 
     all_results = {}
+    model_name = Path(args.model).name
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+
     for bench_key in args.benchmarks:
         bench_name, loader = BENCHMARKS[bench_key]
         print(f"\n{'='*60}")
@@ -314,28 +318,25 @@ def main():
         result = evaluate_benchmark(model, problems, bench_name, args.max_tokens, args.max_samples)
         all_results[bench_key] = result
 
+        # Save incrementally after each benchmark
+        if args.output_dir:
+            output_path = os.path.join(args.output_dir, f"eval_{model_name}.json")
+            save_data = {
+                "model": args.model,
+                "results": {k: {kk: vv for kk, vv in v.items() if kk != "results"}
+                            for k, v in all_results.items()},
+                "detailed_results": {k: v["results"] for k, v in all_results.items()},
+            }
+            with open(output_path, "w") as f:
+                json.dump(save_data, f, indent=2)
+            print(f"  Results saved to {output_path}")
+
     # Summary
     print(f"\n{'='*60}")
     print(f"SUMMARY: {args.model}")
     print(f"{'='*60}")
     for key, result in all_results.items():
         print(f"  {result['benchmark']}: {result['accuracy']:.1f}% ({result['correct']}/{result['total']})")
-
-    # Save results
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        model_name = Path(args.model).name
-        output_path = os.path.join(args.output_dir, f"eval_{model_name}.json")
-
-        save_data = {
-            "model": args.model,
-            "results": {k: {kk: vv for kk, vv in v.items() if kk != "results"}
-                        for k, v in all_results.items()},
-            "detailed_results": {k: v["results"] for k, v in all_results.items()},
-        }
-        with open(output_path, "w") as f:
-            json.dump(save_data, f, indent=2)
-        print(f"\nResults saved to {output_path}")
 
 
 if __name__ == "__main__":
