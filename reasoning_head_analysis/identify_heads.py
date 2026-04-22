@@ -46,29 +46,23 @@ logger = logging.getLogger(__name__)
 # Prompt construction (Thinking Sparks A.2)
 # ═══════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = (
-    "You are a helpful AI Assistant that provides well-reasoned and detailed responses. "
-    "You first think about the reasoning process as an internal monologue and then provide "
-    "the user with the answer. Respond in the following format:\n"
-    "<think>\\n...\\n</think>\\n<answer>\\n...\\n</answer>"
-)
+# System prompt matches Qwen2.5-Math's tokenizer-default chat template — this
+# is the distribution the base and GRPO checkpoints were trained on.
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
-REASONING_PREFIXES = [
-    "<think>\nOkay, so I have this problem",
-    "<think>\nAlright, let me think about this",
-    "<think>\nOkay, so I need to find",
-    "<think>\nLet me work through this step by step",
-    "<think>\nHmm, let me think about this carefully",
-    "<think>\nOkay, let me break this down",
-]
-
-DIRECT_PREFIXES = [
-    "To solve this problem, we need to",
-    "The answer can be found by",
-    "We can solve this by computing",
-    "Let me calculate this directly. First",
-    "Using the given information, we",
-    "To determine the answer, first",
+# Length-matched (clean, corrupted) assistant-prefix pairs. The clean prefix
+# steers the model into CoT mode; the corrupted prefix steers it into
+# direct-answer mode. Chosen empirically via the prefix-steering diagnostic
+# (reasoning_head_analysis/test_reasoning_prefix.py): all three pairs produce
+# 8–17 nats of KL divergence at the prefix boundary on both base and
+# GRPO-trained Qwen2.5-Math-1.5B.
+PREFIX_PAIRS = [
+    # 6 tokens — strongest signal (~17 nats)
+    ("To solve this problem, we",        "The answer is \\boxed{"),
+    # 7 tokens
+    ("Let's think step by step.",        "The final answer is \\boxed{"),
+    # 8 tokens
+    ("Let me solve this step by step.",  "The answer to this is \\boxed{"),
 ]
 
 
@@ -127,39 +121,45 @@ def make_chat_prompt(question):
 
 
 def find_matched_prefixes(model):
-    """Find prefix pairs that tokenize to the same length (required by EAP-IG)."""
+    """Return the curated (clean, corrupted) prefix pairs, verifying equal
+    token length under this model's tokenizer."""
     matched = []
-    for r in REASONING_PREFIXES:
-        rl = model.to_tokens(r).shape[1]
-        for d in DIRECT_PREFIXES:
-            dl = model.to_tokens(d).shape[1]
-            if rl == dl:
-                matched.append((r, d))
-            elif abs(rl - dl) <= 5:
-                short, long_len = (r, dl) if rl < dl else (d, rl)
-                padded = short
-                for _ in range(20):
-                    padded += "."
-                    if model.to_tokens(padded).shape[1] == long_len:
-                        if rl < dl:
-                            matched.append((padded, d))
-                        else:
-                            matched.append((r, padded))
-                        break
+    for clean, corrupt in PREFIX_PAIRS:
+        cl = model.to_tokens(clean, prepend_bos=False).shape[1]
+        dl = model.to_tokens(corrupt, prepend_bos=False).shape[1]
+        if cl == dl:
+            matched.append((clean, corrupt))
+        else:
+            logger.warning(
+                f"Dropping length-mismatched pair ({cl} vs {dl} tokens): "
+                f"{clean!r} / {corrupt!r}"
+            )
     return matched
 
 
-def build_pairs(model, n_pairs=300):
-    """Build clean/corrupted prompt pairs from GSM8K questions."""
+def build_pairs(model, n_pairs=300, dataset="aime"):
+    """Build clean/corrupted prompt pairs from math questions.
+
+    Args:
+        dataset: "aime" (AI-MO/aimo-validation-aime, as in Thinking Sparks)
+                 or "gsm8k" (openai/gsm8k)
+    """
     matched = find_matched_prefixes(model)
     assert matched, "No matched-length prefix pairs found!"
     logger.info(f"Found {len(matched)} matched prefix pairs")
 
-    logger.info("Loading GSM8K...")
-    ds = load_dataset("openai/gsm8k", "main", split="train")
-    indices = list(range(len(ds)))
-    random.shuffle(indices)
-    questions = [ds[i]["question"] for i in indices[:500]]
+    if dataset == "aime":
+        logger.info("Loading AIME (AI-MO/aimo-validation-aime)...")
+        ds = load_dataset("AI-MO/aimo-validation-aime", split="train")
+        questions = [ds[i]["problem"] for i in range(len(ds))]
+    else:
+        logger.info("Loading GSM8K...")
+        ds = load_dataset("openai/gsm8k", "main", split="train")
+        indices = list(range(len(ds)))
+        random.shuffle(indices)
+        questions = [ds[i]["question"] for i in indices[:500]]
+
+    logger.info(f"Loaded {len(questions)} questions")
 
     pairs = []
     for q in questions:
@@ -306,6 +306,11 @@ def main():
     parser.add_argument("--n_pairs", type=int, default=300, help="Number of prompt pairs")
     parser.add_argument("--ig_steps", type=int, default=100, help="Integrated gradients steps")
     parser.add_argument("--top_n", type=int, default=5000, help="Top-n edges to keep")
+    parser.add_argument("--threshold", type=float, default=0.1,
+                        help="Edge-score threshold tau for circuit simplification "
+                             "(Thinking Sparks A.2). Applied after top-n, with isolated-node pruning.")
+    parser.add_argument("--dataset", type=str, default="aime", choices=["aime", "gsm8k"],
+                        help="Dataset for prompt pairs: 'aime' (default, as in paper) or 'gsm8k'")
     parser.add_argument("--device", type=str, default=None,
                         help="Force device: 'cpu' or 'cuda' (default: auto-detect)")
     parser.add_argument("--output_dir", type=str, default=None,
@@ -341,7 +346,7 @@ def main():
     logger.info("Building prompt pairs...")
     t_build = time.time()
     model = load_hooked_model(args.model, device="cpu", dtype=torch.float32)
-    all_pairs = build_pairs(model, n_pairs=args.n_pairs)
+    all_pairs = build_pairs(model, n_pairs=args.n_pairs, dataset=args.dataset)
     del model
     logger.info(f"Pairs built in {time.time() - t_build:.1f}s")
 
@@ -392,23 +397,37 @@ def main():
         score = flat[idx].item()
         logger.info(f"  #{rank+1}: L{l}H{h} = {score:.4f}")
 
-    # Save
+    # Save full top-n circuit first (scores for all edges preserved, so threshold
+    # can be re-applied offline from circuit.json).
+    graph.to_json(os.path.join(output_dir, "circuit.json"))
+
+    # Paper pipeline (Thinking Sparks A.2): simplify with threshold tau and prune
+    # isolated nodes. This gives the set of "emergent" attention heads.
+    logger.info(f"Applying threshold tau={args.threshold} with isolated-node pruning...")
+    graph.apply_threshold(args.threshold, absolute=True, reset=True,
+                          level="edge", prune=True)
+    active_heads = sorted(
+        (l, h) for l in range(n_layers) for h in range(n_heads)
+        if graph.nodes[f"a{l}.h{h}"].in_graph
+    )
+    logger.info(f"Active heads after threshold+prune: {len(active_heads)}")
+
     importance_path = os.path.join(output_dir, "head_importance.pt")
     torch.save({
         "head_scores": head_scores,
+        "active_heads": active_heads,
         "config": {
             "model": args.model,
             "method": "EAP-IG-inputs",
             "ig_steps": args.ig_steps,
             "top_n": args.top_n,
+            "threshold": args.threshold,
             "n_pairs": len(all_pairs),
             "device": device_str,
             "elapsed_minutes": elapsed / 60,
         },
     }, importance_path)
     logger.info(f"Saved head importance to {importance_path}")
-
-    graph.to_json(os.path.join(output_dir, "circuit.json"))
 
     # Heatmap
     plot_heatmap(head_scores, os.path.join(output_dir, "head_importance_heatmap.png"))

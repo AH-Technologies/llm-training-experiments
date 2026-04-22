@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Ablation study: validate reasoning heads by measuring accuracy impact.
+"""Head scaling study: validate reasoning heads by adjusting their output.
 
-Loads head importance from identify_heads.py, then runs three experiments:
-1. Baseline accuracy (no ablation)
-2. Top-10 reasoning heads ablated
-3. 10 random heads ablated (3 seeds)
-4. Incremental top-k ablation curve until accuracy hits 0
+Loads head importance from identify_heads.py, then runs experiments that
+multiply the output of identified heads by various scale factors (0 = ablate,
+0.5 = dampen, 2.0 = amplify, ...) and measures MATH-500 accuracy.
+
+Experiments:
+1. Baseline accuracy (scale=1, unmodified).
+2. Scale sweep: top-k reasoning heads and random-k control at each scale.
+3. Incremental top-k ablation curve at scale=0 (how many heads to kill
+   accuracy).
+4. Random-k control curve at scale=0.
 
 Produces:
-- ablation_barplot.png   — bar chart comparing baseline / top-10 / random-10
-- ablation_curve.png     — accuracy vs number of heads ablated (top-k vs random)
+- scale_sweep.png        — accuracy vs scale, top-k vs random-k
+- ablation_barplot.png   — bar chart at scale=0 (baseline / top-k / random-k)
+- ablation_curve.png     — accuracy vs k heads ablated (scale=0)
 - ablation_results.json  — all numerical results
-
-Requires: transformers, datasets, pandas
 
 Usage:
   python -m reasoning_head_analysis.ablate_heads \
-      --importance_path reasoning_head_analysis/results/Qwen_Qwen2.5-1.5B-Instruct/head_importance.pt \
-      --model Qwen/Qwen2.5-1.5B-Instruct
+      --importance_path .../head_importance.pt \
+      --model Qwen/Qwen2.5-Math-1.5B \
+      --scales "0.0,0.5,2.0,4.0" \
+      --top_k 10
 """
 import argparse
 import json
@@ -91,9 +97,11 @@ def format_prompts(tokenizer, problems):
 # Ablation hooks
 # ═══════════════════════════════════════════════════════════════════════
 
-def register_ablation_hooks(model, heads_to_ablate):
-    """Zero out the output of specified attention heads via o_proj pre-hooks."""
-    if not heads_to_ablate:
+def register_scaling_hooks(model, heads, scale=0.0):
+    """Multiply the output of specified attention heads by `scale` via o_proj
+    pre-hooks. scale=0 → ablation, scale=1 → no-op, scale>1 → amplification,
+    0<scale<1 → dampening."""
+    if not heads or scale == 1.0:
         return []
 
     n_heads = model.config.num_attention_heads
@@ -102,25 +110,33 @@ def register_ablation_hooks(model, heads_to_ablate):
     )
 
     layer_heads = {}
-    for layer, head in heads_to_ablate:
+    for layer, head in heads:
         layer_heads.setdefault(layer, []).append(head)
 
     handles = []
     for layer_idx, head_indices in layer_heads.items():
-        def make_hook(h_indices):
+        def make_hook(h_indices, s):
             def hook_fn(module, args):
                 inp = args[0]
                 inp = inp.view(inp.shape[0], inp.shape[1], n_heads, head_dim)
                 for h in h_indices:
-                    inp[:, :, h, :] = 0.0
+                    if s == 0.0:
+                        inp[:, :, h, :] = 0.0
+                    else:
+                        inp[:, :, h, :] = inp[:, :, h, :] * s
                 return (inp.view(inp.shape[0], inp.shape[1], -1),) + args[1:]
             return hook_fn
 
         o_proj = model.model.layers[layer_idx].self_attn.o_proj
-        handle = o_proj.register_forward_pre_hook(make_hook(head_indices))
+        handle = o_proj.register_forward_pre_hook(make_hook(head_indices, scale))
         handles.append(handle)
 
     return handles
+
+
+# Back-compat alias: old name zeroes heads.
+def register_ablation_hooks(model, heads_to_ablate):
+    return register_scaling_hooks(model, heads_to_ablate, scale=0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -171,48 +187,95 @@ def generate_and_score(model, tokenizer, prompts, ground_truths,
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_bar_chart(model, tokenizer, prompts, ground_truths, ranked_heads, all_heads,
-                  max_new_tokens=2048, batch_size=4):
-    """Baseline vs top-10 reasoning heads vs 3x random-10."""
+                  max_new_tokens=2048, batch_size=4, top_k=10):
+    """Baseline vs top-K reasoning heads vs 3x random-K (all at scale=0)."""
     results = {}
 
-    # Baseline
     logger.info("=== Baseline (no ablation) ===")
     acc, c, t = generate_and_score(model, tokenizer, prompts, ground_truths,
                                     max_new_tokens=max_new_tokens, batch_size=batch_size)
     results["baseline"] = acc
     logger.info(f"Baseline: {acc:.1f}% ({c}/{t})")
 
-    # Top-10 reasoning heads
-    logger.info("=== Top-10 reasoning heads ablated ===")
-    heads = ranked_heads[:10]
+    logger.info(f"=== Top-{top_k} reasoning heads ablated ===")
+    heads = ranked_heads[:top_k]
     logger.info(f"Ablating: {heads}")
-    handles = register_ablation_hooks(model, heads)
+    handles = register_scaling_hooks(model, heads, scale=0.0)
     acc, c, t = generate_and_score(model, tokenizer, prompts, ground_truths,
                                     max_new_tokens=max_new_tokens, batch_size=batch_size)
     for h in handles:
         h.remove()
-    results["top10"] = acc
-    logger.info(f"Top-10 ablated: {acc:.1f}% ({c}/{t})")
+    results["top_ablated"] = acc
+    logger.info(f"Top-{top_k} ablated: {acc:.1f}% ({c}/{t})")
 
-    # 3x random-10
     random_accs = []
     for seed in [42, 123, 456]:
         rng = random.Random(seed)
-        random_heads = rng.sample(all_heads, 10)
-        logger.info(f"=== Random-10 (seed={seed}) ===")
-        logger.info(f"Ablating: {random_heads}")
-        handles = register_ablation_hooks(model, random_heads)
+        random_heads = rng.sample(all_heads, top_k)
+        logger.info(f"=== Random-{top_k} (seed={seed}) ===")
+        handles = register_scaling_hooks(model, random_heads, scale=0.0)
         acc, c, t = generate_and_score(model, tokenizer, prompts, ground_truths,
                                         max_new_tokens=max_new_tokens, batch_size=batch_size)
         for h in handles:
             h.remove()
         random_accs.append(acc)
-        logger.info(f"Random-10 seed={seed}: {acc:.1f}% ({c}/{t})")
+        logger.info(f"Random-{top_k} seed={seed}: {acc:.1f}% ({c}/{t})")
 
-    results["random10_seeds"] = random_accs
-    results["random10_mean"] = float(np.mean(random_accs))
-    results["random10_std"] = float(np.std(random_accs))
+    results["random_seeds"] = random_accs
+    results["random_mean"] = float(np.mean(random_accs))
+    results["random_std"] = float(np.std(random_accs))
+    results["top_k"] = top_k
     return results
+
+
+def run_scale_sweep(model, tokenizer, prompts, ground_truths,
+                    ranked_heads, all_heads, scales, top_k,
+                    max_new_tokens=2048, batch_size=4,
+                    baseline_acc=None, random_seeds=(42, 123, 456)):
+    """For each scale in `scales`, measure accuracy with top-k heads scaled
+    vs random-k heads scaled (averaged over seeds). scale=1 is the baseline
+    (we reuse baseline_acc if provided to avoid an extra pass)."""
+    heads_top = ranked_heads[:top_k]
+    per_scale = {}
+
+    for scale in scales:
+        logger.info(f"=== Scale sweep: scale={scale} ===")
+
+        if scale == 1.0 and baseline_acc is not None:
+            top_acc = baseline_acc
+        else:
+            logger.info(f"  top-{top_k} @ scale={scale}: {heads_top}")
+            handles = register_scaling_hooks(model, heads_top, scale=scale)
+            top_acc, c, t = generate_and_score(
+                model, tokenizer, prompts, ground_truths,
+                max_new_tokens=max_new_tokens, batch_size=batch_size,
+            )
+            for h in handles:
+                h.remove()
+            logger.info(f"  top-{top_k} @ scale={scale}: {top_acc:.1f}% ({c}/{t})")
+
+        rand_accs = []
+        for seed in random_seeds:
+            rng = random.Random(seed)
+            rand_heads = rng.sample(all_heads, top_k)
+            handles = register_scaling_hooks(model, rand_heads, scale=scale)
+            ra, _, _ = generate_and_score(
+                model, tokenizer, prompts, ground_truths,
+                max_new_tokens=max_new_tokens, batch_size=batch_size,
+            )
+            for h in handles:
+                h.remove()
+            rand_accs.append(ra)
+            logger.info(f"  random-{top_k} seed={seed} @ scale={scale}: {ra:.1f}%")
+
+        per_scale[scale] = {
+            "top_k_acc": top_acc,
+            "random_seeds": rand_accs,
+            "random_mean": float(np.mean(rand_accs)),
+            "random_std": float(np.std(rand_accs)),
+        }
+
+    return per_scale
 
 
 def run_topk_curve(model, tokenizer, prompts, ground_truths, ranked_heads,
@@ -270,12 +333,13 @@ def run_random_curve(model, tokenizer, prompts, ground_truths, all_heads,
 def plot_bar_chart(bar_results, output_path):
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    labels = ["Baseline\n(no ablation)", "Top-10\nreasoning heads"]
-    values = [bar_results["baseline"], bar_results["top10"]]
+    k = bar_results.get("top_k", 10)
+    labels = ["Baseline\n(no ablation)", f"Top-{k}\nreasoning heads"]
+    values = [bar_results["baseline"], bar_results["top_ablated"]]
     colors = ["tab:green", "tab:red"]
 
-    for seed, acc in zip([42, 123, 456], bar_results["random10_seeds"]):
-        labels.append(f"Random-10\n(seed {seed})")
+    for seed, acc in zip([42, 123, 456], bar_results["random_seeds"]):
+        labels.append(f"Random-{k}\n(seed {seed})")
         values.append(acc)
         colors.append("tab:blue")
 
@@ -292,6 +356,39 @@ def plot_bar_chart(bar_results, output_path):
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     logger.info(f"Saved bar chart to {output_path}")
+
+
+def plot_scale_sweep(per_scale, baseline_acc, top_k, output_path):
+    """Accuracy vs scale factor. Top-k reasoning heads (line) vs random-k
+    control (line with std band). Dashed horizontal: baseline."""
+    scales = sorted(per_scale.keys())
+    top_accs = [per_scale[s]["top_k_acc"] for s in scales]
+    rand_means = [per_scale[s]["random_mean"] for s in scales]
+    rand_stds = [per_scale[s]["random_std"] for s in scales]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.axhline(baseline_acc, ls="--", color="tab:green", alpha=0.7,
+               label=f"Baseline ({baseline_acc:.1f}%)")
+    ax.plot(scales, top_accs, "o-", color="tab:red", linewidth=2, markersize=8,
+            label=f"Top-{top_k} reasoning heads scaled")
+    ax.plot(scales, rand_means, "s--", color="tab:blue", linewidth=2, markersize=7,
+            label=f"Random-{top_k} heads scaled (mean of 3 seeds)")
+    ax.fill_between(scales,
+                    np.array(rand_means) - np.array(rand_stds),
+                    np.array(rand_means) + np.array(rand_stds),
+                    alpha=0.15, color="tab:blue")
+
+    ax.set_xlabel("Scale factor applied to head output", fontsize=13)
+    ax.set_ylabel("MATH-500 accuracy (%)", fontsize=13)
+    ax.set_title(f"Head Activation Scaling: top-{top_k} reasoning heads vs random",
+                 fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=-2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved scale sweep to {output_path}")
 
 
 def plot_ablation_curve(topk_results, random_results, output_path):
@@ -341,7 +438,25 @@ def main():
     parser.add_argument("--num_problems", type=int, default=50)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--top_k", type=int, default=10,
+                        help="How many top reasoning heads to scale/ablate")
+    parser.add_argument("--use_active_heads", action="store_true",
+                        help="Restrict ablation candidates to the 'active_heads' set "
+                             "(paper's threshold+prune circuit) saved in the .pt file. "
+                             "Within that set, rank by head_score and take top_k.")
+    parser.add_argument("--exclude_layer0", action="store_true",
+                        help="Exclude layer-0 heads from the candidate set "
+                             "(usually dominated by trivial input-projection heads).")
+    parser.add_argument("--heads", type=str, default=None,
+                        help="Explicit head list as 'L.H,L.H,...' (e.g. '11.8,15.7,19.6'). "
+                             "Overrides score ranking and filters; uses these heads in order. "
+                             "Useful for cross-model studies where you want to apply the heads "
+                             "found in one checkpoint to a different model.")
+    parser.add_argument("--scales", type=str, default="0.0,0.25,0.5,1.5,2.0,4.0",
+                        help="Comma-separated scale factors for the sweep")
     args = parser.parse_args()
+    import re as _re_scales
+    scales = [float(s) for s in _re_scales.split(r"[,|;\s]+", args.scales.strip()) if s]
 
     safe_model = args.model.replace("/", "_")
     output_dir = args.output_dir or os.path.join("reasoning_head_analysis", "results", safe_model, "ablation")
@@ -360,7 +475,33 @@ def main():
     ranked_heads = [(idx.item() // n_heads, idx.item() % n_heads) for idx in sorted_indices]
     all_heads = ranked_heads.copy()
 
-    logger.info(f"Top-10 reasoning heads: {ranked_heads[:10]}")
+    if args.heads:
+        # Explicit head list overrides everything else.
+        # Accept ',' '|' ';' or whitespace as separators — sbatch --export
+        # consumes plain commas as variable separators so use '|' over SLURM.
+        import re as _re
+        parsed = []
+        for token in _re.split(r"[,|;\s]+", args.heads.strip()):
+            if not token:
+                continue
+            l, h = token.split(".")
+            parsed.append((int(l), int(h)))
+        ranked_heads = parsed
+        logger.info(f"Using explicit heads ({len(ranked_heads)}): {ranked_heads}")
+    elif args.use_active_heads:
+        active = data.get("active_heads") if isinstance(data, dict) else None
+        if not active:
+            raise ValueError("--use_active_heads set but no 'active_heads' key in .pt file. "
+                             "Re-run identify_heads.py to produce one.")
+        active_set = {tuple(h) for h in active}
+        ranked_heads = [h for h in ranked_heads if h in active_set]
+        logger.info(f"Filtered to {len(ranked_heads)} active (circuit) heads")
+
+    if args.exclude_layer0 and not args.heads:
+        ranked_heads = [(l, h) for (l, h) in ranked_heads if l != 0]
+        logger.info(f"Excluded layer-0 heads; {len(ranked_heads)} candidates remain")
+
+    logger.info(f"Top-10 candidates: {ranked_heads[:10]}")
 
     # Load model + data
     logger.info(f"Loading model: {args.model}")
@@ -382,28 +523,40 @@ def main():
 
     t0 = time.time()
 
-    # Experiment 1: Bar chart (baseline vs top-10 vs 3x random-10)
+    # Experiment 1: Bar chart at scale=0 (baseline vs top-k vs 3x random-k)
     logger.info("=" * 60)
-    logger.info("EXPERIMENT 1: Bar chart comparison")
+    logger.info(f"EXPERIMENT 1: Bar chart (top-{args.top_k} ablated, scale=0)")
     logger.info("=" * 60)
     bar_results = run_bar_chart(
         model, tokenizer, prompts, ground_truths, ranked_heads, all_heads,
+        top_k=args.top_k,
         max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
     )
 
-    # Experiment 2: Incremental top-k ablation curve
+    # Experiment 2: Scale sweep (top-k and random-k at each scale)
     logger.info("=" * 60)
-    logger.info("EXPERIMENT 2: Incremental top-k ablation curve")
+    logger.info(f"EXPERIMENT 2: Scale sweep — scales={scales}, top-{args.top_k} vs random")
+    logger.info("=" * 60)
+    scale_results = run_scale_sweep(
+        model, tokenizer, prompts, ground_truths, ranked_heads, all_heads,
+        scales=scales, top_k=args.top_k,
+        max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
+        baseline_acc=bar_results["baseline"],
+    )
+
+    # Experiment 3: Incremental top-k ablation curve (scale=0 only)
+    logger.info("=" * 60)
+    logger.info("EXPERIMENT 3: Incremental top-k ablation curve (scale=0)")
     logger.info("=" * 60)
     topk_results = run_topk_curve(
         model, tokenizer, prompts, ground_truths, ranked_heads,
         max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
     )
 
-    # Experiment 3: Random-k control curve (same k range as top-k)
+    # Experiment 4: Random-k control curve (scale=0, same k range)
     max_k_reached = max(topk_results.keys())
     logger.info("=" * 60)
-    logger.info(f"EXPERIMENT 3: Random-k control curve (k=0..{max_k_reached}, 3 seeds)")
+    logger.info(f"EXPERIMENT 4: Random-k control curve (k=0..{max_k_reached}, 3 seeds)")
     logger.info("=" * 60)
     random_results = run_random_curve(
         model, tokenizer, prompts, ground_truths, all_heads,
@@ -416,12 +569,15 @@ def main():
     # Save results
     all_results = {
         "bar_chart": bar_results,
+        "scale_sweep": {str(s): v for s, v in scale_results.items()},
         "topk_curve": {str(k): v for k, v in topk_results.items()},
         "random_curve": {str(k): v for k, v in random_results.items()},
         "config": {
             "model": args.model,
             "importance_path": args.importance_path,
             "num_problems": args.num_problems,
+            "top_k": args.top_k,
+            "scales": scales,
             "elapsed_minutes": elapsed / 60,
         },
     }
@@ -432,6 +588,8 @@ def main():
 
     # Plots
     plot_bar_chart(bar_results, os.path.join(output_dir, "ablation_barplot.png"))
+    plot_scale_sweep(scale_results, bar_results["baseline"], args.top_k,
+                     os.path.join(output_dir, "scale_sweep.png"))
     plot_ablation_curve(topk_results, random_results, os.path.join(output_dir, "ablation_curve.png"))
 
     logger.info("Done.")

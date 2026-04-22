@@ -37,33 +37,72 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
+try:
+    from eap.graph import Graph
+except ImportError:
+    Graph = None
 
-def load_active_heads(importance_path, top_k=20):
-    """Load head importance and return the set of active (layer, head) tuples."""
+
+def _head_scores_from_pt(importance_path):
+    """Return (head_scores tensor, n_layers, n_heads) from a head_importance.pt."""
     data = torch.load(importance_path, map_location="cpu", weights_only=True)
     head_scores = data["head_scores"] if isinstance(data, dict) else data
     n_layers, n_heads = head_scores.shape
+    return head_scores, n_layers, n_heads
 
+
+def load_active_heads_top_k(importance_path, top_k=20):
+    """Legacy mode: take the top-k heads ranked by aggregated edge importance."""
+    head_scores, n_layers, n_heads = _head_scores_from_pt(importance_path)
     flat = head_scores.flatten()
     sorted_idx = flat.argsort(descending=True)
     active = set()
     for idx in sorted_idx[:top_k]:
         l, h = idx.item() // n_heads, idx.item() % n_heads
         active.add((l, h))
+    return active, head_scores, n_layers, n_heads
+
+
+def load_active_heads_from_circuit(circuit_path, threshold=0.1,
+                                   importance_path=None):
+    """Paper-style (Thinking Sparks A.2): apply edge-score threshold tau to the
+    saved circuit, prune isolated nodes, and take the surviving attention-head
+    nodes as the active set. Head-importance scores (for the companion heatmap)
+    are loaded from importance_path if provided."""
+    if Graph is None:
+        raise ImportError("eap package required for circuit-based selection")
+    g = Graph.from_json(circuit_path)
+    g.apply_threshold(threshold, absolute=True, reset=True,
+                      level="edge", prune=True)
+    n_layers, n_heads = g.cfg.n_layers, g.cfg.n_heads
+    active = {
+        (l, h) for l in range(n_layers) for h in range(n_heads)
+        if g.nodes[f"a{l}.h{h}"].in_graph
+    }
+
+    if importance_path and os.path.exists(importance_path):
+        head_scores, _, _ = _head_scores_from_pt(importance_path)
+    else:
+        head_scores = torch.zeros(n_layers, n_heads)
 
     return active, head_scores, n_layers, n_heads
 
 
-def auto_discover_checkpoints(results_dir):
-    """Find head_importance.pt files with step numbers in their path."""
+def auto_discover_checkpoints(results_dir, filename="head_importance.pt",
+                              path_filter=None):
+    """Find result files with step numbers in their path. If path_filter is
+    given, only paths whose full path contains that substring are kept (use
+    this to scope discovery to a single training run)."""
     checkpoints = {}
     for root, dirs, files in os.walk(results_dir):
-        if "head_importance.pt" in files:
-            # Look for step number in path
-            match = re.search(r"(?:global_)?step_?(\d+)", root)
-            if match:
-                step = int(match.group(1))
-                checkpoints[step] = os.path.join(root, "head_importance.pt")
+        if filename not in files:
+            continue
+        if path_filter and path_filter not in root:
+            continue
+        match = re.search(r"(?:global_)?step_?(\d+)", root)
+        if match:
+            step = int(match.group(1))
+            checkpoints[step] = os.path.join(root, filename)
     return checkpoints
 
 
@@ -289,41 +328,63 @@ def main():
     parser = argparse.ArgumentParser(
         description="Plot reasoning head evolution across training checkpoints")
     parser.add_argument("--base", type=str, required=True,
-                        help="Path to head_importance.pt for the base model")
+                        help="Path to base-model result: circuit.json (default) "
+                             "or head_importance.pt if --selection=top_k")
     parser.add_argument("--checkpoints", type=str, nargs="*", default=[],
-                        help="step:path pairs, e.g. 100:results/step100/head_importance.pt")
+                        help="step:path pairs, e.g. 100:results/step100/circuit.json")
     parser.add_argument("--results_dir", type=str, default=None,
                         help="Auto-discover checkpoints from this directory")
+    parser.add_argument("--filter", type=str, default=None,
+                        help="If set with --results_dir, only checkpoint paths "
+                             "containing this substring are kept. Use to scope "
+                             "discovery to a single training run.")
+    parser.add_argument("--selection", type=str, default="circuit",
+                        choices=["circuit", "top_k"],
+                        help="Head selection method. 'circuit' (default) applies "
+                             "the paper's threshold+prune pipeline from circuit.json. "
+                             "'top_k' is the legacy fixed-K ranking from head_importance.pt.")
+    parser.add_argument("--threshold", type=float, default=0.1,
+                        help="Edge-score threshold tau (circuit mode only, default 0.1)")
     parser.add_argument("--top_k", type=int, default=20,
-                        help="Number of top heads to consider 'active' (default: 20)")
+                        help="Number of top heads when --selection=top_k (default 20)")
     parser.add_argument("--output_dir", type=str, default="reasoning_head_analysis/results/evolution")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load base model
+    use_circuit = args.selection == "circuit"
+    discover_fname = "circuit.json" if use_circuit else "head_importance.pt"
+
+    def load_one(path):
+        if use_circuit:
+            importance = os.path.join(os.path.dirname(path), "head_importance.pt")
+            return load_active_heads_from_circuit(
+                path, threshold=args.threshold, importance_path=importance)
+        return load_active_heads_top_k(path, top_k=args.top_k)
+
+    label = (f"circuit (tau={args.threshold})" if use_circuit
+             else f"top-{args.top_k}")
+    print(f"Head selection: {label}")
     print(f"Loading base model heads from {args.base}")
-    base_heads, base_scores, n_layers, n_heads = load_active_heads(args.base, top_k=args.top_k)
+    base_heads, base_scores, n_layers, n_heads = load_one(args.base)
     print(f"  Architecture: {n_layers} layers x {n_heads} heads")
-    print(f"  Active heads (top {args.top_k}): {sorted(base_heads)}")
+    print(f"  Base active heads ({len(base_heads)}): {sorted(base_heads)}")
 
-    # Load checkpoints
     ckpt_paths = {}
-
-    # From --checkpoints args
     for spec in args.checkpoints:
         step_str, path = spec.split(":", 1)
         ckpt_paths[int(step_str)] = path
 
-    # From --results_dir auto-discovery
     if args.results_dir:
-        discovered = auto_discover_checkpoints(args.results_dir)
+        discovered = auto_discover_checkpoints(
+            args.results_dir, filename=discover_fname, path_filter=args.filter)
         for step, path in discovered.items():
             if step not in ckpt_paths:
                 ckpt_paths[step] = path
 
     if not ckpt_paths:
-        print("ERROR: No checkpoints found. Use --checkpoints or --results_dir")
+        print(f"ERROR: No checkpoints with {discover_fname} found. "
+              "Use --checkpoints or --results_dir.")
         return
 
     print(f"\nLoading {len(ckpt_paths)} checkpoints:")
@@ -331,11 +392,12 @@ def main():
     for step in sorted(ckpt_paths.keys()):
         path = ckpt_paths[step]
         print(f"  Step {step}: {path}")
-        active, scores, _, _ = load_active_heads(path, top_k=args.top_k)
+        active, scores, _, _ = load_one(path)
         new = active - base_heads
         lost = base_heads - active
         retained = active & base_heads
-        print(f"    Active: {len(active)}, New: {len(new)}, Retained: {len(retained)}, Lost base: {len(lost)}")
+        print(f"    Active: {len(active)}, New: {len(new)}, "
+              f"Retained: {len(retained)}, Lost base: {len(lost)}")
         checkpoint_data[step] = {"active": active, "scores": scores}
 
     # Get final checkpoint data
@@ -367,12 +429,17 @@ def main():
         "lost_from_base": sorted(list(base_heads - final_heads)),
         "retained": sorted(list(base_heads & final_heads)),
         "steps": sorted(list(checkpoint_data.keys())),
-        "top_k": args.top_k,
+        "selection": {
+            "mode": args.selection,
+            "threshold": args.threshold if use_circuit else None,
+            "top_k": args.top_k if not use_circuit else None,
+        },
         "per_step": {
             str(step): {
                 "n_active": len(d["active"]),
                 "n_new": len(d["active"] - base_heads),
                 "n_retained": len(d["active"] & base_heads),
+                "active_heads": sorted(list(d["active"])),
                 "new_heads": sorted(list(d["active"] - base_heads)),
             }
             for step, d in checkpoint_data.items()

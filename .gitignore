@@ -81,3 +81,7 @@ benchmarks/results/
 # One shot metrics results
 one_shot_metrics/entropy_profiling/results/
 one_shot_metrics/results/
+
+reasoning_head_analysis/results/
+reasoning_head_analysis/results_old/
+papers/

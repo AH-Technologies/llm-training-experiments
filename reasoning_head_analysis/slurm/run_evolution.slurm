@@ -2,7 +2,7 @@
 #SBATCH --job-name=head-evolution
 #SBATCH --account=share-ie-idi
 #SBATCH --partition=GPUQ
-#SBATCH --gpus-per-node=2
+#SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
@@ -173,11 +173,14 @@ echo "Plotting head evolution"
 echo "==========================================="
 
 EVOLUTION_DIR="${RESULTS_BASE}/evolution_${SAFE_REPO}"
+BASE_CIRCUIT="${RESULTS_BASE}/${SAFE_BASE}/circuit.json"
 
 python -m reasoning_head_analysis.plot_head_evolution \
-    --base "$BASE_IMPORTANCE" \
+    --base "$BASE_CIRCUIT" \
     --results_dir "$RESULTS_BASE" \
-    --top_k "$TOP_K" \
+    --filter "$SAFE_REPO" \
+    --selection circuit \
+    --threshold 0.1 \
     --output_dir "$EVOLUTION_DIR"
 
 echo ""
