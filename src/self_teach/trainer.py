@@ -1,24 +1,23 @@
-"""Self-Teach 2-phase trainer and task runner.
+"""Self-Teach tree-structured trainer and task runner.
 
-Implements a 2-phase generation strategy where branching happens at the right
-point for each role:
+Implements a tree-structured generation strategy:
 
-Phase 1 (Teacher training):
-  - Generate A₁ once per prompt (single-turn)
-  - Branch: Generate n different F samples per prompt (all see same A₁)
-  - Generate A₂ per F for teacher grading
-  - Teacher reward = f(A₁ correctness, A₂ correctness)
+  Q → A₁ → (F₁ ... Fₖ) → each Fᵢ → (A₂ᵢ₁ ... A₂ᵢₘ)
 
-Phase 2 (Student₂ training):
-  - Select one F per prompt (from phase 1)
-  - Branch: Generate n different A₂ samples (all see same A₁ + F)
-  - Student₂ reward = f(A₁ correctness, A₂ correctness)
+Step 1: Generate A₁ once per prompt.
+Step 2: Branch k teacher feedbacks per prompt (all see same A₁).
+Step 3: Branch m student A₂ responses per feedback (all see same A₁ + Fᵢ).
 
-This fixes the credit assignment problem where student₂ was blamed/credited
-for the teacher's quality, since all n copies now share the same context.
+The m A₂ responses serve dual purpose:
+  - Grade teacher quality: mean improvement rate across m A₂s → teacher reward.
+  - Train student₂: GRPO groups of m sharing the same (Q, A₁, Fᵢ) context.
+
+Every generation contributes to training — no wasted compute.
 
 Based on verl v0.2+ RayPPOTrainer with AgentLoop-based generation.
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -27,7 +26,6 @@ import socket
 import uuid
 from dataclasses import dataclass
 from pprint import pprint
-from typing import Optional
 
 import numpy as np
 import torch
@@ -53,7 +51,13 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 from src.rlvr_grokking.rewards.deepscaler_reward import compute_score as grade_solution
-from .prompts import TEACHER_PROMPT_TEMPLATE
+from .prompts import (
+    TEACHER_PROMPT_TEMPLATE,
+    TEACHER_PROMPT_TEMPLATE_FILTERED,
+    BLIND_TEACHER_PROMPT_TEMPLATE,
+    BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED,
+    STUDENT2_PROMPT_TEMPLATE,
+)
 from .rewards import compute_self_teach_rewards
 
 
@@ -62,60 +66,118 @@ def strip_think_blocks(text: str) -> str:
     return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
 
 
+def extract_feedback(text: str) -> str:
+    """Extract content inside <feedback>...</feedback> tags.
+
+    Returns just the feedback portion so the student only sees the
+    teacher's final guidance, not the internal reasoning. Falls back
+    to the full text if tags are missing.
+    """
+    match = re.search(r"<feedback>(.*?)</feedback>", text, re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
 @dataclass
 class SelfTeachConfig:
     """Configuration for self-teach training."""
 
     enabled: bool = False
+    blind_teacher: bool = False  # Teacher gets no ground truth (self-improvement variant)
+    filter_a1_correct: bool | None = None  # Skip A₁-correct prompts; None = auto (True if blind_teacher)
+    num_feedbacks: int = 6  # k: number of teacher feedbacks per prompt
+    num_a2_per_feedback: int = 6  # m: number of A₂ responses per feedback
+    train_teacher_only: bool = False  # Only train on teacher feedback entries (skip student₂ from batch)
+
+    # Leakage detection
+    leakage_detector: str = "heuristic"       # "heuristic" | "llm_judge"
+    llm_judge_api_base: str | None = None     # OpenAI-compatible endpoint
+    llm_judge_api_key: str | None = None      # falls back to LLM_JUDGE_API_KEY env var
+    llm_judge_model: str = "gemini-2.5-flash-lite"
+    llm_judge_max_workers: int = 32
+    llm_judge_timeout: float = 30.0
 
 
 class SelfTeachRayPPOTrainer(RayPPOTrainer):
-    """2-phase GRPO trainer for student-teacher self-play.
+    """Tree-structured GRPO trainer for student-teacher self-play.
 
-    Instead of generating all 3 turns as one trajectory, this trainer
-    makes 4 separate single-turn generation calls per step, branching
-    at the right point for each role to enable clean GRPO comparisons.
+    Generates a tree per prompt: Q → A₁ → k feedbacks → m A₂s each.
+    The m A₂s per feedback serve dual purpose: grading teacher quality
+    (mean improvement rate) and training student₂ (GRPO groups of m).
     """
 
-    def __init__(self, *args, self_teach_config: Optional[SelfTeachConfig] = None, **kwargs):
+    def __init__(self, *args, self_teach_config: SelfTeachConfig | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.self_teach_config = self_teach_config or SelfTeachConfig()
-        # Derive A2 prompt budget from configured max_prompt_length so prompts
-        # fit within the padding target used by the agent loop.
-        self.max_a2_prompt_tokens = self.config.data.max_prompt_length
+        # Resolve auto default for filter_a1_correct
+        if self.self_teach_config.filter_a1_correct is None:
+            self.self_teach_config.filter_a1_correct = self.self_teach_config.blind_teacher
         if self.self_teach_config.enabled:
             if self.config.reward_model.get("launch_reward_fn_async", False):
                 raise ValueError(
                     "Self-teach is incompatible with launch_reward_fn_async=True."
                 )
-            print("[SelfTeach 2-Phase] Initialized.")
+            mode = "blind" if self.self_teach_config.blind_teacher else "conditioned"
+            filter_str = "yes" if self.self_teach_config.filter_a1_correct else "no"
+            k = self.self_teach_config.num_feedbacks
+            m = self.self_teach_config.num_a2_per_feedback
+            assert k == m, (
+                f"num_feedbacks ({k}) must equal num_a2_per_feedback ({m}) "
+                f"for unified GRPO grouping"
+            )
+            print(
+                f"[SelfTeach Tree] Initialized. teacher={mode}, "
+                f"filter_a1_correct={filter_str}, k={k}, m={m}"
+            )
+            # Initialize leakage detector
+            if self.self_teach_config.leakage_detector == "llm_judge":
+                from .leakage_judge import LLMJudgeLeakageDetector
+                api_key = self.self_teach_config.llm_judge_api_key or os.environ.get("LLM_JUDGE_API_KEY")
+                if not self.self_teach_config.llm_judge_api_base:
+                    raise ValueError("llm_judge_api_base must be set when leakage_detector='llm_judge'")
+                if not api_key:
+                    raise ValueError("LLM_JUDGE_API_KEY env var or llm_judge_api_key config must be set")
+                self.leakage_detector = LLMJudgeLeakageDetector(
+                    api_base=self.self_teach_config.llm_judge_api_base,
+                    api_key=api_key,
+                    model=self.self_teach_config.llm_judge_model,
+                    max_workers=self.self_teach_config.llm_judge_max_workers,
+                    timeout=self.self_teach_config.llm_judge_timeout,
+                )
+                print(f"[SelfTeach] Leakage detector: LLM judge ({self.self_teach_config.llm_judge_model})")
+            else:
+                from .leakage_judge import HeuristicLeakageDetector
+                self.leakage_detector = HeuristicLeakageDetector()
+                print("[SelfTeach] Leakage detector: heuristic (\\boxed{} check)")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    # Token budget for the A2 prompt — set dynamically in __init__ from
-    # config.data.max_prompt_length so prompts are padded consistently.
-
-    def _truncate_for_a2(self, a1_text: str, f_text: str, question: str) -> tuple[str, str]:
+    def _truncate_for_a2(self, a1_text: str, f_text: str, question: str) -> tuple[str, str, int]:
         """Truncate A1 and F texts so the A2 prompt fits within context.
 
         Fixed parts: question plus chat template overhead.
         The remaining budget is split evenly between A1 and F.
+
+        Returns:
+            (a1_text, f_text, tokens_truncated) where tokens_truncated is the
+            number of tokens removed (0 if no truncation was needed).
         """
         fixed_tokens = len(self.tokenizer.encode(
             question,
             add_special_tokens=False,
-        )) + 50  # chat template overhead
+        )) + 200  # STUDENT2_PROMPT_TEMPLATE XML tags + instruction + chat template overhead
 
-        available = self.max_a2_prompt_tokens - fixed_tokens
+        available = self.config.data.max_prompt_length - fixed_tokens
         per_turn = available // 2
 
         a1_ids = self.tokenizer.encode(a1_text, add_special_tokens=False)
         f_ids = self.tokenizer.encode(f_text, add_special_tokens=False)
 
-        if len(a1_ids) + len(f_ids) <= available:
-            return a1_text, f_text
+        original_total = len(a1_ids) + len(f_ids)
+
+        if original_total <= available:
+            return a1_text, f_text, 0
 
         # Truncate whichever is over budget, giving slack to the other
         if len(a1_ids) <= per_turn:
@@ -126,9 +188,79 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             a1_ids = a1_ids[:per_turn]
             f_ids = f_ids[:per_turn]
 
+        tokens_truncated = original_total - len(a1_ids) - len(f_ids)
         a1_out = self.tokenizer.decode(a1_ids, skip_special_tokens=True)
         f_out = self.tokenizer.decode(f_ids, skip_special_tokens=True)
-        return a1_out, f_out
+        return a1_out, f_out, tokens_truncated
+
+    def _check_prompt_overflow(
+        self,
+        raw_prompts: list,
+        max_prompt_length: int,
+    ) -> dict:
+        """Check how many prompts exceed the max_prompt_length budget.
+
+        "Overflow" means verl will silently truncate these prompts at
+        tokenization time. This is distinct from our explicit A2
+        "truncation" in _truncate_for_a2 which we control ourselves.
+
+        Returns dict with overflow stats: count, rate, and mean tokens over.
+        """
+        overflow_count = 0
+        total_overflow_tokens = 0
+        for prompt_msgs in raw_prompts:
+            # Concatenate all message content to approximate token count
+            text = "".join(msg.get("content", "") for msg in prompt_msgs)
+            n_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
+            # Add overhead for chat template (rough estimate)
+            n_tokens += 50
+            if n_tokens > max_prompt_length:
+                overflow_count += 1
+                total_overflow_tokens += n_tokens - max_prompt_length
+        n = len(raw_prompts)
+        return {
+            "count": overflow_count,
+            "rate": overflow_count / max(n, 1),
+            "mean_overflow_tokens": total_overflow_tokens / max(overflow_count, 1),
+        }
+
+    def _generate_padded(
+        self,
+        raw_prompts: list,
+        temperature: float,
+        global_steps: int,
+        data_sources: list[str],
+        ground_truths: list[str],
+    ) -> DataProto:
+        """Generate sequences, padding the batch to be divisible by worker count.
+
+        The agent loop requires batch size % num_workers == 0. When filtering
+        produces uneven batch sizes, we duplicate the last entry to pad, then
+        strip the extra outputs.
+        """
+        real_n = len(raw_prompts)
+        num_workers = len(self.async_rollout_manager.agent_loop_workers)
+        remainder = real_n % num_workers
+        if remainder != 0:
+            pad_n = num_workers - remainder
+            # Duplicate last entry as padding
+            raw_prompts = raw_prompts + [raw_prompts[-1]] * pad_n
+            data_sources = data_sources + [data_sources[-1]] * pad_n
+            ground_truths = ground_truths + [ground_truths[-1]] * pad_n
+
+        gen_batch = self._build_gen_batch(
+            raw_prompts, temperature, global_steps,
+            data_sources=data_sources, ground_truths=ground_truths,
+        )
+        output = self.async_rollout_manager.generate_sequences(gen_batch)
+        timing = output.meta_info.pop("timing", {})
+
+        # Strip padding entries
+        if remainder != 0:
+            output = output[:real_n]
+
+        output.meta_info["timing"] = timing
+        return output
 
     def _build_gen_batch(
         self,
@@ -280,21 +412,24 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         a2_acc = metrics_dict["a2_correct_count"] / max(total, 1)
         imp_rate = metrics_dict["improvement_count"] / max(total, 1)
         reg_rate = metrics_dict["regression_count"] / max(total, 1)
-        t_grading_a2_acc = metrics_dict.get("teacher_grading_a2_correct_count", 0) / max(
-            metrics_dict.get("teacher_grading_total", 1), 1
-        )
         t_mean_reward = metrics_dict.get("teacher_mean_reward", 0.0)
         s2_mean_reward = metrics_dict.get("student2_mean_reward", 0.0)
         t_leak_count = metrics_dict.get("teacher_leak_count", 0)
         t_leak_rate = t_leak_count / max(total, 1)
 
+        # Truncation metrics
+        a1_ovf = metrics_dict.get("a1_prompt_overflow_rate", 0.0)
+        f_ovf = metrics_dict.get("f_prompt_overflow_rate", 0.0)
+        a2_trunc = metrics_dict.get("a2_prompt_truncation_rate", 0.0)
+
         print(
             f"[SelfTeach step {self.global_steps}] "
             f"a1_acc={a1_acc:.3f}, a2_acc={a2_acc:.3f}, "
             f"improve={imp_rate:.3f}, regress={reg_rate:.3f}, "
-            f"grading_a2_acc={t_grading_a2_acc:.3f}, "
             f"teacher_reward={t_mean_reward:.3f}, student2_reward={s2_mean_reward:.3f}, "
-            f"teacher_leak_rate={t_leak_rate:.3f}"
+            f"teacher_leak_rate={t_leak_rate:.3f}, "
+            f"a1_prompt_overflow={a1_ovf:.3f}, f_prompt_overflow={f_ovf:.3f}, "
+            f"a2_prompt_truncation={a2_trunc:.3f}"
         )
 
         try:
@@ -307,10 +442,16 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                         "self_teach/a2_accuracy": a2_acc,
                         "self_teach/improvement_rate": imp_rate,
                         "self_teach/regression_rate": reg_rate,
-                        "self_teach/teacher_grading_a2_accuracy": t_grading_a2_acc,
                         "self_teach/teacher_leak_rate": t_leak_rate,
-                        "self_teach/phase1_teacher_mean_reward": t_mean_reward,
-                        "self_teach/phase2_student2_mean_reward": s2_mean_reward,
+                        "self_teach/teacher_mean_reward": t_mean_reward,
+                        "self_teach/student2_mean_reward": s2_mean_reward,
+                        "self_teach/a1_prompt_overflow_rate": a1_ovf,
+                        "self_teach/a1_prompt_overflow_mean_tokens": metrics_dict.get("a1_prompt_overflow_mean_tokens", 0.0),
+                        "self_teach/f_prompt_overflow_rate": f_ovf,
+                        "self_teach/f_prompt_overflow_mean_tokens": metrics_dict.get("f_prompt_overflow_mean_tokens", 0.0),
+                        "self_teach/a2_prompt_truncation_rate": a2_trunc,
+                        "self_teach/a2_prompt_truncation_mean_tokens": metrics_dict.get("a2_prompt_truncation_mean_tokens", 0.0),
+                        "self_teach/judge_error_count": metrics_dict.get("judge_error_count", 0),
                     },
                     step=self.global_steps,
                 )
@@ -353,16 +494,27 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             ],
         )
         # Log up to num_samples prompts, using the first rollout (j=0) for a2
+        filter_a1 = self.self_teach_config.filter_a1_correct
+        if self.self_teach_config.blind_teacher:
+            log_tpl = BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else BLIND_TEACHER_PROMPT_TEMPLATE
+        else:
+            log_tpl = TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else TEACHER_PROMPT_TEMPLATE
         for i in range(min(num_samples, len(question_texts))):
-            teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
+            if self.self_teach_config.blind_teacher:
+                teacher_prompt = log_tpl.format(
+                    question=question_texts[i],
+                    student_attempt=a1_texts[i],
+                )
+            else:
+                teacher_prompt = log_tpl.format(
+                    question=question_texts[i],
+                    student_attempt=a1_texts[i],
+                    ground_truth=ground_truths[i],
+                )
+            a2_prompt = STUDENT2_PROMPT_TEMPLATE.format(
                 question=question_texts[i],
-                student_attempt=a1_texts[i],
-                ground_truth=ground_truths[i],
-            )
-            a2_prompt = (
-                f"[USER] {question_texts[i]}\n\n"
-                f"[ASSISTANT] {a1_texts[i]}\n\n"
-                f"[USER] {f_texts[i]}"
+                first_attempt=a1_texts[i],
+                feedback=f_texts[i],
             )
             table.add_data(
                 teacher_prompt,
@@ -386,13 +538,17 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         a1_correct: list[bool],
         ground_truths: list[str],
         f_texts: list[str],
-        a2_grading_texts: list[str],
-        a2_grading_correct: list[bool],
         teacher_rewards: list[float],
-        n: int,
+        a2_correct: list[bool],
+        k: int,
+        m: int,
         step: int,
     ):
-        """Append one JSONL record per teacher sample for reward-hacking analysis."""
+        """Append one JSONL record per teacher feedback for reward-hacking analysis.
+
+        f_texts has n_prompts * k entries. teacher_rewards has n_prompts * k entries.
+        a2_correct has n_prompts * k * m entries (m A₂ outcomes per feedback).
+        """
         if not hasattr(self, "_teacher_log_path"):
             from datetime import datetime
             log_dir = os.path.join(
@@ -403,32 +559,97 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
             self._teacher_log_path = os.path.join(log_dir, f"teacher_log_{ts}.jsonl")
         log_path = self._teacher_log_path
 
+        blind = self.self_teach_config.blind_teacher
+        filter_a1 = self.self_teach_config.filter_a1_correct
+        if blind:
+            log_tpl = BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else BLIND_TEACHER_PROMPT_TEMPLATE
+        else:
+            log_tpl = TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else TEACHER_PROMPT_TEMPLATE
         with open(log_path, "a") as f:
-            for idx in range(len(f_texts)):
-                i = idx // n  # prompt index
-                teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
-                    question=question_texts[i],
-                    student_attempt=a1_texts[i],
-                    ground_truth=ground_truths[i],
-                )
+            for f_idx in range(len(f_texts)):
+                i = f_idx // k  # prompt index
+                if blind:
+                    teacher_prompt = log_tpl.format(
+                        question=question_texts[i],
+                        student_attempt=a1_texts[i],
+                    )
+                else:
+                    teacher_prompt = log_tpl.format(
+                        question=question_texts[i],
+                        student_attempt=a1_texts[i],
+                        ground_truth=ground_truths[i],
+                    )
+                # Collect per-A₂ correctness for this feedback
+                a2_start = f_idx * m
+                a2_outcomes = [a2_correct[a2_start + off] for off in range(m)]
                 record = {
                     "step": step,
                     "prompt_idx": i,
-                    "rollout_idx": idx % n,
+                    "feedback_idx": f_idx % k,
+                    "blind_teacher": blind,
                     "question": question_texts[i],
                     "ground_truth": ground_truths[i],
                     "a1_text": a1_texts[i],
                     "a1_correct": a1_correct[i],
                     "teacher_prompt": teacher_prompt,
-                    "teacher_response": f_texts[idx],
-                    "a2_grading_text": a2_grading_texts[idx],
-                    "a2_grading_correct": a2_grading_correct[idx],
-                    "teacher_reward": teacher_rewards[idx],
+                    "teacher_response": f_texts[f_idx],
+                    "teacher_reward": teacher_rewards[f_idx],
+                    "a2_correct_count": sum(a2_outcomes),
+                    "a2_total": m,
+                }
+                f.write(json.dumps(record) + "\n")
+
+    def _log_student2_jsonl(
+        self,
+        question_texts: list[str],
+        a1_texts: list[str],
+        a1_correct: list[bool],
+        ground_truths: list[str],
+        f_texts: list[str],
+        a2_texts: list[str],
+        a2_correct: list[bool],
+        student2_rewards: list[float],
+        k: int,
+        m: int,
+        step: int,
+    ):
+        """Append one JSONL record per A₂ response for student₂ analysis.
+
+        a2_texts/a2_correct/student2_rewards have n_prompts * k * m entries.
+        f_texts has n_prompts * k entries.
+        question_texts/a1_texts/a1_correct/ground_truths are per-prompt.
+        """
+        if not hasattr(self, "_student2_log_path"):
+            from datetime import datetime
+            log_dir = os.path.join(
+                self.config.trainer.default_local_dir, "student2_logs"
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._student2_log_path = os.path.join(log_dir, f"student2_log_{ts}.jsonl")
+        log_path = self._student2_log_path
+
+        with open(log_path, "a") as f:
+            for a2_idx in range(len(a2_texts)):
+                f_idx = a2_idx // m
+                i = f_idx // k  # prompt index
+                record = {
+                    "step": step,
+                    "prompt_idx": i,
+                    "feedback_idx": f_idx % k,
+                    "a2_idx": a2_idx % m,
+                    "question": question_texts[i],
+                    "ground_truth": ground_truths[i],
+                    "a1_correct": a1_correct[i],
+                    "feedback": strip_think_blocks(f_texts[f_idx]),
+                    "a2_response": a2_texts[a2_idx],
+                    "a2_correct": a2_correct[a2_idx],
+                    "student2_reward": student2_rewards[a2_idx],
                 }
                 f.write(json.dumps(record) + "\n")
 
     # ------------------------------------------------------------------
-    # fit() override — 2-phase generation flow
+    # fit() override — tree-structured generation flow
     # ------------------------------------------------------------------
 
     def fit(self):
@@ -472,6 +693,8 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
         next_step_profile = False
 
         n = self.config.actor_rollout_ref.rollout.n  # GRPO group size (e.g. 8)
+        k = self.self_teach_config.num_feedbacks  # teacher feedbacks per prompt
+        m = self.self_teach_config.num_a2_per_feedback  # A₂ responses per feedback
         temperature = self.config.actor_rollout_ref.rollout.temperature
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
@@ -499,16 +722,21 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                 base_uids = [str(uuid.uuid4()) for _ in range(bs)]
                 batch.non_tensor_batch["uid"] = np.array(base_uids, dtype=object)
 
-                # Extract question texts from raw_prompt
+                # Extract question texts and system prompts from raw_prompt
                 question_texts = []
+                system_prompts = []
                 for i in range(bs):
                     raw_prompt = batch.non_tensor_batch["raw_prompt"][i]
                     q = ""
+                    sp = ""
                     for msg in raw_prompt:
-                        if msg.get("role") == "user":
+                        if msg.get("role") == "system":
+                            sp = msg.get("content", "")
+                        elif msg.get("role") == "user":
                             q = msg.get("content", "")
                             break
                     question_texts.append(q)
+                    system_prompts.append(sp)
 
                 # Extract ground truths and data sources for grading
                 ground_truths = []
@@ -533,6 +761,9 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     # ==========================================================
                     with marked_timer("gen_a1", timing_raw, color="red"):
                         a1_raw_prompts = list(batch.non_tensor_batch["raw_prompt"])
+                        a1_overflow = self._check_prompt_overflow(
+                            a1_raw_prompts, self.config.data.max_prompt_length,
+                        )
                         a1_gen_batch = self._build_gen_batch(
                             a1_raw_prompts, temperature, self.global_steps,
                             data_sources=data_sources, ground_truths=ground_truths,
@@ -557,260 +788,356 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                     a1_texts_clean = [strip_think_blocks(t) for t in a1_texts]
 
                     # ==========================================================
-                    # Step 2: Generate F (teacher feedback) — bs*n entries
-                    # Each prompt gets n different feedback samples,
+                    # Step 2: Generate F (teacher feedback) — n_teacher * k entries
+                    # Each prompt gets k different feedback samples,
                     # all conditioned on the SAME A₁.
+                    # When filter_a1_correct=True, skip prompts where A₁ is correct.
                     # ==========================================================
                     with marked_timer("gen_f", timing_raw, color="yellow"):
+                        # Determine which prompts participate in teacher training
+                        if self.self_teach_config.filter_a1_correct:
+                            teacher_prompt_indices = [i for i in range(bs) if not a1_correct[i]]
+                        else:
+                            teacher_prompt_indices = list(range(bs))
+
+                        # Pick the right template based on blind/filtered config
+                        filter_a1 = self.self_teach_config.filter_a1_correct
+                        if self.self_teach_config.blind_teacher:
+                            tpl = BLIND_TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else BLIND_TEACHER_PROMPT_TEMPLATE
+                        else:
+                            tpl = TEACHER_PROMPT_TEMPLATE_FILTERED if filter_a1 else TEACHER_PROMPT_TEMPLATE
+
                         teacher_messages = []
-                        for i in range(bs):
-                            teacher_prompt = TEACHER_PROMPT_TEMPLATE.format(
-                                question=question_texts[i],
-                                student_attempt=a1_texts_clean[i],
-                                ground_truth=ground_truths[i],
-                            )
+                        for i in teacher_prompt_indices:
+                            if self.self_teach_config.blind_teacher:
+                                teacher_prompt = tpl.format(
+                                    question=question_texts[i],
+                                    student_attempt=a1_texts_clean[i],
+                                )
+                            else:
+                                teacher_prompt = tpl.format(
+                                    question=question_texts[i],
+                                    student_attempt=a1_texts_clean[i],
+                                    ground_truth=ground_truths[i],
+                                )
                             msgs = [
                                 {"role": "user", "content": teacher_prompt},
                             ]
                             teacher_messages.append(msgs)
 
-                        # Repeat each prompt n times (interleaved)
+                        # Ensure the combined batch (k + k*m entries per prompt)
+                        # is divisible by the number of GPUs for dynamic batching.
+                        entries_per_prompt = k + k * m
+                        n_gpus = self.resource_pool_manager.get_n_gpus()
+                        from math import gcd
+                        prompts_needed = n_gpus // gcd(entries_per_prompt, n_gpus)
+                        if len(teacher_prompt_indices) > 0 and len(teacher_prompt_indices) % prompts_needed != 0:
+                            trim_to = (len(teacher_prompt_indices) // prompts_needed) * prompts_needed
+                            if trim_to == 0:
+                                trim_to = prompts_needed
+                                # Pad by duplicating random prompts
+                                while len(teacher_prompt_indices) < trim_to:
+                                    teacher_prompt_indices.append(teacher_prompt_indices[-1])
+                                    teacher_messages.append(teacher_messages[-1])
+                            else:
+                                teacher_prompt_indices = teacher_prompt_indices[:trim_to]
+                                teacher_messages = teacher_messages[:trim_to]
+
+                        n_teacher_prompts = len(teacher_prompt_indices)
+
+                        # Repeat each prompt k times (k feedbacks per prompt)
                         f_raw_prompts = []
                         f_data_sources = []
                         f_ground_truths = []
-                        for i, msgs in enumerate(teacher_messages):
-                            for _ in range(n):
-                                f_raw_prompts.append(msgs)
+                        for j, i in enumerate(teacher_prompt_indices):
+                            for _ in range(k):
+                                f_raw_prompts.append(teacher_messages[j])
                                 f_data_sources.append(data_sources[i])
                                 f_ground_truths.append(ground_truths[i])
 
-                        f_gen_batch = self._build_gen_batch(
-                            f_raw_prompts, temperature, self.global_steps,
-                            data_sources=f_data_sources, ground_truths=f_ground_truths,
-                        )
-                        f_output = self.async_rollout_manager.generate_sequences(f_gen_batch)
-                        timing_raw.update(f_output.meta_info.get("timing", {}))
-                        f_output.meta_info.pop("timing", None)
+                        f_overflow = self._check_prompt_overflow(
+                            teacher_messages, self.config.data.max_prompt_length,
+                        ) if n_teacher_prompts > 0 else {"count": 0, "rate": 0.0, "mean_overflow_tokens": 0.0}
 
-                    f_texts = self._decode_responses(f_output)
-
-                    # ==========================================================
-                    # Step 3: Generate A₂ for teacher grading — bs*n entries
-                    # Each F gets one A₂. Grade A₂ → teacher reward for that F.
-                    # ==========================================================
-                    with marked_timer("gen_a2_grading", timing_raw, color="blue"):
-                        s2_grading_messages = []
-                        for idx in range(bs * n):
-                            i = idx // n  # prompt index
-                            a1_t, f_t = self._truncate_for_a2(
-                                a1_texts_clean[i], strip_think_blocks(f_texts[idx]), question_texts[i]
+                        if n_teacher_prompts > 0:
+                            f_output = self._generate_padded(
+                                f_raw_prompts, temperature, self.global_steps,
+                                data_sources=f_data_sources, ground_truths=f_ground_truths,
                             )
-                            msgs = [
-                                {"role": "user", "content": question_texts[i]},
-                                {"role": "assistant", "content": a1_t},
-                                {"role": "user", "content": f_t},
-                            ]
-                            s2_grading_messages.append(msgs)
+                            timing_raw.update(f_output.meta_info.pop("timing", {}))
+                        else:
+                            f_output = None
 
-                        a2_grading_ds = [data_sources[idx // n] for idx in range(bs * n)]
-                        a2_grading_gt = [ground_truths[idx // n] for idx in range(bs * n)]
-                        a2_grading_gen_batch = self._build_gen_batch(
-                            s2_grading_messages, temperature, self.global_steps,
-                            data_sources=a2_grading_ds, ground_truths=a2_grading_gt,
+                    if self.self_teach_config.filter_a1_correct:
+                        n_filtered = bs - n_teacher_prompts
+                        print(
+                            f"[SelfTeach step {self.global_steps}] "
+                            f"Filtered {n_filtered}/{bs} A₁-correct prompts from teacher training"
                         )
-                        a2_grading_output = self.async_rollout_manager.generate_sequences(
-                            a2_grading_gen_batch
+
+                    f_texts = self._decode_responses(f_output) if f_output is not None else []
+
+                    # Submit leakage detection (async for LLM judge, immediate for heuristic)
+                    if f_texts:
+                        self.leakage_detector.submit_batch(
+                            feedbacks=[extract_feedback(strip_think_blocks(f)) for f in f_texts],
+                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices for _ in range(k)],
+                            questions=[question_texts[i] for i in teacher_prompt_indices for _ in range(k)],
                         )
-                        timing_raw.update(a2_grading_output.meta_info.get("timing", {}))
-                        a2_grading_output.meta_info.pop("timing", None)
 
-                    a2_grading_texts = self._decode_responses(a2_grading_output)
-
-                    # Grade A₂ → compute teacher rewards
+                    # ==========================================================
+                    # Step 3: Generate A₂ — n_teacher * k * m entries
+                    # Each feedback Fᵢ gets m A₂ responses. These serve dual
+                    # purpose:
+                    #   1. Grade teacher quality (mean improvement rate across m)
+                    #   2. Train student₂ (GRPO groups of m, same context)
+                    # ==========================================================
                     teacher_rewards = []
-                    a2_grading_correct = []
-                    a2_grading_correct_count = 0
-                    for idx in range(bs * n):
-                        i = idx // n
-                        score = grade_solution(
-                            data_source=data_sources[i],
-                            solution_str=strip_think_blocks(a2_grading_texts[idx]),
-                            ground_truth=ground_truths[i],
-                        )
-                        a2_correct_flag = score >= 0.5
-                        a2_grading_correct.append(a2_correct_flag)
-                        if a2_correct_flag:
-                            a2_grading_correct_count += 1
-                        t_reward, _ = compute_self_teach_rewards(a1_correct[i], a2_correct_flag)
-                        teacher_rewards.append(t_reward)
-
-                    # Penalize teacher for leaking answer (reward hacking detection)
-                    teacher_leak_count = 0
-                    for idx in range(bs * n):
-                        f_visible = strip_think_blocks(f_texts[idx])
-                        if "\\boxed{" in f_visible:
-                            teacher_rewards[idx] = -1.0
-                            teacher_leak_count += 1
-
-                    # Log all teacher prompt-response pairs for reward-hacking analysis
-                    self._log_teacher_jsonl(
-                        question_texts=question_texts,
-                        a1_texts=a1_texts_clean,
-                        a1_correct=a1_correct,
-                        ground_truths=ground_truths,
-                        f_texts=f_texts,
-                        a2_grading_texts=a2_grading_texts,
-                        a2_grading_correct=a2_grading_correct,
-                        teacher_rewards=teacher_rewards,
-                        n=n,
-                        step=self.global_steps,
-                    )
-
-                    # ==========================================================
-                    # Step 4: Generate A₂ for student₂ training — bs*n entries
-                    # Pick one F per prompt (first from step 2), then branch
-                    # n times for different A₂ samples.
-                    # ==========================================================
-                    with marked_timer("gen_a2_training", timing_raw, color="magenta"):
-                        # Select first F per prompt
-                        selected_f_texts = [f_texts[i * n] for i in range(bs)]
-
-                        s2_training_messages = []
-                        truncated_a1 = []
-                        truncated_f = []
-                        for i in range(bs):
-                            a1_t, f_t = self._truncate_for_a2(
-                                a1_texts_clean[i], strip_think_blocks(selected_f_texts[i]), question_texts[i]
-                            )
-                            truncated_a1.append(a1_t)
-                            truncated_f.append(f_t)
-                            msgs = [
-                                {"role": "user", "content": question_texts[i]},
-                                {"role": "assistant", "content": a1_t},
-                                {"role": "user", "content": f_t},
-                            ]
-                            s2_training_messages.append(msgs)
-
-                        # Repeat each prompt n times (interleaved)
-                        s2_raw_prompts = []
-                        s2_data_sources = []
-                        s2_ground_truths = []
-                        for i, msgs in enumerate(s2_training_messages):
-                            for _ in range(n):
-                                s2_raw_prompts.append(msgs)
-                                s2_data_sources.append(data_sources[i])
-                                s2_ground_truths.append(ground_truths[i])
-
-                        a2_training_gen_batch = self._build_gen_batch(
-                            s2_raw_prompts, temperature, self.global_steps,
-                            data_sources=s2_data_sources, ground_truths=s2_ground_truths,
-                        )
-                        a2_training_output = self.async_rollout_manager.generate_sequences(
-                            a2_training_gen_batch
-                        )
-                        timing_raw.update(a2_training_output.meta_info.get("timing", {}))
-                        a2_training_output.meta_info.pop("timing", None)
-
-                    a2_training_texts = self._decode_responses(a2_training_output)
-
-                    # Grade A₂ → compute student₂ rewards
                     student2_rewards = []
-                    a2_training_correct = []
-                    for idx in range(bs * n):
-                        i = idx // n
-                        score = grade_solution(
-                            data_source=data_sources[i],
-                            solution_str=strip_think_blocks(a2_training_texts[idx]),
-                            ground_truth=ground_truths[i],
+                    a2_correct = []
+                    a2_texts = []
+                    teacher_leak_count = 0
+                    a2_output = None
+                    # Store truncated texts per feedback for logging
+                    truncated_a1_per_f = []
+                    truncated_f_per_f = []
+                    # Truncation tracking
+                    a2_prompt_truncation_count = 0
+                    a2_prompt_truncation_tokens = []
+
+                    n_total_f = n_teacher_prompts * k  # total feedbacks
+                    n_total_a2 = n_total_f * m  # total A₂ responses
+
+                    if n_teacher_prompts > 0:
+                        with marked_timer("gen_a2", timing_raw, color="blue"):
+                            a2_raw_prompts = []
+                            a2_data_sources = []
+                            a2_ground_truths = []
+
+                            for f_idx in range(n_total_f):
+                                j = f_idx // k  # index into teacher_prompt_indices
+                                i = teacher_prompt_indices[j]
+                                a1_t, f_t, tokens_lost = self._truncate_for_a2(
+                                    a1_texts_clean[i], extract_feedback(f_texts[f_idx]), question_texts[i]
+                                )
+                                if tokens_lost > 0:
+                                    a2_prompt_truncation_count += 1
+                                    a2_prompt_truncation_tokens.append(tokens_lost)
+                                truncated_a1_per_f.append(a1_t)
+                                truncated_f_per_f.append(f_t)
+                                s2_prompt = STUDENT2_PROMPT_TEMPLATE.format(
+                                    question=question_texts[i],
+                                    first_attempt=a1_t,
+                                    feedback=f_t,
+                                )
+                                base_msgs = [{"role": "system", "content": system_prompts[i]}] if system_prompts[i] else []
+                                base_msgs.append({"role": "user", "content": s2_prompt})
+                                for _ in range(m):
+                                    a2_raw_prompts.append(base_msgs)
+                                    a2_data_sources.append(data_sources[i])
+                                    a2_ground_truths.append(ground_truths[i])
+
+                            a2_output = self._generate_padded(
+                                a2_raw_prompts, temperature, self.global_steps,
+                                data_sources=a2_data_sources, ground_truths=a2_ground_truths,
+                            )
+                            timing_raw.update(a2_output.meta_info.pop("timing", {}))
+
+                        a2_texts = self._decode_responses(a2_output)
+
+                        # Grade all A₂ responses
+                        for a2_idx in range(n_total_a2):
+                            f_idx = a2_idx // m
+                            j = f_idx // k
+                            i = teacher_prompt_indices[j]
+                            score = grade_solution(
+                                data_source=data_sources[i],
+                                solution_str=strip_think_blocks(a2_texts[a2_idx]),
+                                ground_truth=ground_truths[i],
+                            )
+                            a2_correct.append(score >= 0.5)
+
+                        # Compute teacher rewards: mean improvement rate per F
+                        for f_idx in range(n_total_f):
+                            j = f_idx // k
+                            i = teacher_prompt_indices[j]
+                            a2_start = f_idx * m
+                            rewards_for_f = []
+                            for a2_offset in range(m):
+                                t_r, _ = compute_self_teach_rewards(
+                                    a1_correct[i], a2_correct[a2_start + a2_offset]
+                                )
+                                rewards_for_f.append(t_r)
+                            teacher_rewards.append(sum(rewards_for_f) / m)
+
+                        # Collect leakage detection results and apply penalties
+                        if f_texts:
+                            leak_flags = self.leakage_detector.collect_results()
+                            for f_idx, leaked in enumerate(leak_flags):
+                                if leaked:
+                                    teacher_rewards[f_idx] = -1.0
+                                    teacher_leak_count += 1
+
+                        # Compute student₂ rewards: per A₂, binary
+                        for a2_idx in range(n_total_a2):
+                            f_idx = a2_idx // m
+                            j = f_idx // k
+                            i = teacher_prompt_indices[j]
+                            _, s2_reward = compute_self_teach_rewards(
+                                a1_correct[i], a2_correct[a2_idx]
+                            )
+                            student2_rewards.append(s2_reward)
+
+                        # Log teacher data for reward-hacking analysis
+                        self._log_teacher_jsonl(
+                            question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                            a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
+                            a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                            f_texts=f_texts,
+                            teacher_rewards=teacher_rewards,
+                            a2_correct=a2_correct,
+                            k=k,
+                            m=m,
+                            step=self.global_steps,
                         )
-                        a2_correct_flag = score >= 0.5
-                        a2_training_correct.append(a2_correct_flag)
-                        _, s2_reward = compute_self_teach_rewards(a1_correct[i], a2_correct_flag)
-                        student2_rewards.append(s2_reward)
+
+                        # Log student₂ data for debugging
+                        self._log_student2_jsonl(
+                            question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                            a1_texts=[a1_texts_clean[i] for i in teacher_prompt_indices],
+                            a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                            ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                            f_texts=f_texts,
+                            a2_texts=a2_texts,
+                            a2_correct=a2_correct,
+                            student2_rewards=student2_rewards,
+                            k=k,
+                            m=m,
+                            step=self.global_steps,
+                        )
 
                     # ==========================================================
                     # Build combined batch (teacher + student₂ sub-rollouts)
+                    # Layout: teacher entries in groups of k (per prompt),
+                    #         student₂ entries in groups of m (per feedback).
+                    # Since k == m, compute_advantage uses a single num_repeat.
                     # ==========================================================
                     with marked_timer("self_teach_build_batch", timing_raw, color="cyan"):
-                        # Metrics tracking (uses cached a2_training_correct from grading)
-                        a2_correct_count = sum(1 for c in a2_training_correct if c)
+                        # Metrics tracking
+                        a2_correct_count = sum(1 for c in a2_correct if c)
                         improvement_count = sum(
-                            1 for idx in range(bs * n)
-                            if not a1_correct[idx // n] and a2_training_correct[idx]
+                            1 for a2_idx in range(n_total_a2)
+                            if not a1_correct[teacher_prompt_indices[a2_idx // m // k]] and a2_correct[a2_idx]
                         )
                         regression_count = sum(
-                            1 for idx in range(bs * n)
-                            if a1_correct[idx // n] and not a2_training_correct[idx]
+                            1 for a2_idx in range(n_total_a2)
+                            if a1_correct[teacher_prompt_indices[a2_idx // m // k]] and not a2_correct[a2_idx]
                         )
 
                         self_teach_metrics = {
                             "a1_correct_count": sum(1 for c in a1_correct if c),
-                            "a1_total": bs,  # a1 is graded once per prompt
+                            "a1_total": bs,
                             "a2_correct_count": a2_correct_count,
                             "improvement_count": improvement_count,
                             "regression_count": regression_count,
-                            "teacher_grading_a2_correct_count": a2_grading_correct_count,
-                            "teacher_grading_total": bs * n,
                             "teacher_leak_count": teacher_leak_count,
-                            "teacher_mean_reward": sum(teacher_rewards) / len(teacher_rewards),
-                            "student2_mean_reward": sum(student2_rewards) / len(student2_rewards),
+                            "judge_error_count": getattr(self.leakage_detector, "_error_count", 0),  # reset below
+                            "teacher_mean_reward": sum(teacher_rewards) / max(len(teacher_rewards), 1),
+                            "student2_mean_reward": sum(student2_rewards) / max(len(student2_rewards), 1),
+                                # Prompt overflow (verl-level silent truncation) and
+                            # A2 truncation (our explicit _truncate_for_a2)
+                            "a1_prompt_overflow_rate": a1_overflow["rate"],
+                            "a1_prompt_overflow_mean_tokens": a1_overflow["mean_overflow_tokens"],
+                            "f_prompt_overflow_rate": f_overflow["rate"],
+                            "f_prompt_overflow_mean_tokens": f_overflow["mean_overflow_tokens"],
+                            "a2_prompt_truncation_rate": a2_prompt_truncation_count / max(n_total_f, 1),
+                            "a2_prompt_truncation_mean_tokens": (
+                                sum(a2_prompt_truncation_tokens) / max(len(a2_prompt_truncation_tokens), 1)
+                            ),
                         }
-                        self._log_self_teach_metrics(self_teach_metrics, bs * n)
+                        self._log_self_teach_metrics(self_teach_metrics, max(n_total_a2, 1))
+
+                        # Reset per-step judge error counters
+                        if hasattr(self.leakage_detector, "_error_count"):
+                            self.leakage_detector._error_count = 0
+                            self.leakage_detector._call_count = 0
 
                         test_freq = self.config.trainer.test_freq
-                        if test_freq > 0 and (
+                        if n_teacher_prompts > 0 and test_freq > 0 and (
                             is_last_step or self.global_steps % test_freq == 0
                         ):
+                            # Log first feedback per prompt for the sample table
                             self._log_sample_table(
-                                question_texts=question_texts,
-                                a1_texts=truncated_a1,
-                                a1_correct=a1_correct,
-                                f_texts=truncated_f,
-                                a2_texts=a2_training_texts,
-                                a2_correct=a2_training_correct,
-                                student_rewards=student2_rewards,
-                                teacher_rewards=teacher_rewards,
-                                ground_truths=ground_truths,
-                                n=n,
+                                question_texts=[question_texts[i] for i in teacher_prompt_indices],
+                                a1_texts=[truncated_a1_per_f[j * k] for j in range(n_teacher_prompts)],
+                                a1_correct=[a1_correct[i] for i in teacher_prompt_indices],
+                                f_texts=[truncated_f_per_f[j * k] for j in range(n_teacher_prompts)],
+                                a2_texts=[a2_texts[j * k * m] for j in range(n_teacher_prompts)],
+                                a2_correct=[a2_correct[j * k * m] for j in range(n_teacher_prompts)],
+                                student_rewards=[student2_rewards[j * k * m] for j in range(n_teacher_prompts)],
+                                teacher_rewards=[teacher_rewards[j * k] for j in range(n_teacher_prompts)],
+                                ground_truths=[ground_truths[i] for i in teacher_prompt_indices],
+                                n=1,  # one sample per prompt for the table
                             )
 
-                        # Build teacher entries from step 2 generation output
+                        # Build teacher entries from F generation output
+                        # Grouped by prompt: [p0_f0, p0_f1, ..., p0_f(k-1), p1_f0, ...]
                         teacher_entries = []
-                        for idx in range(bs * n):
-                            i = idx // n
-                            prompt_ids, response_ids = self._extract_real_tokens(f_output, idx)
+                        for f_idx in range(n_total_f):
+                            j = f_idx // k
+                            i = teacher_prompt_indices[j]
+                            prompt_ids, response_ids = self._extract_real_tokens(f_output, f_idx)
                             teacher_entries.append(
                                 {
                                     "prompt_ids": prompt_ids,
                                     "response_ids": response_ids,
-                                    "reward": teacher_rewards[idx],
+                                    "reward": teacher_rewards[f_idx],
                                     "uid": f"teacher_{base_uids[i]}",
                                 }
                             )
 
-                        # Build student₂ entries from step 4 generation output
+                        # Build student₂ entries from A₂ generation output
+                        # Grouped by feedback: [p0_f0_a0, ..., p0_f0_a(m-1), p0_f1_a0, ...]
                         student2_entries = []
-                        for idx in range(bs * n):
-                            i = idx // n
+                        for a2_idx in range(n_total_a2):
+                            f_idx = a2_idx // m
+                            j = f_idx // k
+                            i = teacher_prompt_indices[j]
                             prompt_ids, response_ids = self._extract_real_tokens(
-                                a2_training_output, idx
+                                a2_output, a2_idx
                             )
                             student2_entries.append(
                                 {
                                     "prompt_ids": prompt_ids,
                                     "response_ids": response_ids,
-                                    "reward": student2_rewards[idx],
-                                    "uid": f"student2_{base_uids[i]}",
+                                    "reward": student2_rewards[a2_idx],
+                                    "uid": f"student2_{base_uids[i]}_f{f_idx % k}",
                                 }
                             )
 
-                        all_entries = teacher_entries + student2_entries
+                        if self.self_teach_config.train_teacher_only:
+                            all_entries = teacher_entries
+                        else:
+                            all_entries = teacher_entries + student2_entries
+
+                        if len(all_entries) == 0:
+                            print(
+                                f"[SelfTeach step {self.global_steps}] "
+                                f"All prompts filtered (all A₁ correct). Skipping training step."
+                            )
+                            self.global_steps += 1
+                            progress_bar.update(1)
+                            continue
+
                         batch = self._build_combined_batch(all_entries, pad_token_id)
 
                     print(
                         f"[SelfTeach step {self.global_steps}] "
                         f"Combined batch: {len(all_entries)} entries "
-                        f"({len(teacher_entries)} teacher + {len(student2_entries)} student₂)"
+                        f"({len(teacher_entries)} teacher + "
+                        f"{'0 (teacher-only)' if self.self_teach_config.train_teacher_only else str(len(student2_entries))} student₂) "
+                        f"from {n_teacher_prompts}/{bs} prompts, k={k}, m={m}"
                     )
 
                     # ==========================================================
@@ -920,7 +1247,7 @@ class SelfTeachRayPPOTrainer(RayPPOTrainer):
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            num_repeat=k,  # k == m, both teacher and student groups use this size
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
@@ -1089,10 +1416,30 @@ class SelfTeachTaskRunner(TaskRunner):
 
         # Extract self-teach config
         st_cfg_raw = config.get("self_teach", {})
+        filter_val = st_cfg_raw.get("filter_a1_correct", None)
+        # Hydra may pass the string "null" or omit the key; normalize to None
+        if filter_val == "null" or filter_val == "":
+            filter_val = None
         self_teach_config = SelfTeachConfig(
             enabled=st_cfg_raw.get("enabled", False),
+            blind_teacher=st_cfg_raw.get("blind_teacher", False),
+            filter_a1_correct=filter_val,
+            num_feedbacks=st_cfg_raw.get("num_feedbacks", 6),
+            num_a2_per_feedback=st_cfg_raw.get("num_a2_per_feedback", 6),
+            train_teacher_only=st_cfg_raw.get("train_teacher_only", False),
+            leakage_detector=st_cfg_raw.get("leakage_detector", "heuristic"),
+            llm_judge_api_base=st_cfg_raw.get("llm_judge_api_base", None),
+            llm_judge_api_key=st_cfg_raw.get("llm_judge_api_key", None),
+            llm_judge_model=st_cfg_raw.get("llm_judge_model", "gemini-2.5-flash-lite"),
+            llm_judge_max_workers=st_cfg_raw.get("llm_judge_max_workers", 32),
+            llm_judge_timeout=st_cfg_raw.get("llm_judge_timeout", 30.0),
         )
-        print(f"[SelfTeach] Config: enabled={self_teach_config.enabled}")
+        print(
+            f"[SelfTeach] Config: enabled={self_teach_config.enabled}, "
+            f"blind_teacher={self_teach_config.blind_teacher}, "
+            f"filter_a1_correct={self_teach_config.filter_a1_correct}, "
+            f"k={self_teach_config.num_feedbacks}, m={self_teach_config.num_a2_per_feedback}"
+        )
 
         trainer = SelfTeachRayPPOTrainer(
             config=config,
