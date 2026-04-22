@@ -121,7 +121,7 @@ python3 -m attention_sparks_thinking.scripts.train \
     trainer.project_name='attention-sparks-thinking' \
     trainer.experiment_name="rhythm_run${RUN_TYPE}${EXP_SUFFIX:-}" \
     trainer.n_gpus_per_node=4 \
-    trainer.nnodes=2 \
+    trainer.nnodes=${NNODES:-2} \
     actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=0 \

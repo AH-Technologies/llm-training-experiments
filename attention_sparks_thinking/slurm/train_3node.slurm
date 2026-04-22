@@ -3,7 +3,7 @@
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=48:00:00
-#SBATCH --nodes=2
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -11,17 +11,17 @@
 #SBATCH --output=attention_sparks_thinking/logs/rhythm_%x_%j.log
 #SBATCH --error=attention_sparks_thinking/logs/rhythm_%x_%j.err
 
-# Attention-rhythm GRPO training (2-node, 8 GPUs) for Qwen3-4B.
+# Attention-rhythm GRPO training (3-node, 12 GPUs) for Qwen3-4B.
 #
 # Usage:
-#   sbatch --export=ALL,RUN_TYPE=A attention_sparks_thinking/slurm/train_2node.slurm
+#   sbatch --export=ALL,RUN_TYPE=A attention_sparks_thinking/slurm/train_3node.slurm
 
 set -e
 
 RUN_TYPE=${RUN_TYPE:?ERROR: RUN_TYPE not set. Use --export=ALL,RUN_TYPE=<A|B|C>}
 
 echo "=========================================="
-echo "Attention-Rhythm GRPO Training (2-node)"
+echo "Attention-Rhythm GRPO Training (3-node)"
 echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_NODELIST"
@@ -154,7 +154,7 @@ srun --nodes=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 --export=ALL \
 RAY_PIDS=$!
 sleep 30
 
-echo "Ray cluster status (expecting 2 nodes, 8 GPUs):"
+echo "Ray cluster status (expecting 3 nodes, 12 GPUs):"
 ray status --address="$HEAD_IP:$RAY_PORT" || echo "WARNING: ray status failed"
 python -c "
 import ray
@@ -162,7 +162,7 @@ ray.init(address='$HEAD_IP:$RAY_PORT')
 resources = ray.cluster_resources()
 print(f'Cluster resources: {resources}')
 num_gpus = resources.get('GPU', 0)
-assert num_gpus >= 8, f'Expected 8 GPUs, got {num_gpus}'
+assert num_gpus >= 12, f'Expected 12 GPUs, got {num_gpus}'
 print(f'Total GPUs: {num_gpus} -- OK')
 ray.shutdown()
 "

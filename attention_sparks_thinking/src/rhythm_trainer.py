@@ -25,7 +25,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 # ── Config path shared between driver and workers ──
-_CONFIG_PATH = f"/tmp/rhythm_trainer_config_{os.environ.get('SLURM_JOB_ID', 'default')}.pt"
+_CONFIG_PATH = f"/cluster/projects/nn12068k/haaklau/llm-training-experiments/attention_sparks_thinking/logs/rhythm_trainer_config_{os.environ.get('SLURM_JOB_ID', 'default')}.pt"
 
 
 # ═══════════════════════════════════════════════════════════════════════
