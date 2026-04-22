@@ -80,3 +80,8 @@ benchmarks/results/
 
 # One shot metrics results
 one_shot_metrics/entropy_profiling/results/
+attention_based_rewards/analysis/
+attention_based_rewards/plots/
+attention_based_rewards/merged_models_v2
+attention_based_rewards/results
+attention_based_rewards/data
