@@ -84,8 +84,11 @@ attention_based_rewards/analysis/
 attention_based_rewards/plots/
 attention_based_rewards/merged_models/
 attention_based_rewards/merged_models_v2/
-attention_based_rewards/results/
 attention_based_rewards/data/
+attention_based_rewards/docs/
+attention_sparks_thinking/analysis/
+attention_sparks_thinking/data/
+attention_sparks_thinking/logs/
 one_shot_metrics/results/
 
 reasoning_head_analysis/results/
