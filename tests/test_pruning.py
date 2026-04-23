@@ -89,3 +89,80 @@ class TestParseSkillsResponse:
             "skill two",
             "skill three",
         ]
+
+
+import json
+from unittest.mock import patch, MagicMock
+
+from s1.pruning.tag_skills import SkillIdentifier
+
+
+def _mock_response(content: str):
+    body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+class TestSkillIdentifier:
+    def setup_method(self):
+        self.identifier = SkillIdentifier(
+            api_base="https://api.example.com/v1",
+            api_key="test-key",
+            model="gemini-2.5-flash-lite",
+            max_workers=2,
+            timeout=5.0,
+        )
+
+    @patch("s1.pruning.tag_skills.urlopen")
+    def test_identify_single_returns_parsed_skills(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(
+            "<answer>solve linear eq: factor polynomials</answer>"
+        )
+        skills = self.identifier._identify_single(
+            question="2x+3=7", category="algebra"
+        )
+        assert skills == ["solve linear eq", "factor polynomials"]
+
+    @patch("s1.pruning.tag_skills.urlopen")
+    def test_identify_single_none_returns_empty(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response("<answer>None</answer>")
+        assert self.identifier._identify_single("Q", "algebra") == []
+
+    @patch("s1.pruning.tag_skills.urlopen")
+    def test_api_error_returns_empty_and_increments_error_count(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("timeout")
+        assert self.identifier._identify_single("Q", "algebra") == []
+        assert self.identifier._error_count == 1
+
+    @patch("s1.pruning.tag_skills.urlopen")
+    def test_payload_uses_temperature_zero(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response("<answer>None</answer>")
+        self.identifier._identify_single("Q", "algebra")
+        # Capture the Request that was passed to urlopen
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        assert body["temperature"] == 0.0
+        assert body["model"] == "gemini-2.5-flash-lite"
+
+    @patch("s1.pruning.tag_skills.urlopen")
+    def test_submit_collect_batch(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response("<answer>skill a</answer>"),
+            _mock_response("<answer>None</answer>"),
+            _mock_response("<answer>skill c: skill d</answer>"),
+        ]
+        self.identifier.submit_batch([
+            ("Q1", "algebra"),
+            ("Q2", "geometry"),
+            ("Q3", "number_theory"),
+        ])
+        results = self.identifier.collect_results()
+        assert results == [
+            ["skill a"],
+            [],
+            ["skill c", "skill d"],
+        ]
