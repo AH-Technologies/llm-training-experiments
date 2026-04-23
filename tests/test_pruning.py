@@ -324,3 +324,45 @@ class TestSkillAbundanceSelect:
         skills_path = self._write_skills(tmp_path, [2, 5])
         with pytest.raises(ValueError):
             skill_abundance_select(skills_path, n=3)
+
+
+from s1.pruning.prune import write_subset
+
+
+class TestWriteSubset:
+    def _write_input(self, tmp_path):
+        path = tmp_path / "s1k.parquet"
+        pq.write_table(
+            pa.table({
+                "question": [f"Q{i}" for i in range(10)],
+                "solution": [f"S{i}" for i in range(10)],
+                "thinking_trajectories": [[f"T{i}"] for i in range(10)],
+            }),
+            path,
+        )
+        return str(path)
+
+    def test_writes_subset_with_same_schema(self, tmp_path):
+        input_path = self._write_input(tmp_path)
+        output_path = tmp_path / "subset.parquet"
+        write_subset(
+            input_path=input_path,
+            output_path=str(output_path),
+            indices=[0, 3, 7],
+        )
+        out = pq.read_table(output_path)
+        assert out.column_names == ["question", "solution", "thinking_trajectories"]
+        assert out.column("question").to_pylist() == ["Q0", "Q3", "Q7"]
+        assert out.column("solution").to_pylist() == ["S0", "S3", "S7"]
+
+    def test_preserves_index_order(self, tmp_path):
+        input_path = self._write_input(tmp_path)
+        output_path = tmp_path / "subset.parquet"
+        # Intentionally unsorted input indices
+        write_subset(
+            input_path=input_path,
+            output_path=str(output_path),
+            indices=[7, 0, 3],
+        )
+        out = pq.read_table(output_path)
+        assert out.column("question").to_pylist() == ["Q7", "Q0", "Q3"]

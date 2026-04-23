@@ -7,9 +7,11 @@ Two strategies:
 
 from __future__ import annotations
 
+import argparse
 import random
 from typing import Iterable
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -42,3 +44,47 @@ def skill_abundance_select(skills_path: str, n: int) -> list[int]:
         zip(counts, indices), key=lambda pair: (-pair[0], pair[1])
     )
     return [idx for _, idx in ranked[:n]]
+
+
+def write_subset(input_path: str, output_path: str, indices: list[int]) -> None:
+    """Write a parquet containing only the given row indices from input_path,
+    preserving the order of `indices`.
+    """
+    table = pq.read_table(input_path)
+    # pa.Table.take preserves order; accepts any iterable of int indices
+    subset = table.take(pa.array(indices, type=pa.int64()))
+    pq.write_table(subset, output_path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Select a pruned subset of s1K for SFT."
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("random", "skill_abundance"),
+        required=True,
+    )
+    parser.add_argument("--n", type=int, required=True)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--input", default="data/s1K/s1k.parquet")
+    parser.add_argument(
+        "--skills",
+        default="data/s1K/s1k_skills.parquet",
+        help="Required for --strategy skill_abundance.",
+    )
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    if args.strategy == "random":
+        table = pq.read_table(args.input)
+        indices = random_select(pool_size=table.num_rows, n=args.n, seed=args.seed)
+    else:  # skill_abundance
+        indices = skill_abundance_select(args.skills, n=args.n)
+
+    write_subset(args.input, args.output, indices)
+    print(f"Wrote {len(indices)} rows ({args.strategy}, n={args.n}) to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
