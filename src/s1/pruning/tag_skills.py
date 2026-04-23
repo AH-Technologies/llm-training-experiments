@@ -83,7 +83,7 @@ class SkillIdentifier:
         api_base: str,
         api_key: str | None = None,
         model: str = "gemini-2.5-flash",
-        max_workers: int = 32,
+        max_workers: int = 16,
         timeout: float = 30.0,
     ):
         self.api_base = api_base.rstrip("/")
@@ -212,7 +212,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--model", default="gemini-2.5-flash")
-    parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
 
