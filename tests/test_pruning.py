@@ -166,3 +166,88 @@ class TestSkillIdentifier:
             [],
             ["skill c", "skill d"],
         ]
+
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from s1.pruning.tag_skills import tag_dataset
+
+
+class FakeIdentifier:
+    """Test double: returns deterministic skill lists keyed by category."""
+
+    def __init__(self, per_category_skills: dict[str, list[str]]):
+        self.per_category_skills = per_category_skills
+        self._last_calls: list[tuple[str, str]] = []
+        self._last_results: list[list[str]] = []
+
+    def submit_batch(self, calls):
+        self._last_calls = list(calls)
+        self._last_results = [
+            list(self.per_category_skills.get(category, []))
+            for _, category in calls
+        ]
+
+    def collect_results(self):
+        return self._last_results
+
+
+class TestTagDataset:
+    def test_writes_parquet_with_expected_schema(self, tmp_path):
+        input_path = tmp_path / "s1k.parquet"
+        output_path = tmp_path / "skills.parquet"
+        input_table = pa.table({
+            "question": ["Q1", "Q2", "Q3"],
+            "cot_type": ["math", "math", "science"],
+            "source_type": ["AIME", "Omni-MATH", "GPQA"],
+        })
+        pq.write_table(input_table, input_path)
+
+        identifier = FakeIdentifier({
+            "algebra": ["solve eq"],
+            "number_theory": [],
+            "geometry": [],
+            "precalculus": ["derivative"],
+            "probability": [],
+        })
+
+        tag_dataset(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            identifier=identifier,
+        )
+
+        out = pq.read_table(output_path).to_pydict()
+        assert out["index"] == [0, 1, 2]
+        assert out["question"] == ["Q1", "Q2", "Q3"]
+        assert out["cot_type"] == ["math", "math", "science"]
+        assert out["source_type"] == ["AIME", "Omni-MATH", "GPQA"]
+        assert out["skills_algebra"] == [["solve eq"]] * 3
+        assert out["skills_number_theory"] == [[]] * 3
+        assert out["skills_precalculus"] == [["derivative"]] * 3
+        # skill_count = sum of per-category list lengths = 1 + 1 = 2 for each row
+        assert out["skill_count"] == [2, 2, 2]
+
+    def test_issues_five_calls_per_row(self, tmp_path):
+        input_path = tmp_path / "s1k.parquet"
+        output_path = tmp_path / "skills.parquet"
+        pq.write_table(
+            pa.table({
+                "question": ["Qa", "Qb"],
+                "cot_type": ["math", "math"],
+                "source_type": ["s", "s"],
+            }),
+            input_path,
+        )
+        identifier = FakeIdentifier({c: [] for c in SKILL_CATEGORIES})
+        tag_dataset(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            identifier=identifier,
+        )
+        # 2 rows × 5 categories = 10 calls
+        assert len(identifier._last_calls) == 10
+        # Calls ordered as (Qa,algebra), (Qa,number_theory), ..., (Qb,...)
+        expected = [(q, c) for q in ("Qa", "Qb") for c in SKILL_CATEGORIES]
+        assert identifier._last_calls == expected

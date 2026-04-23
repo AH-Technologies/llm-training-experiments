@@ -10,11 +10,15 @@ OpenAI-compatible API pattern as `src/self_teach/leakage_judge.py`.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.request import Request, urlopen
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 SKILL_CATEGORIES: tuple[str, ...] = (
     "algebra",
@@ -129,3 +133,74 @@ class SkillIdentifier:
                 f"API calls failed (treated as empty skill list)"
             )
         return results
+
+
+def tag_dataset(input_path: str, output_path: str, identifier) -> None:
+    """Tag every row of the input parquet with skills across all 5 categories.
+
+    The `identifier` is any object exposing `submit_batch(calls)` and
+    `collect_results()` — production callers pass a `SkillIdentifier`, tests
+    pass a fake.
+    """
+    table = pq.read_table(input_path)
+    questions = table.column("question").to_pylist()
+    cot_type = table.column("cot_type").to_pylist()
+    source_type = table.column("source_type").to_pylist()
+
+    # Build (question, category) call list — row-major over rows, then categories
+    calls = [(q, c) for q in questions for c in SKILL_CATEGORIES]
+    identifier.submit_batch(calls)
+    flat_results = identifier.collect_results()
+
+    n_cats = len(SKILL_CATEGORIES)
+    per_row = [
+        flat_results[i * n_cats : (i + 1) * n_cats] for i in range(len(questions))
+    ]
+
+    columns = {
+        "index": list(range(len(questions))),
+        "question": questions,
+        "cot_type": cot_type,
+        "source_type": source_type,
+    }
+    for ci, cat in enumerate(SKILL_CATEGORIES):
+        columns[f"skills_{cat}"] = [row[ci] for row in per_row]
+    columns["skill_count"] = [sum(len(lst) for lst in row) for row in per_row]
+
+    pq.write_table(pa.table(columns), output_path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Tag s1K problems with paper-native salient math skills."
+    )
+    parser.add_argument("--input", default="data/s1K/s1k.parquet")
+    parser.add_argument("--output", default="data/s1K/s1k_skills.parquet")
+    parser.add_argument(
+        "--api-base",
+        default=os.environ.get(
+            "LLM_JUDGE_API_BASE",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+    )
+    parser.add_argument("--model", default="gemini-2.5-flash-lite")
+    parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    args = parser.parse_args()
+
+    identifier = SkillIdentifier(
+        api_base=args.api_base,
+        model=args.model,
+        max_workers=args.workers,
+        timeout=args.timeout,
+    )
+    tag_dataset(
+        input_path=args.input,
+        output_path=args.output,
+        identifier=identifier,
+    )
+    print(f"Wrote tagged skills to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
