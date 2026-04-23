@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import random
-from typing import Iterable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
