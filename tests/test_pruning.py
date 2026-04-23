@@ -251,3 +251,36 @@ class TestTagDataset:
         # Calls ordered as (Qa,algebra), (Qa,number_theory), ..., (Qb,...)
         expected = [(q, c) for q in ("Qa", "Qb") for c in SKILL_CATEGORIES]
         assert identifier._last_calls == expected
+
+
+from s1.pruning.prune import random_select
+
+
+class TestRandomSelect:
+    def test_returns_n_distinct_indices(self):
+        selected = random_select(pool_size=100, n=10, seed=42)
+        assert len(selected) == 10
+        assert len(set(selected)) == 10
+
+    def test_indices_in_range(self):
+        selected = random_select(pool_size=100, n=10, seed=42)
+        assert all(0 <= i < 100 for i in selected)
+
+    def test_deterministic_given_seed(self):
+        a = random_select(pool_size=1000, n=100, seed=42)
+        b = random_select(pool_size=1000, n=100, seed=42)
+        assert a == b
+
+    def test_different_seeds_give_different_selections(self):
+        a = random_select(pool_size=1000, n=100, seed=42)
+        b = random_select(pool_size=1000, n=100, seed=43)
+        assert a != b
+
+    def test_n_equals_pool_returns_all_indices(self):
+        selected = random_select(pool_size=10, n=10, seed=42)
+        assert sorted(selected) == list(range(10))
+
+    def test_n_greater_than_pool_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            random_select(pool_size=10, n=11, seed=42)
