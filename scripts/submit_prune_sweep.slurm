@@ -2,7 +2,7 @@
 #SBATCH --job-name=s1-prune-sweep
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --time=18:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -144,56 +144,62 @@ for cell in "${CELLS[@]}"; do
         continue
     fi
 
-    # Step 2a: prune
-    if [ ! -f "$PRUNED_PARQUET" ]; then
-        python -m s1.pruning.prune \
-            --strategy "$STRATEGY" \
-            --n "$N" \
-            --seed 42 \
-            --input data/s1K/s1k.parquet \
-            --skills "$SKILLS_PATH" \
-            --output "$PRUNED_PARQUET"
-    fi
+    # Per-cell subshell: a failure here won't kill other cells.
+    if ! (
+        set -e
 
-    # Step 2b: format for SFT
-    if [ ! -f "$SFT_PARQUET" ]; then
-        python scripts/prepare_s1k_sft.py \
-            --input "$PRUNED_PARQUET" \
-            --output "$SFT_PARQUET"
-    fi
-
-    # Step 2c: SFT (reuses run_sft_s1k.sh)
-    if [ ! -d "$OUTPUT_DIR" ]; then
-        export NUM_EPOCHS=$EPOCHS
-        export SAVE_EVERY=$EPOCHS   # save only at end
-        export SEQ_LENGTH=16384
-        export TP_DEGREE=1
-        export FSDP_OFFLOAD=1
-        export TRAIN_FILE="$SFT_PARQUET"
-        export OUTPUT_DIR="$OUTPUT_DIR"
-        bash scripts/run_sft_s1k.sh \
-            --wandb-run-name "s1_prune_${CELL_TAG}_steps315"
-    fi
-
-    # Step 2d: eval on MATH500 + AIME24 + GPQA-Diamond
-    if [ ! -f "$EVAL_OUT" ]; then
-        LATEST_CKPT=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
-        if [ -z "$LATEST_CKPT" ]; then
-            echo "ERROR: no checkpoint found in $OUTPUT_DIR — skipping eval."
-            continue
+        # Step 2a: prune
+        if [ ! -f "$PRUNED_PARQUET" ]; then
+            python -m s1.pruning.prune \
+                --strategy "$STRATEGY" \
+                --n "$N" \
+                --seed 42 \
+                --input data/s1K/s1k.parquet \
+                --skills "$SKILLS_PATH" \
+                --output "$PRUNED_PARQUET"
         fi
-        python -m s1.eval \
-            --model "$LATEST_CKPT" \
-            --benchmarks math500 aime24 gpqa \
-            --output-dir eval_results
-        # eval.py writes eval_<checkpoint_basename>.json; rename to our canonical cell-tagged name
-        CKPT_NAME=$(basename "$LATEST_CKPT")
-        if [ -f "eval_results/eval_${CKPT_NAME}.json" ]; then
-            mv "eval_results/eval_${CKPT_NAME}.json" "$EVAL_OUT"
-        else
-            echo "ERROR: eval did not produce eval_results/eval_${CKPT_NAME}.json"
-            continue
+
+        # Step 2b: format for SFT
+        if [ ! -f "$SFT_PARQUET" ]; then
+            python scripts/prepare_s1k_sft.py \
+                --input "$PRUNED_PARQUET" \
+                --output "$SFT_PARQUET"
         fi
+
+        # Step 2c: SFT (reuses run_sft_s1k.sh)
+        if [ ! -d "$OUTPUT_DIR" ]; then
+            export NUM_EPOCHS=$EPOCHS
+            export SAVE_EVERY=$EPOCHS   # save only at end
+            export SEQ_LENGTH=16384
+            export TP_DEGREE=1
+            export FSDP_OFFLOAD=1
+            export TRAIN_FILE="$SFT_PARQUET"
+            export OUTPUT_DIR="$OUTPUT_DIR"
+            bash scripts/run_sft_s1k.sh \
+                --wandb-run-name "s1_prune_${CELL_TAG}_steps315"
+        fi
+
+        # Step 2d: eval on MATH500 + AIME24 + GPQA-Diamond
+        if [ ! -f "$EVAL_OUT" ]; then
+            LATEST_CKPT=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
+            if [ -z "$LATEST_CKPT" ]; then
+                echo "ERROR: no checkpoint found in $OUTPUT_DIR"
+                exit 1
+            fi
+            python -m s1.eval \
+                --model "$LATEST_CKPT" \
+                --benchmarks math500 aime24 gpqa \
+                --output-dir eval_results
+            CKPT_NAME=$(basename "$LATEST_CKPT")
+            if [ -f "eval_results/eval_${CKPT_NAME}.json" ]; then
+                mv "eval_results/eval_${CKPT_NAME}.json" "$EVAL_OUT"
+            else
+                echo "ERROR: eval did not produce eval_results/eval_${CKPT_NAME}.json"
+                exit 1
+            fi
+        fi
+    ); then
+        echo "Cell $CELL_TAG FAILED — continuing to next cell"
     fi
 done
 
