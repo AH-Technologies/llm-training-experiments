@@ -4,6 +4,7 @@ from s1.pruning.tag_skills import (
     SKILL_CATEGORIES,
     PROMPT_TEMPLATE,
     build_prompt,
+    parse_skills_response,
 )
 
 
@@ -38,3 +39,53 @@ class TestPromptBuilder:
         prompt = build_prompt(category="geometry", question="Q")
         assert ":" in prompt  # paper: "separate the concepts or skills with :"
         assert "None" in prompt  # paper: "if there is no skills ... answer with None"
+
+
+class TestParseSkillsResponse:
+    def test_extracts_skills_between_answer_tags(self):
+        raw = "<answer>solve linear equations: factor polynomials</answer>"
+        assert parse_skills_response(raw) == [
+            "solve linear equations",
+            "factor polynomials",
+        ]
+
+    def test_none_returns_empty_list(self):
+        assert parse_skills_response("<answer>None</answer>") == []
+
+    def test_none_case_insensitive(self):
+        assert parse_skills_response("<answer>none</answer>") == []
+        assert parse_skills_response("<answer> NONE </answer>") == []
+
+    def test_lowercases_skills(self):
+        raw = "<answer>Solve Quadratics : Factor Polynomials</answer>"
+        assert parse_skills_response(raw) == [
+            "solve quadratics",
+            "factor polynomials",
+        ]
+
+    def test_strips_whitespace_around_skills(self):
+        raw = "<answer>  skill one  :  skill two  </answer>"
+        assert parse_skills_response(raw) == ["skill one", "skill two"]
+
+    def test_drops_empty_tokens(self):
+        raw = "<answer>one: : two</answer>"
+        assert parse_skills_response(raw) == ["one", "two"]
+
+    def test_drops_literal_none_tokens_in_list(self):
+        raw = "<answer>one : None : two</answer>"
+        assert parse_skills_response(raw) == ["one", "two"]
+
+    def test_missing_tags_returns_empty(self):
+        assert parse_skills_response("no tags here") == []
+
+    def test_ignores_text_outside_tags(self):
+        raw = "Sure! <answer>skill a: skill b</answer> Hope that helps."
+        assert parse_skills_response(raw) == ["skill a", "skill b"]
+
+    def test_multiline_content(self):
+        raw = "<answer>skill one:\n skill two\n:skill three</answer>"
+        assert parse_skills_response(raw) == [
+            "skill one",
+            "skill two",
+            "skill three",
+        ]

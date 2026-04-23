@@ -10,6 +10,8 @@ OpenAI-compatible API pattern as `src/self_teach/leakage_judge.py`.
 
 from __future__ import annotations
 
+import re
+
 SKILL_CATEGORIES: tuple[str, ...] = (
     "algebra",
     "number_theory",
@@ -34,3 +36,27 @@ Question:
 def build_prompt(category: str, question: str) -> str:
     """Format the paper's Table 8 prompt for one (problem, category) call."""
     return PROMPT_TEMPLATE.format(category=category, question=question)
+
+
+_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+
+
+def parse_skills_response(raw: str) -> list[str]:
+    """Extract the skill list from a judge response.
+
+    Paper's format: `<answer>skill1 : skill2 : ...</answer>` or `<answer>None</answer>`.
+    Returns a lowercased, whitespace-stripped list with empty/None tokens removed.
+    """
+    m = _ANSWER_RE.search(raw)
+    if not m:
+        return []
+    inside = m.group(1).strip()
+    if inside.lower() == "none":
+        return []
+    skills: list[str] = []
+    for part in inside.split(":"):
+        token = part.strip().lower()
+        if not token or token == "none":
+            continue
+        skills.append(token)
+    return skills
