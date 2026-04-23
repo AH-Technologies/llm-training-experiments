@@ -185,7 +185,15 @@ for cell in "${CELLS[@]}"; do
         python -m s1.eval \
             --model "$LATEST_CKPT" \
             --benchmarks math500 aime24 gpqa \
-            --output "$EVAL_OUT"
+            --output-dir eval_results
+        # eval.py writes eval_<checkpoint_basename>.json; rename to our canonical cell-tagged name
+        CKPT_NAME=$(basename "$LATEST_CKPT")
+        if [ -f "eval_results/eval_${CKPT_NAME}.json" ]; then
+            mv "eval_results/eval_${CKPT_NAME}.json" "$EVAL_OUT"
+        else
+            echo "ERROR: eval did not produce eval_results/eval_${CKPT_NAME}.json"
+            continue
+        fi
     fi
 done
 
@@ -199,12 +207,13 @@ for path in sorted(glob.glob("eval_results/s1_prune_*.json")):
     cell = os.path.basename(path).replace("s1_prune_", "").replace(".json", "")
     # cell = "<strategy>_n<N>"
     strategy, n_part = cell.rsplit("_n", 1)
+    results = data.get("results", {})
     row = {
         "strategy": strategy,
         "n": int(n_part),
-        "math500": data.get("math500"),
-        "aime24": data.get("aime24"),
-        "gpqa": data.get("gpqa"),
+        "math500": results.get("math500", {}).get("accuracy"),
+        "aime24": results.get("aime24", {}).get("accuracy"),
+        "gpqa": results.get("gpqa", {}).get("accuracy"),
     }
     scores = [v for v in (row["math500"], row["aime24"], row["gpqa"]) if v is not None]
     row["avg"] = sum(scores) / len(scores) if scores else None
