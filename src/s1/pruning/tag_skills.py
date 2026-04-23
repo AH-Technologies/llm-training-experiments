@@ -4,7 +4,7 @@ Paper-native: 5 math categories with Prealgebra+Algebra+IntermediateAlgebra
 merged into `algebra` per §5 to eliminate overlaps. Uses the paper's
 Table 8 prompt template verbatim, one call per (problem, category) pair.
 
-Judge model is Gemini 2.5 Flash-Lite (paper uses Qwen2.5-72B); same
+Judge model is Gemini 2.5 Flash (paper uses Qwen2.5-72B); same
 OpenAI-compatible API pattern as `src/self_teach/leakage_judge.py`.
 """
 
@@ -79,7 +79,7 @@ class SkillIdentifier:
         self,
         api_base: str,
         api_key: str | None = None,
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-2.5-flash",
         max_workers: int = 32,
         timeout: float = 30.0,
     ):
@@ -193,7 +193,7 @@ def main() -> None:
             "https://generativelanguage.googleapis.com/v1beta/openai",
         ),
     )
-    parser.add_argument("--model", default="gemini-2.5-flash-lite")
+    parser.add_argument("--model", default="gemini-2.5-flash")
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
