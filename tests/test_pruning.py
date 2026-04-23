@@ -253,7 +253,7 @@ class TestTagDataset:
         assert identifier._last_calls == expected
 
 
-from s1.pruning.prune import random_select
+from s1.pruning.prune import random_select, skill_abundance_select
 
 
 class TestRandomSelect:
@@ -284,3 +284,43 @@ class TestRandomSelect:
         import pytest
         with pytest.raises(ValueError):
             random_select(pool_size=10, n=11, seed=42)
+
+
+class TestSkillAbundanceSelect:
+    def _write_skills(self, tmp_path, skill_counts: list[int]):
+        path = tmp_path / "skills.parquet"
+        pq.write_table(
+            pa.table({
+                "index": list(range(len(skill_counts))),
+                "skill_count": skill_counts,
+            }),
+            path,
+        )
+        return str(path)
+
+    def test_picks_top_by_skill_count(self, tmp_path):
+        skills_path = self._write_skills(tmp_path, [1, 5, 3, 7, 2])
+        selected = skill_abundance_select(skills_path, n=2)
+        assert selected == [3, 1]  # indices sorted by count desc
+
+    def test_ties_broken_by_index_ascending(self, tmp_path):
+        skills_path = self._write_skills(tmp_path, [4, 4, 4, 4, 1])
+        selected = skill_abundance_select(skills_path, n=3)
+        assert selected == [0, 1, 2]
+
+    def test_deterministic(self, tmp_path):
+        skills_path = self._write_skills(tmp_path, [3, 1, 4, 1, 5, 9, 2, 6])
+        a = skill_abundance_select(skills_path, n=4)
+        b = skill_abundance_select(skills_path, n=4)
+        assert a == b
+
+    def test_n_equals_pool_returns_all(self, tmp_path):
+        skills_path = self._write_skills(tmp_path, [2, 5, 1])
+        selected = skill_abundance_select(skills_path, n=3)
+        assert sorted(selected) == [0, 1, 2]
+
+    def test_n_greater_than_pool_raises(self, tmp_path):
+        import pytest
+        skills_path = self._write_skills(tmp_path, [2, 5])
+        with pytest.raises(ValueError):
+            skill_abundance_select(skills_path, n=3)
