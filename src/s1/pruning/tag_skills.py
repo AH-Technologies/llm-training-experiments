@@ -13,8 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random as _random
 import re
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pyarrow as pa
@@ -104,24 +107,35 @@ class SkillIdentifier:
             # Harmless on non-Gemini models (unknown field is ignored).
             "reasoning_effort": "none",
         }).encode()
-        req = Request(
-            f"{self.api_base}/chat/completions",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                body = json.loads(resp.read())
-            content = body["choices"][0]["message"]["content"]
-            self._call_count += 1
-            return parse_skills_response(content)
-        except Exception:
-            self._call_count += 1
-            self._error_count += 1
-            return []
+        # Retry with exponential backoff + jitter on 429s and 5xx. Gemini Flash
+        # rate-limits bursts; this keeps the job moving instead of silently
+        # dropping a call on the first 429.
+        for attempt in range(5):
+            req = Request(
+                f"{self.api_base}/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+            )
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read())
+                content = body["choices"][0]["message"]["content"]
+                self._call_count += 1
+                return parse_skills_response(content)
+            except HTTPError as e:
+                if e.code == 429 or 500 <= e.code < 600:
+                    if attempt < 4:
+                        time.sleep(2 ** attempt + _random.random())
+                        continue
+                break
+            except Exception:
+                break
+        self._call_count += 1
+        self._error_count += 1
+        return []
 
     def submit_batch(self, calls: list[tuple[str, str]]) -> None:
         """Submit (question, category) pairs asynchronously."""
