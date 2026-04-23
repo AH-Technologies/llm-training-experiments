@@ -97,8 +97,12 @@ class SkillIdentifier:
         payload = json.dumps({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 400,
+            "max_tokens": 800,
             "temperature": 0.0,
+            # Classification task — disable Gemini's hidden reasoning so the
+            # `<answer>...</answer>` response is not truncated mid-token.
+            # Harmless on non-Gemini models (unknown field is ignored).
+            "reasoning_effort": "none",
         }).encode()
         req = Request(
             f"{self.api_base}/chat/completions",
