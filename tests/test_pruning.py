@@ -252,6 +252,35 @@ class TestTagDataset:
         expected = [(q, c) for q in ("Qa", "Qb") for c in SKILL_CATEGORIES]
         assert identifier._last_calls == expected
 
+    def test_raises_on_widespread_api_failure(self, tmp_path):
+        input_path = tmp_path / "s1k.parquet"
+        output_path = tmp_path / "skills.parquet"
+        pq.write_table(
+            pa.table({
+                "question": [f"Q{i}" for i in range(4)],
+                "cot_type": ["math"] * 4,
+                "source_type": ["s"] * 4,
+            }),
+            input_path,
+        )
+
+        class FailingIdentifier(FakeIdentifier):
+            def submit_batch(self, calls):
+                super().submit_batch(calls)
+                # Simulate: every call returned empty list, and most errored
+                self._error_count = len(calls)  # >50% threshold
+                self._call_count = len(calls)
+
+        identifier = FailingIdentifier({c: [] for c in SKILL_CATEGORIES})
+
+        import pytest
+        with pytest.raises(RuntimeError, match="Skill tagging failed"):
+            tag_dataset(
+                input_path=str(input_path),
+                output_path=str(output_path),
+                identifier=identifier,
+            )
+
 
 from s1.pruning.prune import random_select, skill_abundance_select
 

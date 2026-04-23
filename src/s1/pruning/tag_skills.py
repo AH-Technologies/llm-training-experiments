@@ -152,6 +152,16 @@ def tag_dataset(input_path: str, output_path: str, identifier) -> None:
     identifier.submit_batch(calls)
     flat_results = identifier.collect_results()
 
+    # Hard-abort on widespread API failure to prevent silent data corruption
+    # (all-zero skill_counts would degrade skill_abundance_select to dataset order).
+    error_count = getattr(identifier, "_error_count", 0)
+    call_count = getattr(identifier, "_call_count", len(calls))
+    if call_count > 0 and error_count > call_count // 2:
+        raise RuntimeError(
+            f"Skill tagging failed: {error_count}/{call_count} API calls errored. "
+            "Check LLM_JUDGE_API_KEY and API connectivity before continuing."
+        )
+
     n_cats = len(SKILL_CATEGORIES)
     per_row = [
         flat_results[i * n_cats : (i + 1) * n_cats] for i in range(len(questions))
