@@ -59,7 +59,9 @@ TRAINER_ARGS="\
     --sequence-length ${SEQ_LENGTH} \
     --lr 1e-5 \
     --warmup-ratio 0.05 \
-    --weight-decay 1e-4 \
+    --weight-decay ${WEIGHT_DECAY:-1e-4} \
+    ${CPU_OFFLOAD:+--cpu-offload} \
+    ${FSDP_OFFLOAD:+--fsdp-offload} \
     --tp-degree ${TP_DEGREE} \
     --save-every-n-epochs ${SAVE_EVERY} \
     --log-every-n-steps 1 \

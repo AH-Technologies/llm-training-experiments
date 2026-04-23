@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=s1-grok-32b
+#SBATCH --job-name=s1-hf-32b
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
 #SBATCH --time=12:00:00
@@ -8,22 +8,18 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=800G
-#SBATCH --output=logs/s1-grok-%j.out
-#SBATCH --error=logs/s1-grok-%j.err
+#SBATCH --output=logs/s1-hf-%j.out
+#SBATCH --error=logs/s1-hf-%j.err
 
-# S1 Grokking: Qwen2.5-32B-Instruct on s1K — 50 epochs (10x paper run)
-# Tests whether extended training produces a grokking-like effect.
-# wd=1e-3 (10x paper), cpu offload enabled.
+# S1 Grokking via HuggingFace Trainer + accelerate FSDP.
+# Replaces the custom torchtune trainer which had memory-scaling issues at long seq.
 #
-# Saves 10 checkpoints (every 5 epochs) for post-hoc eval.
-#
-# Usage:
-#   sbatch scripts/submit_s1_sft_grokking.slurm
+# 50 epochs (10x paper), wd=1e-3 (10x paper), seq=16384 (~1 MATH500 pt below paper).
 
 set -e
 
 echo "=========================================="
-echo "S1 Grokking: Qwen2.5-32B on s1K (50 epochs)"
+echo "S1 Grokking HF Trainer: Qwen2.5-32B on s1K"
 echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_JOB_NODELIST"
@@ -33,7 +29,6 @@ echo "=========================================="
 
 mkdir -p logs checkpoints data
 
-# Load modules
 module load NRIS/GPU
 module load Python/3.12.3-GCCcore-13.3.0
 module load aws-ofi-nccl/1.14.1-GCCcore-13.3.0-CUDA-12.6.0
@@ -84,7 +79,6 @@ MATH_LIBS=/cluster/software/NRIS.old/neoverse_v2/software/NVHPC/25.3-CUDA-12.8.0
 export LIBRARY_PATH=${MATH_LIBS}:${LIBRARY_PATH}
 export LD_LIBRARY_PATH=${MATH_LIBS}:${LD_LIBRARY_PATH}
 
-# --- Other ---
 export TIKTOKEN_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_ENCODINGS_BASE=$PROJECT_DIR/tiktoken_encodings
 export TIKTOKEN_RS_CACHE_DIR=$PROJECT_DIR/tiktoken_encodings
@@ -92,15 +86,22 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 unset ROCR_VISIBLE_DEVICES
 
+export PYTHONPATH=${PROJECT_DIR}/src:${PROJECT_DIR}:${PYTHONPATH}
+
 # --- Multi-node setup ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
 
+NUM_NODES=$SLURM_NNODES
+GPUS_PER_NODE=$SLURM_GPUS_ON_NODE
+WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "World size: $WORLD_SIZE (${NUM_NODES} nodes x ${GPUS_PER_NODE} GPUs)"
 echo "HF cache: $HF_HOME"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-# ---- Background GPU/memory monitor (every 120s) ----
+# ---- Background GPU/memory monitor ----
 (while true; do
     echo "--- GPU monitor $(date) ---"
     nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu --format=csv,noheader
@@ -109,25 +110,40 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 done) &
 MONITOR_PID=$!
 
-# ---- Prepare data if needed ----
 if [ ! -f "data/s1K/s1k_sft.parquet" ]; then
     echo "Preparing s1K SFT data..."
     python scripts/prepare_s1k_sft.py
 fi
 
-# ---- Run training ----
-echo "Starting S1 grokking training (50 epochs)..."
-export NUM_EPOCHS=50
-export SAVE_EVERY=5
-export WEIGHT_DECAY=1e-3
-export SEQ_LENGTH=16384
-export TP_DEGREE=1
-export FSDP_OFFLOAD=1
-export OUTPUT_DIR="checkpoints/s1_grokking_qwen32b"
-export HF_REPO="alexauren/s1-grokking-qwen32b"
-bash scripts/run_sft_s1k.sh --wandb-run-name "s1_grokking_50ep_wd1e3_seq16k"
+# ---- Launch via accelerate (srun per node) ----
+ACCEL_CMD="accelerate launch \
+    --config_file ${PROJECT_DIR}/configs/accelerate_fsdp.yaml \
+    --num_processes=${WORLD_SIZE} \
+    --num_machines=${NUM_NODES} \
+    --main_process_ip=${MASTER_ADDR} \
+    --main_process_port=${MASTER_PORT} \
+    --machine_rank=\${SLURM_PROCID} \
+    -m s1.sft_hf \
+    --model Qwen/Qwen2.5-32B-Instruct \
+    --train-file data/s1K/s1k_sft.parquet \
+    --output-dir checkpoints/s1_grokking_qwen32b_hf \
+    --num-epochs 50 \
+    --batch-size 16 \
+    --per-device-batch-size 1 \
+    --sequence-length 16384 \
+    --lr 1e-5 \
+    --warmup-ratio 0.05 \
+    --weight-decay 1e-3 \
+    --max-grad-norm 1.0 \
+    --save-every-n-epochs 5 \
+    --wandb-project s1-qwen32b-sft \
+    --wandb-run-name s1_hf_50ep_wd1e3_seq16k \
+    --hf-repo alexauren/s1-grokking-qwen32b-hf \
+    --seed 42"
 
-# Cleanup
+srun --nodes=${NUM_NODES} --ntasks-per-node=1 --export=ALL \
+    bash -c "unset ROCR_VISIBLE_DEVICES; ${ACCEL_CMD}"
+
 kill $MONITOR_PID 2>/dev/null || true
 wait
 

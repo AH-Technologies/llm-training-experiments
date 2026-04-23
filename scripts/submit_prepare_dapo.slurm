@@ -44,7 +44,7 @@ if [ -f "$PROJECT_DIR/.env" ]; then
     set +a
 fi
 
-export HF_HOME=/cluster/projects/nn12068k/alexaau/llm-training-experiments/.cache/huggingface
+export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface
 
 cd $PROJECT_DIR
 

@@ -49,7 +49,7 @@ if [ -f "$PROJECT_DIR/.env" ]; then
     set +a
 fi
 
-export HF_HOME=/cluster/projects/nn12068k/alexaau/llm-training-experiments/.cache/huggingface
+export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface
 export VLLM_USE_V1=1
 export TOKENIZERS_PARALLELISM=false
 

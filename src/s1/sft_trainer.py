@@ -46,6 +46,7 @@ from torchtune.training import (
     prepare_mha_for_tp,
     set_activation_checkpointing,
 )
+from torchtune.modules.loss import CEWithChunkedOutputLoss
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor.parallel import parallelize_module
 from torchtune.modules import TransformerSelfAttentionLayer
@@ -218,7 +219,10 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--tp-degree", type=int, default=4)
-    parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument("--cpu-offload", action="store_true",
+                        help="Offload FSDP params + activations to CPU")
+    parser.add_argument("--fsdp-offload", action="store_true",
+                        help="Offload FSDP params/grads to CPU (no activation offload)")
     parser.add_argument("--save-every-n-epochs", type=int, default=5)
     parser.add_argument("--log-every-n-steps", type=int, default=1)
     parser.add_argument("--wandb-project", default="s1-qwen32b-sft")
@@ -302,7 +306,7 @@ def main() -> None:
 
     # Apply FSDP2
     fsdp_kwargs = {"reshard_after_forward": True, "mesh": dp_mesh}
-    if args.cpu_offload:
+    if args.cpu_offload or args.fsdp_offload:
         from torch.distributed.fsdp import CPUOffloadPolicy
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=False)
 
@@ -320,14 +324,17 @@ def main() -> None:
     # Broadcast weights
     if is_rank0:
         print(f"[s1] Broadcasting weights ...")
-    _load_from_rank0_broadcast(model, full_model_sd, device, rank, strict=False, cpu_offload=args.cpu_offload)
+    _load_from_rank0_broadcast(model, full_model_sd, device, rank, strict=False, cpu_offload=args.cpu_offload or args.fsdp_offload)
     del full_model_sd
     if is_rank0:
         gpu_alloc = torch.cuda.memory_allocated() / 1024**3
         print(f"[s1] Weights loaded. GPU: {gpu_alloc:.1f} GB allocated")
 
-    # Activation checkpointing
+    # Activation checkpointing (after FSDP to preserve state dict key naming)
     set_activation_checkpointing(model, auto_wrap_policy={TransformerSelfAttentionLayer})
+
+    # Chunked output head — avoids materialising full [b, s, vocab] fp32 logits
+    model.set_num_output_chunks(32)
 
     # ---- Tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -359,9 +366,27 @@ def main() -> None:
     )
     scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
 
+    if is_rank0:
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        resv = torch.cuda.memory_reserved() / 1024**3
+        print(f"[s1-mem] After optimizer init: alloc={alloc:.1f} GiB, reserved={resv:.1f} GiB")
+        # Check param sharding
+        total_param_bytes = 0
+        for n, p in model.named_parameters():
+            total_param_bytes += p.data.numel() * p.data.element_size()
+        print(f"[s1-mem] Total param memory: {total_param_bytes / 1024**3:.1f} GiB")
+        # Show first layer shape as sanity check
+        for n, p in model.named_parameters():
+            if "layers.0.attn.q_proj" in n:
+                print(f"[s1-mem] {n}: shape={list(p.shape)}, dtype={p.dtype}")
+                from torch.distributed._tensor import DTensor
+                if isinstance(p, DTensor):
+                    print(f"[s1-mem]   -> DTensor local_shape={list(p._local_tensor.shape)}, placements={p.placements}")
+                break
+
     # ---- Training loop ----
     model.train()
-    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+    loss_fn = CEWithChunkedOutputLoss(num_output_chunks=32, ignore_index=IGNORE_INDEX)
 
     act_offload_ctx = OffloadActivations(use_pin_memory=False) if args.cpu_offload else contextlib.nullcontext()
 
@@ -383,6 +408,12 @@ def main() -> None:
             optimizer.zero_grad()
             accum_loss = torch.tensor(0.0, device=device)
 
+            if global_step == 0 and is_rank0:
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                resv = torch.cuda.memory_reserved() / 1024**3
+                print(f"[s1-mem] Before first forward: alloc={alloc:.1f} GiB, reserved={resv:.1f} GiB")
+
+
             for _ in range(grad_accum_steps):
                 try:
                     batch = next(data_iter)
@@ -395,14 +426,15 @@ def main() -> None:
                 input_ids = input_ids.expand(args.micro_batch_size, -1)
                 labels = labels.expand(args.micro_batch_size, -1)
 
+                # Shift labels: predict token i+1 from position i. Pad last with ignore.
+                shifted_labels = torch.full_like(labels, IGNORE_INDEX)
+                shifted_labels[:, :-1] = labels[:, 1:]
+
                 with act_offload_ctx, torch.autocast("cuda", dtype=torch.bfloat16):
-                    logits = model(input_ids)
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    loss = loss_fn(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                    )
+                    # Model returns list of chunks (set_num_output_chunks above)
+                    logit_chunks = model(input_ids)
+                    loss = loss_fn(logit_chunks, shifted_labels)
+                    del logit_chunks
                     loss = loss / grad_accum_steps
 
                 loss.backward()
