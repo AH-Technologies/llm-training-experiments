@@ -69,6 +69,18 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--save-every-n-epochs", type=int, default=5)
+    p.add_argument(
+        "--save-final-only",
+        action="store_true",
+        help=(
+            "Skip all periodic saves during training and write a single final "
+            "checkpoint to output_dir/ after train() returns. Use for one-shot "
+            "SFT runs (pruning sweep cells) where only the final model matters; "
+            "saves ~130 GiB per cell vs the default 'steps' strategy and avoids "
+            "filling the shared filesystem. Default behavior (steps + final "
+            "save_model) is preserved when the flag is omitted — grokking et al."
+        ),
+    )
     p.add_argument("--wandb-project", default="s1-qwen32b-sft")
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--hf-repo", default=None)
@@ -136,6 +148,13 @@ def main():
     save_steps_per_epoch = len(ds) // (world_size * args.per_device_batch_size * grad_accum)
     save_steps = max(1, save_steps_per_epoch * args.save_every_n_epochs)
 
+    # save_strategy="no" with --save-final-only: no periodic checkpoint-N dirs
+    # during training. The single final save to output_dir/ is done explicitly
+    # after trainer.train() returns. Prevents the common failure mode where
+    # the scheduled save at step N coincides with the final step and leaves
+    # two checkpoints on disk (save_total_limit cleanup races with shutdown).
+    save_strategy = "no" if args.save_final_only else "steps"
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -152,7 +171,7 @@ def main():
         bf16=True,
         # AC is handled via fsdp_activation_checkpointing in the accelerate FSDP config
         gradient_checkpointing=False,
-        save_strategy="steps",
+        save_strategy=save_strategy,
         save_steps=save_steps,
         # save_only_model: skip optimizer.bin / scheduler.pt / rng_state / pytorch_model_fsdp.bin
         # → ~65 GiB per checkpoint instead of ~418 GiB
@@ -191,20 +210,23 @@ def main():
 
     trainer.train()
 
-    # Skip the duplicate top-level save unless we need it to feed a Hub upload.
-    # `save_strategy="steps"` + `save_total_limit=1` already leaves the last
-    # checkpoint-N/ subdir with the full model; a second copy at output_dir/
-    # is ~130 GiB of pure waste for Qwen-32B when no Hub upload consumes it.
-    if args.hf_repo:
+    # Write a single final copy to output_dir/ top-level in two cases:
+    # - --save-final-only: this IS the one and only save.
+    # - --hf-repo: needed as the source folder for the final Hub upload below.
+    # Default branch (neither flag): the last `checkpoint-N/` subdir from
+    # save_strategy="steps" already has the model; skipping the top-level
+    # save avoids a ~130 GiB duplicate on shared disk.
+    if args.save_final_only or args.hf_repo:
         trainer.save_model()
-        if trainer.is_world_process_zero():
-            HfApi().upload_folder(
-                folder_path=args.output_dir,
-                repo_id=args.hf_repo,
-                path_in_repo="final",
-                commit_message="final model",
-                ignore_patterns=["checkpoint-*/*"],
-            )
+
+    if args.hf_repo and trainer.is_world_process_zero():
+        HfApi().upload_folder(
+            folder_path=args.output_dir,
+            repo_id=args.hf_repo,
+            path_in_repo="final",
+            commit_message="final model",
+            ignore_patterns=["checkpoint-*/*"],
+        )
 
 
 if __name__ == "__main__":

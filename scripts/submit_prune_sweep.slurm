@@ -54,7 +54,6 @@ fi
 # --- HuggingFace cache ---
 MODEL_CACHE_KEY="Qwen_Qwen2.5-32B-Instruct"
 export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${MODEL_CACHE_KEY}
-export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
 
@@ -129,8 +128,6 @@ fi
 # (strategy, N, num_epochs) triples. Epochs chosen so
 # num_epochs * ceil(N/16) ≈ 315 steps.
 CELLS=(
-    "random 1000 5"
-    "random 500 10"
     "skill_abundance 500 10"
 )
 
@@ -202,6 +199,7 @@ for cell in "${CELLS[@]}"; do
                 --weight-decay 1e-4 \
                 --max-grad-norm 1.0 \
                 --save-every-n-epochs ${EPOCHS} \
+                --save-final-only \
                 --wandb-project s1-qwen32b-sft \
                 --wandb-run-name s1_prune_${CELL_TAG}_steps315 \
                 --seed 42"
