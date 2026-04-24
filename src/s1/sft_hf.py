@@ -190,17 +190,21 @@ def main():
     )
 
     trainer.train()
-    trainer.save_model()
 
-    # Final top-level model isn't saved as checkpoint-N, so upload it explicitly.
-    if args.hf_repo and trainer.is_world_process_zero():
-        HfApi().upload_folder(
-            folder_path=args.output_dir,
-            repo_id=args.hf_repo,
-            path_in_repo="final",
-            commit_message="final model",
-            ignore_patterns=["checkpoint-*/*"],
-        )
+    # Skip the duplicate top-level save unless we need it to feed a Hub upload.
+    # `save_strategy="steps"` + `save_total_limit=1` already leaves the last
+    # checkpoint-N/ subdir with the full model; a second copy at output_dir/
+    # is ~130 GiB of pure waste for Qwen-32B when no Hub upload consumes it.
+    if args.hf_repo:
+        trainer.save_model()
+        if trainer.is_world_process_zero():
+            HfApi().upload_folder(
+                folder_path=args.output_dir,
+                repo_id=args.hf_repo,
+                path_in_repo="final",
+                commit_message="final model",
+                ignore_patterns=["checkpoint-*/*"],
+            )
 
 
 if __name__ == "__main__":

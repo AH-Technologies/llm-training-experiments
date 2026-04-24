@@ -14,7 +14,11 @@
 # S1K pruning sweep: random vs skill_abundance across N ∈ {500, 250, 100}.
 # Fixed optimizer-step budget (~315) per cell — num_epochs scaled with N.
 # Skills parquet is tagged once (if missing); each cell then: prune → format
-# → SFT (reusing run_sft_s1k.sh) → eval.
+# → SFT (HF Trainer + accelerate FSDP via s1.sft_hf) → eval → aggregate.
+#
+# Uses the HF Trainer pipeline (s1.sft_hf), not the custom FSDP2 trainer
+# (s1.sft_trainer) — the latter OOMs on Qwen-32B at seq_length=16384 even
+# with FSDP offload on 16 H200s.
 #
 # Usage:
 #   sbatch scripts/submit_prune_sweep.slurm
@@ -54,6 +58,9 @@ export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
 
+# Enable Rust-based parallel hub uploader (faster hub pushes when --hf-repo is set)
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
 # --- Slingshot / NCCL / libfabric networking ---
 export NCCL_SOCKET_IFNAME=bond0
 export GLOO_SOCKET_IFNAME=bond0
@@ -92,7 +99,12 @@ unset ROCR_VISIBLE_DEVICES
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
 
+NUM_NODES=$SLURM_NNODES
+GPUS_PER_NODE=$SLURM_GPUS_ON_NODE
+WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "World size: $WORLD_SIZE (${NUM_NODES} nodes × ${GPUS_PER_NODE} GPUs)"
 
 # ---- Step 0: ensure baseline data exists ----
 if [ ! -f "data/s1K/s1k.parquet" ]; then
@@ -117,12 +129,9 @@ fi
 # (strategy, N, num_epochs) triples. Epochs chosen so
 # num_epochs * ceil(N/16) ≈ 315 steps.
 CELLS=(
+    "random 1000 5"
     "random 500 10"
     "skill_abundance 500 10"
-    "random 250 20"
-    "skill_abundance 250 20"
-    "random 100 50"
-    "skill_abundance 100 50"
 )
 
 for cell in "${CELLS[@]}"; do
@@ -166,35 +175,69 @@ for cell in "${CELLS[@]}"; do
                 --output "$SFT_PARQUET"
         fi
 
-        # Step 2c: SFT (reuses run_sft_s1k.sh)
-        if [ ! -d "$OUTPUT_DIR" ]; then
-            export NUM_EPOCHS=$EPOCHS
-            export SAVE_EVERY=$EPOCHS   # save only at end
-            export SEQ_LENGTH=16384
-            export TP_DEGREE=1
-            export FSDP_OFFLOAD=1
-            export TRAIN_FILE="$SFT_PARQUET"
-            export OUTPUT_DIR="$OUTPUT_DIR"
-            bash scripts/run_sft_s1k.sh \
-                --wandb-run-name "s1_prune_${CELL_TAG}_steps315"
+        # Step 2c: SFT via HF Trainer + accelerate FSDP.
+        # With --hf-repo unset, sft_hf.py skips the duplicate top-level save
+        # and leaves only the last checkpoint-N/ subdir. Accept either marker
+        # so previously-completed cells (with legacy top-level files) aren't
+        # retrained.
+        if [ ! -f "${OUTPUT_DIR}/config.json" ] && \
+           [ -z "$(ls ${OUTPUT_DIR}/checkpoint-*/config.json 2>/dev/null)" ]; then
+            ACCEL_CMD="accelerate launch \
+                --config_file ${PROJECT_DIR}/configs/accelerate_fsdp.yaml \
+                --num_processes=${WORLD_SIZE} \
+                --num_machines=${NUM_NODES} \
+                --main_process_ip=${MASTER_ADDR} \
+                --main_process_port=${MASTER_PORT} \
+                --machine_rank=\${SLURM_PROCID} \
+                -m s1.sft_hf \
+                --model Qwen/Qwen2.5-32B-Instruct \
+                --train-file ${SFT_PARQUET} \
+                --output-dir ${OUTPUT_DIR} \
+                --num-epochs ${EPOCHS} \
+                --batch-size 16 \
+                --per-device-batch-size 1 \
+                --sequence-length 16384 \
+                --lr 1e-5 \
+                --warmup-ratio 0.05 \
+                --weight-decay 1e-4 \
+                --max-grad-norm 1.0 \
+                --save-every-n-epochs ${EPOCHS} \
+                --wandb-project s1-qwen32b-sft \
+                --wandb-run-name s1_prune_${CELL_TAG}_steps315 \
+                --seed 42"
+            srun --nodes=${NUM_NODES} --ntasks-per-node=1 --export=ALL \
+                bash -c "unset ROCR_VISIBLE_DEVICES; ${ACCEL_CMD}"
         fi
 
-        # Step 2d: eval on MATH500 + AIME24 + GPQA-Diamond
+        # Step 2d: eval on MATH500 + AIME24 + GPQA-Diamond.
+        # Prefer the top-level save (legacy / hf_repo-enabled runs); fall back
+        # to the latest checkpoint-N subdir (default for this sweep).
         if [ ! -f "$EVAL_OUT" ]; then
-            LATEST_CKPT=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
-            if [ -z "$LATEST_CKPT" ]; then
-                echo "ERROR: no checkpoint found in $OUTPUT_DIR"
+            if [ -f "${OUTPUT_DIR}/config.json" ]; then
+                MODEL_PATH="$OUTPUT_DIR"
+            else
+                MODEL_PATH=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
+            fi
+            if [ -z "$MODEL_PATH" ] || [ ! -f "${MODEL_PATH}/config.json" ]; then
+                echo "ERROR: no trained model under $OUTPUT_DIR"
                 exit 1
             fi
+            # Per-cell tmp dir: eval.py names its output eval_<basename>.json,
+            # and checkpoint-N basenames collide across cells with identical
+            # step counts (e.g. random_n500 and skill_abundance_n500 both hit
+            # step 320). Isolating the eval output dir avoids the clash.
+            EVAL_TMP="eval_results/${CELL_TAG}_tmp"
+            mkdir -p "$EVAL_TMP"
             python -m s1.eval \
-                --model "$LATEST_CKPT" \
+                --model "$MODEL_PATH" \
                 --benchmarks math500 aime24 gpqa \
-                --output-dir eval_results
-            CKPT_NAME=$(basename "$LATEST_CKPT")
-            if [ -f "eval_results/eval_${CKPT_NAME}.json" ]; then
-                mv "eval_results/eval_${CKPT_NAME}.json" "$EVAL_OUT"
+                --output-dir "$EVAL_TMP"
+            produced=$(ls ${EVAL_TMP}/eval_*.json 2>/dev/null | head -1)
+            if [ -n "$produced" ]; then
+                mv "$produced" "$EVAL_OUT"
+                rmdir "$EVAL_TMP" 2>/dev/null || true
             else
-                echo "ERROR: eval did not produce eval_results/eval_${CKPT_NAME}.json"
+                echo "ERROR: eval did not produce any output in ${EVAL_TMP}/"
                 exit 1
             fi
         fi
