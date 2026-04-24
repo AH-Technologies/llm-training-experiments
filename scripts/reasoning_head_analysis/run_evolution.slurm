@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=head-evolution
-#SBATCH --account=share-ie-idi
-#SBATCH --partition=GPUQ
-#SBATCH --gres=gpu:a100:2
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --account=nn12068k
+#SBATCH --partition=accel
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/evolution_%j.log
 #SBATCH --error=logs/evolution_%j.err
@@ -48,8 +48,8 @@ module load Python/3.12.3-GCCcore-13.3.0
 # Find venv
 PROJECT_DIR=""
 for candidate in \
-    /cluster/projects/nn12068k/alexaau/llm-training-experiments \
     /cluster/projects/nn12068k/haaklau/llm-training-experiments \
+    /cluster/projects/nn12068k/alexaau/llm-training-experiments \
     /cluster/home/haaklau/code/llm-training-experiments; do
     if [ -d "$candidate/venv" ]; then
         PROJECT_DIR="$candidate"
@@ -80,7 +80,7 @@ export NCCL_DEBUG=WARN
 
 # HF cache
 if [ -w "/cluster/projects/nn12068k" ]; then
-    export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface
+    export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 else
     export HF_HOME=${HOME}/.cache/huggingface
 fi
@@ -106,7 +106,7 @@ for i in range(torch.cuda.device_count()):
 echo ""
 
 SAFE_REPO=$(echo "$HF_REPO" | tr '/' '_')
-RESULTS_BASE="reasoning_head_analysis/results"
+RESULTS_BASE="results/reasoning_head_analysis"
 
 # ── Step 1: Identify heads for base model ────────────────────────────
 SAFE_BASE=$(echo "$BASE_MODEL" | tr '/' '_')
@@ -125,26 +125,31 @@ else
         --output_dir "${RESULTS_BASE}/${SAFE_BASE}"
 fi
 
-# ── Step 2: Download + identify heads for each checkpoint ────────────
-CHECKPOINT_DIR="reasoning_head_analysis/checkpoints/${SAFE_REPO}"
+# ── Step 2: Identify heads for each checkpoint ───────────────────────
+# Use local models from models/ directory, or fall back to downloading
+LOCAL_MODEL_DIR=${LOCAL_MODEL_DIR:-"models/${SAFE_REPO}"}
 
 for STEP in $STEPS; do
     SUBFOLDER="global_step_${STEP}"
-    MODEL_PATH="${CHECKPOINT_DIR}/${SUBFOLDER}"
 
-    # Download if needed
-    if [ -d "$MODEL_PATH" ] && [ -f "$MODEL_PATH/config.json" ]; then
-        echo "Checkpoint already downloaded: $MODEL_PATH"
+    # Check local models/ first, then fall back to downloading
+    if [ -d "${LOCAL_MODEL_DIR}/${SUBFOLDER}" ] && [ -f "${LOCAL_MODEL_DIR}/${SUBFOLDER}/config.json" ]; then
+        MODEL_PATH="${LOCAL_MODEL_DIR}/${SUBFOLDER}"
+        echo "Using local model: $MODEL_PATH"
     else
-        echo ""
-        echo "Downloading: ${HF_REPO} / ${SUBFOLDER}"
-        mkdir -p "$CHECKPOINT_DIR"
-        huggingface-cli download "$HF_REPO" \
-            --include "${SUBFOLDER}/*" \
-            --local-dir "$CHECKPOINT_DIR" || \
-        hf download "$HF_REPO" \
-            --include "${SUBFOLDER}/*" \
-            --local-dir "$CHECKPOINT_DIR"
+        CHECKPOINT_DIR="reasoning_head_analysis/checkpoints/${SAFE_REPO}"
+        MODEL_PATH="${CHECKPOINT_DIR}/${SUBFOLDER}"
+        if [ ! -d "$MODEL_PATH" ] || [ ! -f "$MODEL_PATH/config.json" ]; then
+            echo ""
+            echo "Downloading: ${HF_REPO} / ${SUBFOLDER}"
+            mkdir -p "$CHECKPOINT_DIR"
+            huggingface-cli download "$HF_REPO" \
+                --include "${SUBFOLDER}/*" \
+                --local-dir "$CHECKPOINT_DIR" || \
+            hf download "$HF_REPO" \
+                --include "${SUBFOLDER}/*" \
+                --local-dir "$CHECKPOINT_DIR"
+        fi
     fi
 
     # Identify heads

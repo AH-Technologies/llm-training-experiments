@@ -2,7 +2,7 @@
 #SBATCH --job-name=ablate-v2
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --gres=gpu:h200:4
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
@@ -48,7 +48,7 @@ AIME24_N=${AIME24_N:-30}
 AMC_N=${AMC_N:-40}
 N_SAMPLES=${N_SAMPLES:-4}
 TEMPERATURE=${TEMPERATURE:-0.6}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}
 TOP_P=${TOP_P:-0.95}
 BATCH_SIZE=${BATCH_SIZE:-8}
 SHARD_IDX=${SHARD_IDX:-0}
@@ -64,7 +64,10 @@ USE_ACTIVE_HEADS=${USE_ACTIVE_HEADS:-0}
 EXCLUDE_LAYER0=${EXCLUDE_LAYER0:-0}
 HEADS=${HEADS:-""}
 SKIP_INDIVIDUAL=${SKIP_INDIVIDUAL:-0}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
 MATH500_PATH=${MATH500_PATH:-"data/math500.parquet"}
+EXTRA_CONDITIONS_FILE=${EXTRA_CONDITIONS_FILE:-""}
 
 echo "==========================================="
 echo "Ablation v2 — $BENCHMARK ($NUM_PROBLEMS × $N_SAMPLES samples)"
@@ -90,6 +93,7 @@ export HF_HOME=/cluster/projects/nn12068k/haaklau/.cache/huggingface
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_TOKEN=${HF_TOKEN:-""}
 export TOKENIZERS_PARALLELISM=false
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1  # needed for apply_model with function args
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PROJECT_DIR/src:$PYTHONPATH
 
@@ -100,6 +104,7 @@ EXTRA=""
 [ "$EXCLUDE_LAYER0" = "1" ]   && EXTRA="$EXTRA --exclude_layer0"
 [ "$SKIP_INDIVIDUAL" = "1" ]  && EXTRA="$EXTRA --skip_individual"
 [ -n "$HEADS" ]               && EXTRA="$EXTRA --heads $HEADS"
+[ -n "$EXTRA_CONDITIONS_FILE" ] && EXTRA="$EXTRA --extra_conditions_file $EXTRA_CONDITIONS_FILE"
 
 # How many GPUs did SLURM give us? Shard condition list across them, run one
 # Python worker per GPU in parallel; then one --analyze_only pass at the end.
@@ -109,7 +114,7 @@ echo "GPUs visible: $N_GPUS_DETECTED  |  using $N_SHARDS_EFFECTIVE shards"
 
 if [ "$ANALYZE_ONLY" = "1" ]; then
     # Explicit analyze-only mode — no generation.
-    python -m reasoning_head_analysis.ablate_heads_v2 \
+    python -m reasoning_head_analysis.ablate_heads_v2_vllm \
         --model "$MODEL" \
         --importance_path "$IMPORTANCE_PATH" \
         --output_dir "$OUTPUT_DIR" \
@@ -124,7 +129,8 @@ if [ "$ANALYZE_ONLY" = "1" ]; then
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
         --max_new_tokens "$MAX_NEW_TOKENS" \
-        --batch_size "$BATCH_SIZE" \
+        --max_model_len "$MAX_MODEL_LEN" \
+        --gpu_memory_utilization "$GPU_MEM_UTIL" \
         --top_k "$TOP_K" \
         --scales "$SCALES" \
         --n_random "$N_RANDOM" \
@@ -138,7 +144,7 @@ else
         GPU_IDX=$((SHARD % N_GPUS_DETECTED))
         LOG="$OUTPUT_DIR/shard${SHARD}.log"
         echo "Launching shard $SHARD on GPU $GPU_IDX → $LOG"
-        CUDA_VISIBLE_DEVICES=$GPU_IDX python -m reasoning_head_analysis.ablate_heads_v2 \
+        CUDA_VISIBLE_DEVICES=$GPU_IDX python -m reasoning_head_analysis.ablate_heads_v2_vllm \
             --model "$MODEL" \
             --importance_path "$IMPORTANCE_PATH" \
             --output_dir "$OUTPUT_DIR" \
@@ -149,7 +155,8 @@ else
             --temperature "$TEMPERATURE" \
             --top_p "$TOP_P" \
             --max_new_tokens "$MAX_NEW_TOKENS" \
-            --batch_size "$BATCH_SIZE" \
+            --max_model_len "$MAX_MODEL_LEN" \
+            --gpu_memory_utilization "$GPU_MEM_UTIL" \
             --top_k "$TOP_K" \
             --scales "$SCALES" \
             --n_random "$N_RANDOM" \
@@ -174,7 +181,7 @@ else
     fi
 
     echo "All shards done. Running analyze-only pass..."
-    python -m reasoning_head_analysis.ablate_heads_v2 \
+    python -m reasoning_head_analysis.ablate_heads_v2_vllm \
         --model "$MODEL" \
         --importance_path "$IMPORTANCE_PATH" \
         --output_dir "$OUTPUT_DIR" \
@@ -189,7 +196,8 @@ else
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
         --max_new_tokens "$MAX_NEW_TOKENS" \
-        --batch_size "$BATCH_SIZE" \
+        --max_model_len "$MAX_MODEL_LEN" \
+        --gpu_memory_utilization "$GPU_MEM_UTIL" \
         --top_k "$TOP_K" \
         --scales "$SCALES" \
         --n_random "$N_RANDOM" \
