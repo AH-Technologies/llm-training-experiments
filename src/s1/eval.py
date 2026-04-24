@@ -291,16 +291,39 @@ def main():
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples per benchmark (for testing)")
     parser.add_argument("--tp", type=int, default=4, help="Tensor parallelism for vLLM")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        help=(
+            "vLLM load dtype. Default bfloat16 — our HF Trainer FSDP checkpoints "
+            "save as fp32 even for bf16-trained models; letting vLLM auto-read "
+            "config.json triggers an fp32-allocate-then-downcast path that "
+            "spikes VRAM during load."
+        ),
+    )
     parser.add_argument("--output-dir", default=None, help="Directory to save results")
     args = parser.parse_args()
 
     print(f"Loading model: {args.model}")
+
+    # Cap max_model_len at the model's max_position_embeddings (Qwen2.5-32B is
+    # 32768). Exceeding RoPE's trained range risks NaN / CUDA OOB, so we clamp
+    # rather than set VLLM_ALLOW_LONG_MAX_MODEL_LEN.
+    from transformers import AutoConfig
+    hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    model_cap = getattr(hf_config, "max_position_embeddings", None)
+    max_model_len = args.max_tokens + 2048
+    if model_cap is not None and max_model_len > model_cap:
+        print(f"  Capping max_model_len {max_model_len} → {model_cap} (model limit)")
+        max_model_len = model_cap
+
     model = LLM(
         args.model,
         tensor_parallel_size=args.tp,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype=args.dtype,
         trust_remote_code=True,
-        max_model_len=args.max_tokens + 2048,  # room for prompt + generation
+        max_model_len=max_model_len,
     )
 
     all_results = {}
