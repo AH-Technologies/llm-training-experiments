@@ -144,8 +144,10 @@ for cell in "${CELLS[@]}"; do
     echo "Cell: $CELL_TAG (epochs=$EPOCHS)"
     echo "=========================================="
 
-    # Skip if checkpoint already exists (resumability)
-    if [ -d "$OUTPUT_DIR" ] && [ -f "$EVAL_OUT" ]; then
+    # Skip if eval JSON exists (resumability). Local checkpoint dir is
+    # deleted after upload+eval succeed, so directory presence is no longer
+    # a useful signal — the eval JSON is the only durable marker.
+    if [ -f "$EVAL_OUT" ]; then
         echo "Already complete; skipping."
         continue
     fi
@@ -200,6 +202,8 @@ for cell in "${CELLS[@]}"; do
                 --max-grad-norm 1.0 \
                 --save-every-n-epochs ${EPOCHS} \
                 --save-final-only \
+                --hf-repo alexauren/s1-pruning \
+                --hf-subfolder ${STRATEGY}/${N} \
                 --wandb-project s1-qwen32b-sft \
                 --wandb-run-name s1_prune_${CELL_TAG}_steps315 \
                 --seed 42"
@@ -238,6 +242,14 @@ for cell in "${CELLS[@]}"; do
                 echo "ERROR: eval did not produce any output in ${EVAL_TMP}/"
                 exit 1
             fi
+        fi
+
+        # Reclaim local disk: training pushed the (bf16-cast) model to
+        # alexauren/s1-pruning/${STRATEGY}/${N}, eval succeeded, the JSON is
+        # written. Local checkpoint is now redundant.
+        if [ -d "$OUTPUT_DIR" ]; then
+            echo "Reclaiming $OUTPUT_DIR (model archived at HF Hub)"
+            rm -rf "$OUTPUT_DIR"
         fi
     ); then
         echo "Cell $CELL_TAG FAILED — continuing to next cell"
