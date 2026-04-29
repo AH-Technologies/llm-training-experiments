@@ -45,22 +45,99 @@ def extract_boxed(text: str) -> str | None:
     return None
 
 
+_ANSWER_TAG = "<|im_start|>answer"
+_END_TAG = "<|im_end|>"
+
+
+def answer_section(text: str) -> str | None:
+    """Content between the last <|im_start|>answer and the next <|im_end|>.
+
+    The s1 training format places the final answer in a dedicated section
+    (`<|im_start|>answer\\n...\\n<|im_end|>`). Training data often terminates
+    with a bare integer or short expression there rather than \\boxed{...},
+    so we look in this section first.
+    """
+    idx = text.rfind(_ANSWER_TAG)
+    if idx < 0:
+        return None
+    start = idx + len(_ANSWER_TAG)
+    end = text.find(_END_TAG, start)
+    return text[start:end if end >= 0 else None].strip()
+
+
+_MATH_GROUP = re.compile(
+    r"\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|\$([^\$\n]+?)\$",
+    re.DOTALL,
+)
+
+
+def _last_math_expr(text: str) -> str | None:
+    """Return content of the last $...$ / \\[...\\] / \\(...\\) in text."""
+    matches = list(_MATH_GROUP.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    for g in last.groups():
+        if g is not None:
+            return g.strip()
+    return None
+
+
+def _rhs_if_equation(expr: str) -> str:
+    """If expr has an equals sign that's not part of >=, <=, \\ge, \\le, \\neq, ... ,
+    return the RHS of the last real '='. Otherwise return expr unchanged."""
+    # Strip LaTeX relational operators that contain '=' so we don't split on them.
+    masked = re.sub(r"\\(ge|le|ne|geq|leq|neq|approx|equiv)", "  ", expr)
+    masked = masked.replace(">=", "  ").replace("<=", "  ").replace("!=", "  ")
+    if "=" not in masked:
+        return expr
+    # Find the real '=' positions and take after the last one.
+    idx = masked.rfind("=")
+    return expr[idx + 1:].strip()
+
+
 def extract_answer(text: str) -> str | None:
-    """Extract final answer from model response."""
+    """Extract final answer from model response.
+
+    Priority (based on spot-checks of trained-model MATH500 responses):
+      1. \\boxed{...} anywhere — highest-precision signal.
+      2. "Final Answer: X" / "the answer is X" / "the result is X" in answer
+         section (or full text if no section tag).
+      3. Last math-delimited expression ($..$, \\[..\\], \\(..\\)) in the
+         answer section, with RHS taken when it's an equation. Handles cases
+         like "...so $h = 5$" → "5" or "...sends ... to $-b + ai$" → "-b + ai".
+      4. Short (≤100 chars) answer section verbatim — handles bare answers
+         like "<|im_start|>answer\\n128<|im_end|>".
+    """
     text = text.strip()
 
     boxed = extract_boxed(text)
     if boxed:
         return boxed.strip()
 
-    # "Final Answer: X" or "the answer is X"
-    m = re.search(r"[Ff]inal\s+[Aa]nswer[:\s]+(.+?)(?:\.|$|\n)", text)
-    if m:
-        return m.group(1).strip()
+    section = answer_section(text)
+    search = section if section is not None else text
 
-    m = re.search(r"[Tt]he\s+(?:final\s+)?answer\s+is[:\s]+(.+?)(?:\.|$|\n)", text)
-    if m:
-        return m.group(1).strip()
+    patterns = [
+        r"[Ff]inal\s+[Aa]nswer\s*(?:is|:)\s*(.+?)(?:\.|$|\n)",
+        r"[Tt]he\s+(?:final\s+)?answer\s+is\s*(.+?)(?:\.|$|\n)",
+        r"[Tt]he\s+result\s+is\s*(.+?)(?:\.|$|\n)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, search)
+        if m:
+            cand = m.group(1).strip()
+            # If the captured tail starts with $...$ or \(..\), prefer the math content.
+            inner = _last_math_expr(cand)
+            return inner if inner else cand
+
+    if section is not None:
+        expr = _last_math_expr(section)
+        if expr:
+            return _rhs_if_equation(expr).rstrip(".,;").strip()
+
+    if section is not None and 0 < len(section) <= 100:
+        return section.strip()
 
     return None
 
@@ -68,25 +145,29 @@ def extract_answer(text: str) -> str | None:
 def extract_gpqa_answer(text: str) -> str | None:
     """Extract GPQA multiple-choice answer (A/B/C/D)."""
     text = text.strip()
+    section = answer_section(text)
+    search = section if section is not None else text
 
-    # \boxed{A}
-    boxed = extract_boxed(text)
+    boxed = extract_boxed(search)
     if boxed and boxed.strip().upper() in "ABCD":
         return boxed.strip().upper()
 
-    # "answer is (A)" / "Answer: B"
     patterns = [
         r'[Aa]nswer\s*(?:is|:)\s*\(?([A-Da-d])\)?',
         r'[Cc]orrect\s*(?:answer|option)\s*(?:is|:)\s*\(?([A-Da-d])\)?',
         r'\b([A-Da-d])\s*(?:is|is the)\s*(?:correct|right)',
     ]
     for pat in patterns:
-        m = re.search(pat, text)
+        m = re.search(pat, search)
         if m:
             return m.group(1).upper()
 
-    # Last standalone letter
-    m = re.search(r'\b([A-Da-d])\s*\.?\s*$', text.strip())
+    # Section is a single letter like "B"
+    if section is not None and section.strip().upper() in "ABCD":
+        return section.strip().upper()
+
+    # Last standalone letter in search region
+    m = re.search(r'\b([A-Da-d])\s*\.?\s*$', search.strip())
     if m:
         return m.group(1).upper()
 
@@ -171,23 +252,27 @@ def load_aime24():
 
 
 def load_gpqa_diamond():
-    """Load GPQA Diamond (198 PhD-level science questions)."""
+    """Load GPQA Diamond (198 PhD-level science questions).
+
+    The dataset stores choices in fixed key order (Correct / Incorrect 1-3),
+    so we shuffle them to randomise letter position. Uses a single Random
+    instance seeded once — resetting the seed per row would give every row
+    the same permutation, pinning every correct answer to the same letter.
+    """
+    import random as _random
+    rng = _random.Random(42)  # one stream across all rows
+
     ds = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
     problems = []
     for row in ds:
-        # Build MCQ prompt with choices
         choices = []
         for key in ["Correct Answer", "Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"]:
             if key in row and row[key]:
                 choices.append(row[key])
 
-        # The correct answer is always the first one; we need to shuffle
-        # but keep track of which letter is correct
-        import random
-        random.seed(42)  # Deterministic shuffle
         correct_answer = choices[0]
-        random.shuffle(choices)
-        correct_letter = chr(65 + choices.index(correct_answer))  # A, B, C, D
+        rng.shuffle(choices)
+        correct_letter = chr(65 + choices.index(correct_answer))
 
         choice_text = "\n".join(f"({chr(65+i)}) {c}" for i, c in enumerate(choices))
         question = f"{row['Question']}\n\n{choice_text}"
@@ -212,10 +297,15 @@ BENCHMARKS = {
 # ---------------------------------------------------------------------------
 
 def build_prompt(question: str) -> str:
-    """Build chat prompt matching the s1 paper's format."""
+    """Build chat prompt matching the s1 paper's format (Figure 10, §D).
+
+    Training data (prepare_s1k_sft.py) uses no system prompt — the model is
+    fine-tuned on <|im_start|>user\\n{q}<|im_end|>\\n<|im_start|>assistant\\n
+    and is expected to auto-generate <|im_start|>think ... <|im_start|>answer
+    ... \\boxed{...}<|im_end|>. Prepending Qwen's default system prompt at
+    inference breaks the conditioning and suppresses the answer tail.
+    """
     return (
-        f"<|im_start|>system\n"
-        f"You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
         f"<|im_start|>user\n{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -267,6 +357,9 @@ def evaluate_benchmark(
             "predicted": predicted,
             "correct": match,
             "response_length": len(response),
+            # Last 2500 chars — enough to see the <|im_start|>answer section
+            # and its tail. Kept small so per-eval JSONs stay manageable.
+            "response_tail": response[-2500:] if len(response) > 2500 else response,
         })
 
     accuracy = correct / len(problems) * 100
@@ -324,6 +417,10 @@ def main():
         dtype=args.dtype,
         trust_remote_code=True,
         max_model_len=max_model_len,
+        # Custom all-reduce uses direct GPU peer access; on this cluster's
+        # multi-GPU topology it crashes with "Cuda error ... 'invalid argument'"
+        # in the warm-up RPC, killing TP workers silently. NCCL fallback works.
+        enable_custom_all_reduce=False,
     )
 
     all_results = {}
