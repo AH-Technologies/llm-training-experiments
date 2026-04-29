@@ -108,6 +108,16 @@ def parse_args():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--save-every-n-epochs", type=int, default=5)
     p.add_argument(
+        "--lr-scheduler-type",
+        default="cosine",
+        choices=("cosine", "constant", "constant_with_warmup", "linear"),
+        help=(
+            "LR schedule. Default 'cosine' (the s1-paper / grokking convention). "
+            "Use 'constant_with_warmup' for short screening runs where cosine "
+            "decay would waste the second half of the budget."
+        ),
+    )
+    p.add_argument(
         "--save-final-only",
         action="store_true",
         help=(
@@ -217,7 +227,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=args.lr_scheduler_type,
         optim="adamw_torch",
         adam_beta1=0.9,
         adam_beta2=0.95,

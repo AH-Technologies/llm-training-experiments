@@ -285,10 +285,46 @@ def load_gpqa_diamond():
     return problems
 
 
+def _load_verl_parquet(path: str, name: str):
+    """Load a VERL-format math validation parquet.
+
+    These parquets (data/val/*_verl.parquet) carry chat-style `prompt`
+    (system+user dicts) and `reward_model.ground_truth`. We extract the
+    user content as the question and the ground truth as the gold answer.
+    Used by the screening pipeline for AMC/AIME 2025.
+    """
+    import pyarrow.parquet as pq
+    t = pq.read_table(path)
+    problems = []
+    for prompt, rm in zip(t.column("prompt").to_pylist(), t.column("reward_model").to_pylist()):
+        # prompt is a list of message dicts; pick the user turn
+        user_msg = next((m for m in prompt if m.get("role") == "user"), None)
+        if user_msg is None:
+            continue
+        problems.append({
+            "question": user_msg["content"],
+            "answer": str(rm["ground_truth"]),
+            "answer_type": "boxed",
+        })
+    return problems
+
+
+def load_amc():
+    """AMC validation set (~83 problems, integer/numeric answers)."""
+    return _load_verl_parquet("data/val/amc_verl.parquet", "AMC")
+
+
+def load_aime25():
+    """AIME 2025 (~30 problems, integer answers 0–999)."""
+    return _load_verl_parquet("data/val/aime_2025_verl.parquet", "AIME25")
+
+
 BENCHMARKS = {
     "math500": ("MATH500", load_math500),
     "aime24": ("AIME24", load_aime24),
     "gpqa": ("GPQA Diamond", load_gpqa_diamond),
+    "amc": ("AMC", load_amc),
+    "aime25": ("AIME25", load_aime25),
 }
 
 
