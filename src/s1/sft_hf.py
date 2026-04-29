@@ -13,12 +13,17 @@ Launched via `accelerate launch` (see `scripts/submit_s1_sft_hf.slurm`):
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
+from pathlib import Path
 
 import datasets
 import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi
+from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -30,8 +35,40 @@ from transformers import (
 IGNORE_INDEX = -100
 
 
+def cast_checkpoint_to_bf16(ckpt_dir: str) -> None:
+    """Re-encode safetensors shards in `ckpt_dir` as bf16 in place.
+
+    FSDP with `mixed_precision: bf16` keeps params in fp32 for training stability,
+    so the consolidated state dict saves as fp32 (~131 GiB for 32B params).
+    For evaluation/inference and Hub storage, bf16 is sufficient and halves
+    transfer + commit time. Updates `model.safetensors.index.json::metadata.total_size`
+    so the HF loader sees consistent sizes.
+    """
+    ckpt_path = Path(ckpt_dir)
+    new_total_size = 0
+
+    for shard_path in sorted(ckpt_path.glob("*.safetensors")):
+        new_state = {}
+        with safe_open(str(shard_path), framework="pt") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                if tensor.is_floating_point() and tensor.dtype != torch.bfloat16:
+                    tensor = tensor.to(torch.bfloat16)
+                new_state[key] = tensor
+                new_total_size += tensor.numel() * tensor.element_size()
+        save_file(new_state, str(shard_path))
+
+    index_path = ckpt_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        index["metadata"]["total_size"] = new_total_size
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+
 class BlockingHubPushCallback(TrainerCallback):
-    """Upload each checkpoint-N dir to the Hub synchronously on rank 0.
+    """Cast checkpoint to bf16, then upload to Hub synchronously on rank 0.
 
     Each save lands as its own `checkpoint-{step}/` subfolder on `main`, so
     intermediates are preserved. All ranks barrier after the upload; set
@@ -45,6 +82,7 @@ class BlockingHubPushCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            cast_checkpoint_to_bf16(ckpt_dir)
             self.api.upload_folder(
                 folder_path=ckpt_dir,
                 repo_id=self.repo_id,
@@ -84,6 +122,17 @@ def parse_args():
     p.add_argument("--wandb-project", default="s1-qwen32b-sft")
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--hf-repo", default=None)
+    p.add_argument(
+        "--hf-subfolder",
+        default=None,
+        help=(
+            "path_in_repo for the final upload. Defaults to 'final' to preserve "
+            "the grokking convention. For umbrella repos hosting multiple cells "
+            "(e.g. 'alexauren/s1-pruning' with subfolders 'random/1000', "
+            "'skill_abundance/500'), pass the subfolder explicitly so each cell "
+            "lands in its own namespace."
+        ),
+    )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -145,7 +194,11 @@ def main():
     # Disable HF cache during training (incompatible with gradient checkpointing)
     model.config.use_cache = False
 
-    save_steps_per_epoch = len(ds) // (world_size * args.per_device_batch_size * grad_accum)
+    # Ceiling division: HF Trainer's distributed sampler pads short epochs up to the
+    # next full step, so steps_per_epoch is ceil(len(ds) / batch_total), not floor.
+    # Using floor here would make save_steps fire ~half an epoch early and leave the
+    # final epoch-N boundary unaligned, causing a duplicate end-of-training save.
+    save_steps_per_epoch = math.ceil(len(ds) / (world_size * args.per_device_batch_size * grad_accum))
     save_steps = max(1, save_steps_per_epoch * args.save_every_n_epochs)
 
     # save_strategy="no" with --save-final-only: no periodic checkpoint-N dirs
@@ -188,9 +241,10 @@ def main():
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         dataloader_num_workers=2,
-        # 2h barrier window — covers rank 0 uploading ~65 GiB per checkpoint
-        # while other ranks wait in BlockingHubPushCallback.
-        ddp_timeout=7200,
+        # 4h barrier window — covers rank 0 casting fp32→bf16 (~10 min) plus
+        # uploading ~65 GiB shards while other ranks wait in BlockingHubPushCallback.
+        # Hub commit phase for 29 LFS shards has been seen to take 1-2h under load.
+        ddp_timeout=14400,
     )
 
     callbacks = []
@@ -210,23 +264,22 @@ def main():
 
     trainer.train()
 
-    # Write a single final copy to output_dir/ top-level in two cases:
-    # - --save-final-only: this IS the one and only save.
-    # - --hf-repo: needed as the source folder for the final Hub upload below.
-    # Default branch (neither flag): the last `checkpoint-N/` subdir from
-    # save_strategy="steps" already has the model; skipping the top-level
-    # save avoids a ~130 GiB duplicate on shared disk.
-    if args.save_final_only or args.hf_repo:
+    # With save_strategy="steps", HF Trainer forces a save at max_steps regardless of
+    # save_steps alignment (trainer_callback.py DefaultFlowCallback.on_step_end), so
+    # the highest `checkpoint-N/` IS the final model — no extra save_model() needed.
+    # The save_final_only branch has no intermediate checkpoints and so must save now.
+    if args.save_final_only:
         trainer.save_model()
-
-    if args.hf_repo and trainer.is_world_process_zero():
-        HfApi().upload_folder(
-            folder_path=args.output_dir,
-            repo_id=args.hf_repo,
-            path_in_repo="final",
-            commit_message="final model",
-            ignore_patterns=["checkpoint-*/*"],
-        )
+        if args.hf_repo and trainer.is_world_process_zero():
+            cast_checkpoint_to_bf16(args.output_dir)
+            path_in_repo = args.hf_subfolder if args.hf_subfolder else "final"
+            HfApi().upload_folder(
+                folder_path=args.output_dir,
+                repo_id=args.hf_repo,
+                path_in_repo=path_in_repo,
+                commit_message=f"final model ({path_in_repo})",
+                ignore_patterns=["checkpoint-*/*"],
+            )
 
 
 if __name__ == "__main__":
