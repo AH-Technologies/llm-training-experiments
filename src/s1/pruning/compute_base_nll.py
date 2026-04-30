@@ -62,7 +62,18 @@ def main() -> None:
     parser.add_argument("--output", default="data/s1K/s1k_base_nll.parquet")
     parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct")
     parser.add_argument("--tp", type=int, default=4)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.7,
+        help=(
+            "Lower than the eval default (0.9) because prompt_logprobs=1 "
+            "materialises full-vocab logits at every position (Qwen vocab "
+            "~152K × max_model_len × 4 bytes ≈ 10 GiB transient). With 0.9 "
+            "the KV cache reservation leaves no headroom for that spike and "
+            "we OOM on the first batch."
+        ),
+    )
     parser.add_argument(
         "--max-model-len",
         type=int,
