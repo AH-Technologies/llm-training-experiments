@@ -72,3 +72,57 @@ def score_skill_count(s1k_table: pa.Table, skills_table: pa.Table | None) -> lis
             "score_skill_count requires --skills <s1k_skills.parquet>; pass it via the prune CLI."
         )
     return [float(c) for c in skills_table.column("skill_count").to_pylist()]
+
+
+_BASE_NLL_PATH = "data/s1K/s1k_base_nll.parquet"
+
+
+def _load_base_nll(s1k_table: pa.Table) -> pa.Table:
+    """Load s1k_base_nll.parquet and assert row alignment with s1K."""
+    import pyarrow.parquet as pq
+    try:
+        nll = pq.read_table(_BASE_NLL_PATH)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"{_BASE_NLL_PATH} not found. Run "
+            "`python -m s1.pruning.compute_base_nll` to precompute base-model "
+            "NLL signals before using base_loss / base_logprob_mean strategies."
+        ) from e
+    if nll.num_rows != s1k_table.num_rows:
+        raise ValueError(
+            f"{_BASE_NLL_PATH} has {nll.num_rows} rows but s1K has {s1k_table.num_rows}; "
+            "regenerate the NLL parquet against the current s1K."
+        )
+    return nll
+
+
+@register("base_loss")
+def score_base_loss(s1k_table: pa.Table, skills_table: pa.Table | None) -> list[float]:
+    """Total negative log-likelihood of the SFT response under the untrained
+    base model. High score = response is far from what the base model would
+    naturally generate; the model has the most to learn from this example.
+
+    Top of the screening partition picks the most "informative" / hardest
+    examples; bottom picks the ones the base model already roughly produces.
+    Scores are length-confounded by design — long traces accumulate more
+    total NLL — see `base_logprob_mean` for the per-token version.
+    """
+    nll = _load_base_nll(s1k_table)
+    return [float(x) for x in nll.column("total_nll").to_pylist()]
+
+
+@register("base_logprob_mean")
+def score_base_logprob_mean(s1k_table: pa.Table, skills_table: pa.Table | None) -> list[float]:
+    """Per-token mean log-probability of the SFT response under the untrained
+    base model. Score = -mean_nll, so HIGH = each token is highly probable
+    given context = the trace reads as smoothly extending from the base
+    model's natural distribution.
+
+    Top of the screening partition picks the most "coherent" / sustained-
+    confidence reasoning traces; bottom picks the most surprising-token-by-
+    token traces (unusual notation, stylistic outliers, dense unfamiliar
+    formalism). Length-normalised by per-token averaging — distinct from
+    `base_loss` even though both come from the same forward pass.
+    """
+    nll = _load_base_nll(s1k_table)
+    return [-float(x) for x in nll.column("mean_nll").to_pylist()]

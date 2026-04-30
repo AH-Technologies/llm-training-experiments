@@ -127,6 +127,23 @@ fi
 
 export PYTHONPATH=${PROJECT_DIR}/src:${PROJECT_DIR}:${PYTHONPATH}
 
+# ---- Step 0.5: precompute base-model NLL (one-off, ~10 min on H200×4) ----
+# Used by base_loss and base_logprob_mean screening strategies. Idempotent:
+# skipped if the parquet already exists. Runs on a single node to leave the
+# rest of the allocation idle just briefly; bf16 fits comfortably at TP=4.
+NLL_PATH="data/s1K/s1k_base_nll.parquet"
+if [ ! -f "$NLL_PATH" ]; then
+    echo ""
+    echo "Computing base-model NLL on s1K → $NLL_PATH"
+    srun --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --export=ALL \
+        bash -c "unset ROCR_VISIBLE_DEVICES; python -m s1.pruning.compute_base_nll \
+            --input data/s1K/s1k.parquet \
+            --output $NLL_PATH \
+            --tp 4"
+else
+    echo "Base NLL parquet exists at $NLL_PATH — skipping precomputation."
+fi
+
 # ---- Cell list ----
 # (strategy, position) pairs. To add a new ranking strategy: register a
 # scoring function in src/s1/pruning/strategies.py, then add three lines
@@ -138,6 +155,12 @@ SCREEN_CELLS=(
     "skill_count top"
     "skill_count middle"
     "skill_count bottom"
+    "base_loss top"
+    "base_loss middle"
+    "base_loss bottom"
+    "base_logprob_mean top"
+    "base_logprob_mean middle"
+    "base_logprob_mean bottom"
 )
 
 # Hyperparameters held constant across all screening cells.

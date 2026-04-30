@@ -76,6 +76,20 @@ This means re-evaluation later (after editing extractors, swapping
 benchmarks, etc.) does not require retraining — just re-run `s1.eval`
 against the Hub model.
 
+## Strategies (currently registered)
+
+| Strategy | Score (per row) | Top of partition = | Cost to compute |
+|---|---|---|---|
+| `response_length` | char count of `thinking_trajectories[0]` | longest traces | free |
+| `skill_count` | total salient math skills (paper-style) from `s1k_skills.parquet` | most skill-rich problems | one-off Gemini tagging pass (~10 min) |
+| `base_loss` | total NLL of response under the untrained base model | response is most "surprising" / informative to the base model | one-off vLLM forward pass (~10 min) |
+| `base_logprob_mean` | mean log-prob per response token under the base model | response reads most "coherent" / smoothly extends from the base distribution | shares the forward pass with `base_loss` |
+
+`base_loss` and `base_logprob_mean` both come from one shared precomputation
+(`s1.pruning.compute_base_nll`) which writes `data/s1K/s1k_base_nll.parquet`.
+The screening SLURM runs that precomputation once, before the cell loop,
+if the parquet doesn't yet exist.
+
 ## Adding a strategy
 
 1. **Register a scoring function** in `strategies.py`:
@@ -98,7 +112,14 @@ against the Hub model.
    "my_strategy bottom"
    ```
 
-3. Resubmit. Existing cells with `eval_results/screen_*.json` already on
+3. **Optional precomputation**: if the strategy needs a non-trivial signal
+   (NLL, embeddings, learnability scores), put the producer in a standalone
+   module under `src/s1/pruning/` (see `compute_base_nll.py` for the pattern)
+   and add a guarded `if [ ! -f <output> ]; then srun python -m ... ; fi`
+   block in the SLURM script before the cell loop. The scoring function in
+   `strategies.py` then reads that parquet and aligns rows to s1K.
+
+4. Resubmit. Existing cells with `eval_results/screen_*.json` already on
    disk will be skipped — only the new strategy's three cells run.
    Hub-archived prior cells stay untouched and can still be re-evaluated.
 
@@ -120,10 +141,11 @@ The `prune.py --strategy` CLI auto-resolves any name registered in
 ```
 src/s1/pruning/
 ├── __init__.py
-├── README.md           ← this file
-├── strategies.py       ← scoring functions (the modular extension point)
-├── prune.py            ← random / skill_abundance / thirds-screening selection
-└── tag_skills.py       ← one-off skill tagging via Gemini judge
+├── README.md             ← this file
+├── strategies.py         ← scoring functions (the modular extension point)
+├── prune.py              ← random / skill_abundance / thirds-screening selection
+├── tag_skills.py         ← one-off skill tagging via Gemini judge
+└── compute_base_nll.py   ← one-off base-model NLL pass for base_loss / base_logprob_mean
 
 scripts/
 ├── submit_prune_screen.slurm    ← screening sweep (this README)
@@ -144,5 +166,8 @@ Per cell, sequential on 16 H200s with warm HF cache:
 | Eval (AMC + AIME25, 113 problems) | ~5 min |
 | **Per cell total** | **~35 min** |
 
-For the initial 6-cell screen (response_length + skill_count, three
-positions each): ~3.5 h. Each new strategy adds ~1.7 h.
+For the initial 12-cell screen (response_length + skill_count + base_loss +
+base_logprob_mean, three positions each): ~7 h, plus ~10 min one-off for the
+base-NLL precomputation. Each new strategy adds ~1.7 h. The skill-tagging
+and base-NLL precomputations are skipped on subsequent sweeps if their
+parquets already exist.
