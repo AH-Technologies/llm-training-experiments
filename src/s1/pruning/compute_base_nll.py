@@ -105,7 +105,9 @@ def main() -> None:
         dtype="bfloat16",
         trust_remote_code=True,
         max_model_len=args.max_model_len,
-        enable_custom_all_reduce=False,
+        # vLLM 0.12 renamed enable_custom_all_reduce → disable_custom_all_reduce.
+        # Custom AR crashes on this cluster's multi-GPU topology (see s1.eval).
+        disable_custom_all_reduce=True,
     )
 
     # max_tokens=1 (vLLM rejects 0) — we ignore the generated token; the only

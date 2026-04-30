@@ -456,7 +456,9 @@ def main():
         # Custom all-reduce uses direct GPU peer access; on this cluster's
         # multi-GPU topology it crashes with "Cuda error ... 'invalid argument'"
         # in the warm-up RPC, killing TP workers silently. NCCL fallback works.
-        enable_custom_all_reduce=False,
+        # vLLM 0.12 renamed the flag from enable_custom_all_reduce (default True)
+        # to disable_custom_all_reduce (default False) — same semantic, inverted.
+        disable_custom_all_reduce=True,
     )
 
     all_results = {}
