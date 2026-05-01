@@ -152,6 +152,12 @@ def build_pairs(model, n_pairs=300, dataset="aime"):
         logger.info("Loading AIME (AI-MO/aimo-validation-aime)...")
         ds = load_dataset("AI-MO/aimo-validation-aime", split="train")
         questions = [ds[i]["problem"] for i in range(len(ds))]
+    elif dataset == "math":
+        logger.info("Loading MATH (nlile/hendrycks-MATH-benchmark)...")
+        ds = load_dataset("nlile/hendrycks-MATH-benchmark", split="train")
+        indices = list(range(len(ds)))
+        random.shuffle(indices)
+        questions = [ds[i]["problem"] for i in indices[:500]]
     else:
         logger.info("Loading GSM8K...")
         ds = load_dataset("openai/gsm8k", "main", split="train")
@@ -302,23 +308,24 @@ def plot_heatmap(head_scores, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Identify reasoning heads via EAP-IG")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--n_pairs", type=int, default=300, help="Number of prompt pairs")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B")
+    parser.add_argument("--n_pairs", type=int, default=100, help="Number of prompt pairs")
     parser.add_argument("--ig_steps", type=int, default=100, help="Integrated gradients steps")
     parser.add_argument("--top_n", type=int, default=5000, help="Top-n edges to keep")
     parser.add_argument("--threshold", type=float, default=0.1,
                         help="Edge-score threshold tau for circuit simplification "
                              "(Thinking Sparks A.2). Applied after top-n, with isolated-node pruning.")
-    parser.add_argument("--dataset", type=str, default="aime", choices=["aime", "gsm8k"],
-                        help="Dataset for prompt pairs: 'aime' (default, as in paper) or 'gsm8k'")
+    parser.add_argument("--dataset", type=str, default="aime", choices=["aime", "gsm8k", "math"],
+                        help="Dataset for prompt pairs: 'aime' (default, as in paper), 'gsm8k', or 'math'")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--device", type=str, default=None,
                         help="Force device: 'cpu' or 'cuda' (default: auto-detect)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory (default: reasoning_head_analysis/results/<model>)")
     args = parser.parse_args()
 
-    random.seed(42)
-    torch.manual_seed(42)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Determine device
     if args.device:
@@ -412,10 +419,19 @@ def main():
     )
     logger.info(f"Active heads after threshold+prune: {len(active_heads)}")
 
+    # Also compute top-20 heads (for cross-method comparison)
+    top20_heads = []
+    for i in range(min(20, len(sorted_idx))):
+        idx = sorted_idx[i].item()
+        l, h = idx // n_heads, idx % n_heads
+        top20_heads.append((l, h))
+    top20_heads = sorted(top20_heads)
+
     importance_path = os.path.join(output_dir, "head_importance.pt")
     torch.save({
         "head_scores": head_scores,
         "active_heads": active_heads,
+        "top20_heads": top20_heads,
         "config": {
             "model": args.model,
             "method": "EAP-IG-inputs",
@@ -423,6 +439,8 @@ def main():
             "top_n": args.top_n,
             "threshold": args.threshold,
             "n_pairs": len(all_pairs),
+            "dataset": args.dataset,
+            "seed": args.seed,
             "device": device_str,
             "elapsed_minutes": elapsed / 60,
         },

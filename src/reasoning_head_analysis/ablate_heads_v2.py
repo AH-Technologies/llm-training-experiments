@@ -575,7 +575,7 @@ def main():
 
     # ─── Head selection ────────────────────────────────────────────────
     logger.info(f"Loading head importance from {args.importance_path}")
-    data = torch.load(args.importance_path, map_location="cpu", weights_only=True)
+    data = torch.load(args.importance_path, map_location="cpu", weights_only=False)
     head_scores = data["head_scores"]
     n_layers, n_heads = head_scores.shape
     flat = head_scores.flatten()

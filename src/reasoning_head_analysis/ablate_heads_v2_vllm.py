@@ -285,7 +285,7 @@ def main():
 
     # ─── Head selection ────────────────────────────────────────────────
     logger.info(f"Loading head importance from {args.importance_path}")
-    data = torch.load(args.importance_path, map_location="cpu", weights_only=True)
+    data = torch.load(args.importance_path, map_location="cpu", weights_only=False)
     head_scores = data["head_scores"]
     n_layers, n_heads_total = head_scores.shape
     flat = head_scores.flatten()
@@ -405,10 +405,13 @@ def main():
                 df["condition_kind"] = kind
                 df.to_csv(out_path, index=False)
 
-            # Run extra conditions (per-head scales) on shard 0 only
-            # (these are typically few, so no need to shard them)
-            if extra_conditions and args.shard_idx == 0:
-                for ec_name, head_scales in extra_conditions:
+            # Run extra conditions (per-head scales), sharded across GPUs
+            if extra_conditions:
+                ec_shard = [ec for i, ec in enumerate(extra_conditions)
+                            if i % args.n_shards == args.shard_idx]
+                logger.info(f"Extra conditions: {len(ec_shard)}/{len(extra_conditions)} on shard {args.shard_idx}")
+            if extra_conditions and ec_shard:
+                for ec_name, head_scales in ec_shard:
                     out_path = os.path.join(bench_dir, f"results_{ec_name}.csv")
                     if os.path.exists(out_path):
                         logger.info(f"  {ec_name}: already done, skipping")

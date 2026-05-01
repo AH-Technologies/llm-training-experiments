@@ -428,7 +428,7 @@ def plot_ablation_curve(topk_results, random_results, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Ablation study for reasoning heads")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B")
     parser.add_argument("--importance_path", type=str, required=True,
                         help="Path to head_importance.pt from identify_heads.py")
     parser.add_argument("--data_path", type=str, default=os.path.join(PROJECT_DIR, "data/math500.parquet"))

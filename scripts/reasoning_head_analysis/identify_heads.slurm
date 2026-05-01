@@ -17,7 +17,7 @@
 
 set -e
 
-MODEL=${MODEL:-"Qwen/Qwen2.5-1.5B-Instruct"}
+MODEL=${MODEL:-"Qwen/Qwen2.5-Math-1.5B"}
 N_PAIRS=${N_PAIRS:-300}
 IG_STEPS=${IG_STEPS:-100}
 

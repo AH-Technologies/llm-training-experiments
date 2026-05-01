@@ -10,10 +10,10 @@ from pathlib import Path
 RESULTS_BASE = Path("/cluster/projects/nn12068k/haaklau/llm-training-experiments/results/reasoning_head_analysis")
 
 RUNS = {
-    "pi13_step700": RESULTS_BASE / "ablate_v2_pi13_step700" / "math500",
-    "pi1_step700": RESULTS_BASE / "ablate_v2_pi1_step700" / "math500",
-    "base_common": RESULTS_BASE / "ablate_v2_base_common_heads" / "math500",
-    "base_own": RESULTS_BASE / "ablate_v2_base_own_heads" / "math500",
+    "pi13_step700": RESULTS_BASE / "ablation" / "pi13_step700" / "math500",
+    "pi1_step700": RESULTS_BASE / "ablation" / "pi1_step700" / "math500",
+    "base_common": RESULTS_BASE / "ablation" / "base_common_heads" / "math500",
+    "base_own": RESULTS_BASE / "ablation" / "base_own_heads" / "math500",
 }
 
 # Conditions to analyze per run

@@ -57,97 +57,110 @@ def main():
         print("No results found!")
         return
 
-    (results_dir / "plots").mkdir(parents=True, exist_ok=True)
+    plots_dir = results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     # Colors and markers
     colors = plt.cm.tab10.colors
     markers = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "<"]
 
-    # One plot per benchmark
-    for bench_name in benchmarks:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for i, (model_name, step_results) in enumerate(sorted(all_results.items())):
-            steps = sorted(step_results.keys())
-            accs = []
-            for s in steps:
-                if bench_name in step_results[s]:
-                    accs.append(step_results[s][bench_name]["accuracy"] * 100)
-                else:
-                    accs.append(None)
-            # Filter out None values
-            valid = [(s, a) for s, a in zip(steps, accs) if a is not None]
-            if valid:
-                vs, va = zip(*valid)
-                ax.plot(
-                    vs, va,
-                    color=colors[i % len(colors)],
-                    marker=markers[i % len(markers)],
-                    label=model_name,
-                    linewidth=2,
-                    markersize=5,
-                )
+    # Group models by type
+    sft_models = {k: v for k, v in all_results.items() if k.startswith("sft_")}
+    grpo_models = {k: v for k, v in all_results.items() if k.startswith("grpo_")}
 
-        # Base model as horizontal line
-        if base_results and bench_name in base_results:
-            base_acc = base_results[bench_name]["accuracy"] * 100
-            ax.axhline(y=base_acc, color="black", linestyle="--", linewidth=1.5,
-                       label=f"base model ({base_acc:.1f}%)")
+    groups = [
+        ("all_models", all_results, "All Models"),
+        ("sft_only", sft_models, "SFT Models"),
+        ("grpo_only", grpo_models, "GRPO Models"),
+    ]
 
-        ax.set_xlabel("Training Step (epochs)")
-        ax.set_ylabel("Accuracy (%)")
-        ax.set_title(f"{bench_name} Accuracy over Training")
-        ax.legend(fontsize=7, loc="best")
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(bottom=0)
+    for group_name, group_results, group_title in groups:
+        if not group_results:
+            continue
+
+        # One plot per benchmark
+        for bench_name in benchmarks:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for i, (model_name, step_results) in enumerate(sorted(group_results.items())):
+                steps = sorted(step_results.keys())
+                accs = []
+                for s in steps:
+                    if bench_name in step_results[s]:
+                        accs.append(step_results[s][bench_name]["accuracy"] * 100)
+                    else:
+                        accs.append(None)
+                valid = [(s, a) for s, a in zip(steps, accs) if a is not None]
+                if valid:
+                    vs, va = zip(*valid)
+                    ax.plot(
+                        vs, va,
+                        color=colors[i % len(colors)],
+                        marker=markers[i % len(markers)],
+                        label=model_name,
+                        linewidth=2,
+                        markersize=5,
+                    )
+
+            if base_results and bench_name in base_results:
+                base_acc = base_results[bench_name]["accuracy"] * 100
+                ax.axhline(y=base_acc, color="black", linestyle="--", linewidth=1.5,
+                           label=f"base model ({base_acc:.1f}%)")
+
+            ax.set_xlabel("Training Step (epochs)")
+            ax.set_ylabel("Accuracy (%)")
+            ax.set_title(f"{group_title} — {bench_name}")
+            ax.legend(fontsize=7, loc="best")
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0)
+            fig.tight_layout()
+            out_path = plots_dir / f"{group_name}_{bench_name}.png"
+            fig.savefig(out_path, dpi=150)
+            plt.close(fig)
+            print(f"Saved: {out_path}")
+
+        # Combined subplot for this group
+        n_bench = len(benchmarks)
+        fig, axes = plt.subplots(1, n_bench, figsize=(7 * n_bench, 6), squeeze=False)
+        for j, bench_name in enumerate(benchmarks):
+            ax = axes[0][j]
+            for i, (model_name, step_results) in enumerate(sorted(group_results.items())):
+                steps = sorted(step_results.keys())
+                accs = []
+                for s in steps:
+                    if bench_name in step_results[s]:
+                        accs.append(step_results[s][bench_name]["accuracy"] * 100)
+                    else:
+                        accs.append(None)
+                valid = [(s, a) for s, a in zip(steps, accs) if a is not None]
+                if valid:
+                    vs, va = zip(*valid)
+                    ax.plot(
+                        vs, va,
+                        color=colors[i % len(colors)],
+                        marker=markers[i % len(markers)],
+                        label=model_name,
+                        linewidth=2,
+                        markersize=4,
+                    )
+
+            if base_results and bench_name in base_results:
+                base_acc = base_results[bench_name]["accuracy"] * 100
+                ax.axhline(y=base_acc, color="black", linestyle="--", linewidth=1.5,
+                           label=f"base ({base_acc:.1f}%)")
+
+            ax.set_xlabel("Training Step")
+            ax.set_ylabel("Accuracy (%)")
+            ax.set_title(bench_name)
+            ax.legend(fontsize=6, loc="best")
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0)
+
+        fig.suptitle(group_title, fontsize=14, fontweight="bold")
         fig.tight_layout()
-        out_path = results_dir / "plots" / f"{bench_name}_accuracy.png"
+        out_path = plots_dir / f"{group_name}_combined.png"
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
         print(f"Saved: {out_path}")
-
-    # Combined plot
-    n_bench = len(benchmarks)
-    fig, axes = plt.subplots(1, n_bench, figsize=(7 * n_bench, 6), squeeze=False)
-    for j, bench_name in enumerate(benchmarks):
-        ax = axes[0][j]
-        for i, (model_name, step_results) in enumerate(sorted(all_results.items())):
-            steps = sorted(step_results.keys())
-            accs = []
-            for s in steps:
-                if bench_name in step_results[s]:
-                    accs.append(step_results[s][bench_name]["accuracy"] * 100)
-                else:
-                    accs.append(None)
-            valid = [(s, a) for s, a in zip(steps, accs) if a is not None]
-            if valid:
-                vs, va = zip(*valid)
-                ax.plot(
-                    vs, va,
-                    color=colors[i % len(colors)],
-                    marker=markers[i % len(markers)],
-                    label=model_name,
-                    linewidth=2,
-                    markersize=4,
-                )
-
-        if base_results and bench_name in base_results:
-            base_acc = base_results[bench_name]["accuracy"] * 100
-            ax.axhline(y=base_acc, color="black", linestyle="--", linewidth=1.5,
-                       label=f"base ({base_acc:.1f}%)")
-
-        ax.set_xlabel("Training Step")
-        ax.set_ylabel("Accuracy (%)")
-        ax.set_title(bench_name)
-        ax.legend(fontsize=6, loc="best")
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(bottom=0)
-
-    fig.suptitle("SFT Checkpoint Evaluation", fontsize=14, fontweight="bold")
-    fig.tight_layout()
-    out_path = results_dir / "plots" / "combined_accuracy.png"
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {out_path}")
 
     # Print summary table
     print(f"\n{'='*80}")
