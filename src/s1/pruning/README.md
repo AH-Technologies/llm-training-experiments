@@ -171,3 +171,19 @@ base_logprob_mean, three positions each): ~7 h, plus ~10 min one-off for the
 base-NLL precomputation. Each new strategy adds ~1.7 h. The skill-tagging
 and base-NLL precomputations are skipped on subsequent sweeps if their
 parquets already exist.
+
+## Baselines
+
+The SLURM also runs two non-thirds baselines for sanity:
+
+- `baseline/random_n333` — random 333-row subset, 3 epochs (same compute as a
+  screening cell). Acts as the noise floor; any strategy whose middle bucket
+  sits at this number isn't carrying signal.
+- `baseline/full_n1000` — full s1K, 1 epoch. Same total step budget as a
+  screening cell (1000/16 × 1 ≈ 333/16 × 3). Tests whether thirds-with-3-epochs
+  beats one pass over everything.
+
+Both end up at `alexauren/s1-pruning/baseline/<tag>/` on the Hub and contribute
+rows to `results/pruning_screen.json` with `strategy="baseline"`,
+`position=<tag>`. Rerunnable independently — the existing eval-JSON skip
+applies.

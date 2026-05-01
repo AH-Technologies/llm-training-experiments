@@ -278,17 +278,139 @@ for cell in "${SCREEN_CELLS[@]}"; do
     fi
 done
 
+# ---- Baseline cells ----
+# Sanity-check baselines that don't fit the thirds framework:
+#   - random_n333: random 333-row subset, 3 epochs (same compute as a screening
+#     cell). Acts as the noise floor — strategies whose middle bucket sits at
+#     this level aren't actually carrying signal.
+#   - full_n1000: full s1K, 1 epoch. Same total step budget as a screening
+#     cell (1000/16 × 1 = 63 steps; 333/16 × 3 = 63 steps). Tells us whether
+#     thirds-with-3-epochs beats just running over everything once.
+#
+# Hub layout: alexauren/s1-pruning/baseline/{random_n333,full_n1000}/
+# Eval JSONs:  eval_results/baseline_{random_n333,full_n1000}.json
+BASELINE_CELLS=(
+    "random_n333"
+    "full_n1000"
+)
+
+for tag in "${BASELINE_CELLS[@]}"; do
+    case "$tag" in
+        random_n333)  STRATEGY=random; B_N=333;  B_EPOCHS=3 ;;
+        full_n1000)   STRATEGY=random; B_N=1000; B_EPOCHS=1 ;;
+        *) echo "Unknown baseline tag: $tag — skipping"; continue ;;
+    esac
+
+    CELL_TAG="baseline_${tag}"
+    PRUNED_PARQUET="data/s1K/pruned/${CELL_TAG}.parquet"
+    SFT_PARQUET="data/s1K/pruned/${CELL_TAG}_sft.parquet"
+    OUTPUT_DIR="checkpoints/s1_${CELL_TAG}"
+    EVAL_OUT="eval_results/${CELL_TAG}.json"
+    HF_SUBFOLDER="baseline/${tag}"
+
+    echo ""
+    echo "=========================================="
+    echo "Baseline: $CELL_TAG (n=$B_N, $B_EPOCHS epochs, lr=const)"
+    echo "=========================================="
+
+    if [ -f "$EVAL_OUT" ]; then
+        echo "Already complete; skipping."
+        continue
+    fi
+
+    if ! (
+        set -e
+
+        # Step 1: prune (random selection; for full_n1000 this returns all
+        # 1000 rows in seeded random.sample order, equivalent to a shuffle).
+        if [ ! -f "$PRUNED_PARQUET" ]; then
+            python -m s1.pruning.prune \
+                --strategy "$STRATEGY" \
+                --n "$B_N" \
+                --seed 42 \
+                --input data/s1K/s1k.parquet \
+                --output "$PRUNED_PARQUET"
+        fi
+
+        # Step 2: format for SFT
+        if [ ! -f "$SFT_PARQUET" ]; then
+            python scripts/prepare_s1k_sft.py \
+                --input "$PRUNED_PARQUET" \
+                --output "$SFT_PARQUET"
+        fi
+
+        # Step 3: SFT
+        if [ ! -f "${OUTPUT_DIR}/config.json" ]; then
+            ACCEL_CMD="accelerate launch \
+                --config_file ${PROJECT_DIR}/configs/accelerate_fsdp.yaml \
+                --num_processes=${WORLD_SIZE} \
+                --num_machines=${NUM_NODES} \
+                --main_process_ip=${MASTER_ADDR} \
+                --main_process_port=${MASTER_PORT} \
+                --machine_rank=\${SLURM_PROCID} \
+                -m s1.sft_hf \
+                --model Qwen/Qwen2.5-32B-Instruct \
+                --train-file ${SFT_PARQUET} \
+                --output-dir ${OUTPUT_DIR} \
+                --num-epochs ${B_EPOCHS} \
+                --batch-size 16 \
+                --per-device-batch-size 1 \
+                --sequence-length 16384 \
+                --lr 1e-5 \
+                --lr-scheduler-type constant_with_warmup \
+                --warmup-ratio 0.05 \
+                --weight-decay 1e-4 \
+                --max-grad-norm 1.0 \
+                --save-every-n-epochs ${B_EPOCHS} \
+                --save-final-only \
+                --hf-repo ${HF_REPO} \
+                --hf-subfolder ${HF_SUBFOLDER} \
+                --wandb-project s1-qwen32b-sft \
+                --wandb-run-name ${CELL_TAG} \
+                --seed 42"
+            srun --nodes=${NUM_NODES} --ntasks-per-node=1 --export=ALL \
+                bash -c "unset ROCR_VISIBLE_DEVICES; ${ACCEL_CMD}"
+        fi
+
+        # Step 4: eval (same AMC + AIME25 set as the screening cells).
+        if [ ! -f "$EVAL_OUT" ]; then
+            if [ ! -f "${OUTPUT_DIR}/config.json" ]; then
+                echo "ERROR: no trained model at $OUTPUT_DIR"
+                exit 1
+            fi
+            EVAL_TMP="eval_results/${CELL_TAG}_tmp"
+            mkdir -p "$EVAL_TMP"
+            python -m s1.eval \
+                --model "$OUTPUT_DIR" \
+                --benchmarks amc aime25 \
+                --output-dir "$EVAL_TMP"
+            produced=$(ls ${EVAL_TMP}/eval_*.json 2>/dev/null | head -1)
+            if [ -n "$produced" ]; then
+                mv "$produced" "$EVAL_OUT"
+                rmdir "$EVAL_TMP" 2>/dev/null || true
+            else
+                echo "ERROR: eval did not produce any output in ${EVAL_TMP}/"
+                exit 1
+            fi
+        fi
+
+        # Step 5: reclaim local disk.
+        if [ -d "$OUTPUT_DIR" ]; then
+            echo "Reclaiming $OUTPUT_DIR (model archived at $HF_REPO/$HF_SUBFOLDER)"
+            rm -rf "$OUTPUT_DIR"
+        fi
+    ); then
+        echo "Cell $CELL_TAG FAILED — continuing to next cell"
+    fi
+done
+
 # ---- Aggregation ----
 python - <<'PY'
 import json, glob, os
-rows = []
-for path in sorted(glob.glob("eval_results/screen_*.json")):
+
+def _row_from_eval(path, strategy, position):
     with open(path) as f:
         data = json.load(f)
-    name = os.path.basename(path).replace("screen_", "").replace(".json", "")
-    # name = "<strategy>_<position>" with strategy possibly containing underscores
-    parts = name.rsplit("_", 1)
-    strategy, position = (parts[0], parts[1]) if len(parts) == 2 else (name, "?")
     results = data.get("results", {})
     row = {
         "strategy": strategy,
@@ -298,7 +420,21 @@ for path in sorted(glob.glob("eval_results/screen_*.json")):
     }
     scores = [v for v in (row["amc"], row["aime25"]) if v is not None]
     row["avg"] = sum(scores) / len(scores) if scores else None
-    rows.append(row)
+    return row
+
+rows = []
+# Screening cells: strategy = ranking strategy, position = top/middle/bottom
+for path in sorted(glob.glob("eval_results/screen_*.json")):
+    name = os.path.basename(path).replace("screen_", "").replace(".json", "")
+    parts = name.rsplit("_", 1)
+    strategy, position = (parts[0], parts[1]) if len(parts) == 2 else (name, "?")
+    rows.append(_row_from_eval(path, strategy, position))
+
+# Baseline cells: strategy = "baseline", position = the baseline tag
+for path in sorted(glob.glob("eval_results/baseline_*.json")):
+    name = os.path.basename(path).replace("baseline_", "").replace(".json", "")
+    rows.append(_row_from_eval(path, "baseline", name))
+
 with open("results/pruning_screen.json", "w") as f:
     json.dump(rows, f, indent=2)
 print("Aggregated to results/pruning_screen.json")
