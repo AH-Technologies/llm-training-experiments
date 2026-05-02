@@ -25,7 +25,7 @@
 #   - hub subfolder is {strategy}/{position} under alexauren/s1-pruning
 #
 # Usage:
-#   sbatch scripts/submit_prune_screen.slurm
+#   sbatch scripts/s1/submit_prune_screen.slurm
 
 set -e
 
@@ -121,7 +121,7 @@ if [ ! -f "$SKILLS_PATH" ]; then
     exit 1
 fi
 if [ ! -f "data/val/amc_verl.parquet" ] || [ ! -f "data/val/aime_2025_verl.parquet" ]; then
-    echo "ERROR: validation parquets missing under data/val/. Run scripts/prepare_val_datasets.py first."
+    echo "ERROR: validation parquets missing under data/val/. Run scripts/rlvr_grokking/prepare_val_datasets.py first."
     exit 1
 fi
 
@@ -207,7 +207,7 @@ for cell in "${SCREEN_CELLS[@]}"; do
 
         # Step 2: format for SFT
         if [ ! -f "$SFT_PARQUET" ]; then
-            python scripts/prepare_s1k_sft.py \
+            python scripts/s1/prepare_s1k_sft.py \
                 --input "$PRUNED_PARQUET" \
                 --output "$SFT_PARQUET"
         fi
@@ -334,7 +334,7 @@ for tag in "${BASELINE_CELLS[@]}"; do
 
         # Step 2: format for SFT
         if [ ! -f "$SFT_PARQUET" ]; then
-            python scripts/prepare_s1k_sft.py \
+            python scripts/s1/prepare_s1k_sft.py \
                 --input "$PRUNED_PARQUET" \
                 --output "$SFT_PARQUET"
         fi

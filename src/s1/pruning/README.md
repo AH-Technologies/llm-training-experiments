@@ -2,10 +2,11 @@
 
 SFT data-efficiency experiments on s1K. Two execution modes:
 
-- **Screening** (`scripts/submit_prune_screen.slurm`) — fast proxy runs to
-  rank candidate strategies. Thirds-based: each strategy splits s1K into
-  top/middle/bottom by its score, all three thirds get a short SFT run.
-- **Full sweep** (`scripts/submit_prune_sweep.slurm`) — final compute on
+- **Screening** (`scripts/s1/submit_prune_screen.slurm`) — fast proxy runs
+  to rank candidate strategies. Thirds-based: each strategy splits s1K
+  into top/middle/bottom by its score, all three thirds get a short SFT
+  run.
+- **Full sweep** (`scripts/s1/submit_prune_sweep.slurm`) — final compute on
   the strategy/N combinations chosen from the screening results. Cosine
   schedule, full step budget, full eval.
 
@@ -21,7 +22,7 @@ prune (thirds)  →  format for SFT  →  train (3 ep, constant LR)  →
 | Step | What | Output |
 |---|---|---|
 | Prune | `s1.pruning.prune --strategy X --position {top,middle,bottom} --n 333` | `data/s1K/pruned/screen_X_pos.parquet` |
-| Format | `scripts/prepare_s1k_sft.py` | `..._sft.parquet` |
+| Format | `scripts/s1/prepare_s1k_sft.py` | `..._sft.parquet` |
 | Train | `s1.sft_hf --save-final-only --lr-scheduler-type constant_with_warmup` | `checkpoints/s1_screen_X_pos/` (fp32) |
 | Cast + upload | inside `sft_hf.py`: bf16 cast in place, push to `alexauren/s1-pruning/screen/X/pos` | Hub artifact (~65 GiB bf16) |
 | Eval | `s1.eval --benchmarks amc aime25` | `eval_results/screen_X_pos.json` |
@@ -147,10 +148,11 @@ src/s1/pruning/
 ├── tag_skills.py         ← one-off skill tagging via Gemini judge
 └── compute_base_nll.py   ← one-off base-model NLL pass for base_loss / base_logprob_mean
 
-scripts/
-├── submit_prune_screen.slurm    ← screening sweep (this README)
-├── submit_prune_sweep.slurm     ← full sweep
-└── prepare_s1k_sft.py           ← parquet → prompt/response format
+scripts/s1/
+├── submit_prune_screen.slurm        ← screening sweep (this README)
+├── submit_prune_sweep.slurm         ← full sweep
+├── submit_compute_base_nll.slurm    ← one-off base-NLL precompute
+└── prepare_s1k_sft.py               ← parquet → prompt/response format
 ```
 
 ## Compute budget (rough)

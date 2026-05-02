@@ -21,7 +21,7 @@
 # with FSDP offload on 16 H200s.
 #
 # Usage:
-#   sbatch scripts/submit_prune_sweep.slurm
+#   sbatch scripts/s1/submit_prune_sweep.slurm
 
 set -e
 
@@ -169,7 +169,7 @@ for cell in "${CELLS[@]}"; do
 
         # Step 2b: format for SFT
         if [ ! -f "$SFT_PARQUET" ]; then
-            python scripts/prepare_s1k_sft.py \
+            python scripts/s1/prepare_s1k_sft.py \
                 --input "$PRUNED_PARQUET" \
                 --output "$SFT_PARQUET"
         fi

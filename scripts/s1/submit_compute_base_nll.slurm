@@ -22,7 +22,7 @@
 # Single node, TP=4 on Qwen-32B-Instruct, ~10 min wall-clock.
 #
 # Usage:
-#   sbatch scripts/submit_compute_base_nll.slurm
+#   sbatch scripts/s1/submit_compute_base_nll.slurm
 
 set -e
 
