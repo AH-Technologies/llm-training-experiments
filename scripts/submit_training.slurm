@@ -285,7 +285,6 @@ if [ -z "${MODEL:-}" ]; then
 fi
 MODEL_CACHE_KEY=$(echo "${MODEL:-unknown}" | tr '/' '_')
 export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${MODEL_CACHE_KEY}
-export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
 echo "HF cache: $HF_HOME"

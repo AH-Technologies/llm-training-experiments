@@ -55,7 +55,6 @@ fi
 # HF cache
 MODEL_CACHE_KEY=$(echo "${MODEL}" | tr '/' '_')
 export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${MODEL_CACHE_KEY}
-export TRANSFORMERS_CACHE=$HF_HOME
 mkdir -p $HF_HOME
 
 export TOKENIZERS_PARALLELISM=false

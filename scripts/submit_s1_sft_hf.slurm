@@ -2,7 +2,7 @@
 #SBATCH --job-name=s1-hf-32b
 #SBATCH --account=nn12068k
 #SBATCH --partition=accel
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -14,9 +14,22 @@
 # S1 Grokking via HuggingFace Trainer + accelerate FSDP.
 # Replaces the custom torchtune trainer which had memory-scaling issues at long seq.
 #
-# 50 epochs (10x paper), wd=1e-3 (10x paper), seq=16384 (~1 MATH500 pt below paper).
+# Defaults: 50 epochs (10x paper), wd=1e-3 (10x paper), seq=16384 (~1 MATH500 pt
+# below paper). Override per-run by setting env vars before sbatch, e.g.:
+#
+#   WEIGHT_DECAY=1e-2 \
+#   HF_REPO=alexauren/s1-grokking-qwen32b-hf-wd1e2 \
+#   OUTPUT_DIR=checkpoints/s1_grokking_qwen32b_hf_wd1e2 \
+#   WANDB_RUN_NAME=s1_hf_50ep_wd1e2_seq16k \
+#   sbatch scripts/submit_s1_sft_hf.slurm
 
 set -e
+
+# --- Per-run knobs (override via env before sbatch) ---
+WEIGHT_DECAY=${WEIGHT_DECAY:-1e-3}
+HF_REPO=${HF_REPO:-alexauren/s1-grokking-qwen32b-hf}
+OUTPUT_DIR=${OUTPUT_DIR:-checkpoints/s1_grokking_qwen32b_hf}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-s1_hf_50ep_wd1e3_seq16k}
 
 echo "=========================================="
 echo "S1 Grokking HF Trainer: Qwen2.5-32B on s1K"
@@ -24,6 +37,10 @@ echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "GPUs per node: $SLURM_GPUS_ON_NODE"
+echo "Weight decay: $WEIGHT_DECAY"
+echo "HF repo:      $HF_REPO"
+echo "Output dir:   $OUTPUT_DIR"
+echo "WandB run:    $WANDB_RUN_NAME"
 echo "Start time: $(date)"
 echo "=========================================="
 
@@ -49,9 +66,11 @@ fi
 # --- HuggingFace cache ---
 MODEL_CACHE_KEY="Qwen_Qwen2.5-32B-Instruct"
 export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${MODEL_CACHE_KEY}
-export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 mkdir -p $HF_DATASETS_CACHE
+
+# Enable Rust-based parallel hub uploader (~5-10x faster than default Python client)
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # --- Slingshot / NCCL / libfabric networking ---
 export NCCL_SOCKET_IFNAME=bond0
@@ -126,19 +145,19 @@ ACCEL_CMD="accelerate launch \
     -m s1.sft_hf \
     --model Qwen/Qwen2.5-32B-Instruct \
     --train-file data/s1K/s1k_sft.parquet \
-    --output-dir checkpoints/s1_grokking_qwen32b_hf \
+    --output-dir ${OUTPUT_DIR} \
     --num-epochs 50 \
     --batch-size 16 \
     --per-device-batch-size 1 \
     --sequence-length 16384 \
     --lr 1e-5 \
     --warmup-ratio 0.05 \
-    --weight-decay 1e-3 \
+    --weight-decay ${WEIGHT_DECAY} \
     --max-grad-norm 1.0 \
-    --save-every-n-epochs 5 \
+    --save-every-n-epochs 10 \
     --wandb-project s1-qwen32b-sft \
-    --wandb-run-name s1_hf_50ep_wd1e3_seq16k \
-    --hf-repo alexauren/s1-grokking-qwen32b-hf \
+    --wandb-run-name ${WANDB_RUN_NAME} \
+    --hf-repo ${HF_REPO} \
     --seed 42"
 
 srun --nodes=${NUM_NODES} --ntasks-per-node=1 --export=ALL \

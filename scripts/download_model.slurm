@@ -46,7 +46,6 @@ fi
 # Set HF cache to the same location the training scripts use
 MODEL_CACHE_KEY=$(echo "${MODEL}" | tr '/' '_')
 export HF_HOME=/cluster/projects/nn12068k/alexaau/.cache/huggingface_${MODEL_CACHE_KEY}
-export TRANSFORMERS_CACHE=$HF_HOME
 mkdir -p $HF_HOME
 
 echo "Cache dir: $HF_HOME"
