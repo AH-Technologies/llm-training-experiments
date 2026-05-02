@@ -128,20 +128,36 @@ fi
 export PYTHONPATH=${PROJECT_DIR}/src:${PROJECT_DIR}:${PYTHONPATH}
 
 # ---- Step 0.5: precompute base-model NLL (one-off, ~10 min on H200×4) ----
-# Used by base_loss and base_logprob_mean screening strategies. Idempotent:
-# skipped if the parquet already exists. Runs on a single node to leave the
-# rest of the allocation idle just briefly; bf16 fits comfortably at TP=4.
+# Two passes are needed:
+#   - conditional      (s1k_base_nll.parquet)               for base_loss / base_logprob_mean
+#   - response_only    (s1k_base_nll_response_only.parquet) for ifd
+# Both are idempotent: skipped if the parquet already exists. Runs on a single
+# node to leave the rest of the allocation idle just briefly; bf16 fits at TP=4.
 NLL_PATH="data/s1K/s1k_base_nll.parquet"
+NLL_RESP_PATH="data/s1K/s1k_base_nll_response_only.parquet"
 if [ ! -f "$NLL_PATH" ]; then
     echo ""
-    echo "Computing base-model NLL on s1K → $NLL_PATH"
+    echo "Computing base-model NLL on s1K (conditional) → $NLL_PATH"
     srun --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --export=ALL \
         bash -c "unset ROCR_VISIBLE_DEVICES; python -m s1.pruning.compute_base_nll \
+            --mode conditional \
             --input data/s1K/s1k.parquet \
             --output $NLL_PATH \
             --tp 4"
 else
-    echo "Base NLL parquet exists at $NLL_PATH — skipping precomputation."
+    echo "Conditional base-NLL parquet exists at $NLL_PATH — skipping."
+fi
+if [ ! -f "$NLL_RESP_PATH" ]; then
+    echo ""
+    echo "Computing base-model NLL on s1K (response_only) → $NLL_RESP_PATH"
+    srun --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --export=ALL \
+        bash -c "unset ROCR_VISIBLE_DEVICES; python -m s1.pruning.compute_base_nll \
+            --mode response_only \
+            --input data/s1K/s1k.parquet \
+            --output-response-only $NLL_RESP_PATH \
+            --tp 4"
+else
+    echo "Response-only base-NLL parquet exists at $NLL_RESP_PATH — skipping."
 fi
 
 # ---- Cell list ----
@@ -161,6 +177,12 @@ SCREEN_CELLS=(
     "base_logprob_mean top"
     "base_logprob_mean middle"
     "base_logprob_mean bottom"
+    "ifd top"
+    "ifd middle"
+    "ifd bottom"
+    "skill_coverage top"
+    "skill_coverage middle"
+    "skill_coverage bottom"
 )
 
 # Hyperparameters held constant across all screening cells.

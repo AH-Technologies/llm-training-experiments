@@ -395,3 +395,268 @@ class TestWriteSubset:
         )
         out = pq.read_table(output_path)
         assert out.column("question").to_pylist() == ["Q7", "Q0", "Q3"]
+
+
+from s1.pruning.skill_coverage import (
+    _gather_skill_sets,
+    _greedy_facility_location,
+    _jaccard_matrix,
+    compute_ranking,
+    load_or_compute_ranking,
+)
+
+
+def _skills_table(rows: list[dict[str, list[str]]]) -> pa.Table:
+    """Build an s1k_skills.parquet-shaped table from per-row category dicts."""
+    columns = {"index": list(range(len(rows)))}
+    for cat in SKILL_CATEGORIES:
+        columns[f"skills_{cat}"] = [r.get(cat, []) for r in rows]
+    columns["skill_count"] = [
+        sum(len(r.get(c, [])) for c in SKILL_CATEGORIES) for r in rows
+    ]
+    return pa.table(columns)
+
+
+class TestGatherSkillSets:
+    def test_categories_prefixed_to_avoid_collision(self):
+        table = _skills_table([
+            {"algebra": ["linear_eq"], "geometry": ["linear_eq"]},
+        ])
+        sets = _gather_skill_sets(table)
+        assert sets[0] == {"algebra:linear_eq", "geometry:linear_eq"}
+
+    def test_empty_row_is_empty_set(self):
+        table = _skills_table([{}])
+        assert _gather_skill_sets(table) == [set()]
+
+    def test_handles_none_category_lists(self):
+        # Constructed manually because _skills_table substitutes [] for missing.
+        columns = {"index": [0]}
+        for cat in SKILL_CATEGORIES:
+            columns[f"skills_{cat}"] = [None]
+        columns["skill_count"] = [0]
+        table = pa.table(columns)
+        assert _gather_skill_sets(table) == [set()]
+
+
+class TestJaccardMatrix:
+    def test_diagonal_is_one(self):
+        sets = [{"a"}, {"b"}, {"c"}]
+        sim = _jaccard_matrix(sets)
+        for i in range(3):
+            assert sim[i, i] == 1.0
+
+    def test_disjoint_sets_give_zero(self):
+        sim = _jaccard_matrix([{"a"}, {"b"}])
+        assert sim[0, 1] == 0.0
+
+    def test_identical_sets_give_one(self):
+        sim = _jaccard_matrix([{"a", "b"}, {"a", "b"}])
+        assert sim[0, 1] == 1.0
+
+    def test_partial_overlap(self):
+        # |{a,b} ∩ {b,c}| / |{a,b,c}| = 1/3
+        sim = _jaccard_matrix([{"a", "b"}, {"b", "c"}])
+        assert abs(float(sim[0, 1]) - 1.0 / 3.0) < 1e-6
+
+    def test_two_empty_sets_give_zero_not_nan(self):
+        # Avoid degenerate Jaccard 0/0 → NaN.
+        sim = _jaccard_matrix([set(), set()])
+        assert sim[0, 1] == 0.0
+
+    def test_matrix_is_symmetric(self):
+        sim = _jaccard_matrix([{"a", "b"}, {"b"}, {"c"}])
+        for i in range(3):
+            for j in range(3):
+                assert sim[i, j] == sim[j, i]
+
+
+class TestGreedyFacilityLocation:
+    def test_returns_distinct_indices(self):
+        import numpy as np
+        sim = _jaccard_matrix([{"a"}, {"b"}, {"a", "b"}, {"c"}])
+        order = _greedy_facility_location(sim, k=4)
+        assert sorted(order) == [0, 1, 2, 3]
+
+    def test_first_pick_maximises_total_similarity(self):
+        # Row 2 = {a,b} has the highest Jaccard sum to the rest, so greedy
+        # should pick it first (it covers the broadest "concept space").
+        sim = _jaccard_matrix([{"a"}, {"b"}, {"a", "b"}, {"c"}])
+        order = _greedy_facility_location(sim, k=1)
+        assert order == [2]
+
+    def test_full_ranking_length(self):
+        sim = _jaccard_matrix([{"a"}, {"b"}, {"c"}, {"d"}])
+        order = _greedy_facility_location(sim, k=4)
+        assert len(order) == 4
+
+    def test_k_larger_than_n_caps_at_n(self):
+        sim = _jaccard_matrix([{"a"}, {"b"}])
+        order = _greedy_facility_location(sim, k=10)
+        assert sorted(order) == [0, 1]
+
+    def test_deterministic_on_ties(self):
+        # All-disjoint singletons → all marginal gains identical at every
+        # iteration. argmax tiebreak picks the lowest index.
+        sim = _jaccard_matrix([{"a"}, {"b"}, {"c"}])
+        order = _greedy_facility_location(sim, k=3)
+        assert order == [0, 1, 2]
+
+
+class TestSkillCoverageRanking:
+    def test_compute_ranking_returns_full_permutation(self):
+        table = _skills_table([
+            {"algebra": ["a"]},
+            {"algebra": ["b"]},
+            {"algebra": ["a", "b"]},
+            {"geometry": ["c"]},
+        ])
+        rank = compute_ranking(table)
+        assert sorted(rank) == [0, 1, 2, 3]
+
+    def test_load_or_compute_caches_to_parquet(self, tmp_path):
+        table = _skills_table([
+            {"algebra": ["a"]},
+            {"algebra": ["b"]},
+            {"algebra": ["a", "b"]},
+        ])
+        cache = tmp_path / "rank.parquet"
+        rank = load_or_compute_ranking(table, cache_path=str(cache))
+        assert cache.exists()
+        cached_table = pq.read_table(cache)
+        assert cached_table.column_names == ["selection_order"]
+        assert [int(x) for x in cached_table.column("selection_order").to_pylist()] == rank
+
+    def test_load_or_compute_uses_cache_when_aligned(self, tmp_path):
+        table = _skills_table([
+            {"algebra": ["a"]},
+            {"algebra": ["b"]},
+        ])
+        cache = tmp_path / "rank.parquet"
+        # Seed the cache with a hand-written ranking unrelated to the actual
+        # greedy result. load_or_compute should trust the cache when row count
+        # matches.
+        pq.write_table(pa.table({"selection_order": [1, 0]}), cache)
+        rank = load_or_compute_ranking(table, cache_path=str(cache))
+        assert rank == [1, 0]
+
+    def test_load_or_compute_recomputes_on_row_mismatch(self, tmp_path):
+        table = _skills_table([
+            {"algebra": ["a"]},
+            {"algebra": ["b"]},
+            {"algebra": ["c"]},
+        ])
+        cache = tmp_path / "rank.parquet"
+        pq.write_table(pa.table({"selection_order": [0, 1]}), cache)  # 2 rows
+        rank = load_or_compute_ranking(table, cache_path=str(cache))
+        assert sorted(rank) == [0, 1, 2]
+
+
+from s1.pruning.strategies import (
+    _BASE_NLL_PATH,
+    _BASE_NLL_RESPONSE_ONLY_PATH,
+    score_ifd,
+    score_skill_coverage,
+)
+
+
+def _s1k_table(n: int) -> pa.Table:
+    return pa.table({
+        "question": [f"Q{i}" for i in range(n)],
+        "solution": [f"S{i}" for i in range(n)],
+        "thinking_trajectories": [[f"T{i}"] for i in range(n)],
+    })
+
+
+class TestStrategyIfd:
+    def _seed_nll(self, monkeypatch, tmp_path, cond_means, uncond_means):
+        cond = tmp_path / "cond.parquet"
+        uncond = tmp_path / "uncond.parquet"
+        n = len(cond_means)
+        pq.write_table(pa.table({
+            "index": list(range(n)),
+            "total_nll": [m * 10 for m in cond_means],
+            "mean_nll": cond_means,
+            "response_tokens": [10] * n,
+        }), cond)
+        pq.write_table(pa.table({
+            "index": list(range(n)),
+            "total_nll": [m * 10 for m in uncond_means],
+            "mean_nll": uncond_means,
+            "response_tokens": [10] * n,
+        }), uncond)
+        monkeypatch.setattr("s1.pruning.strategies._BASE_NLL_PATH", str(cond))
+        monkeypatch.setattr(
+            "s1.pruning.strategies._BASE_NLL_RESPONSE_ONLY_PATH", str(uncond)
+        )
+
+    def test_score_is_mean_nll_difference(self, monkeypatch, tmp_path):
+        self._seed_nll(monkeypatch, tmp_path, [2.0, 3.0, 1.5], [1.0, 3.5, 1.5])
+        scores = score_ifd(_s1k_table(3), None)
+        # log(IFD) = mean_nll(A|Q) - mean_nll(A)
+        assert scores == [1.0, -0.5, 0.0]
+
+    def test_higher_score_means_question_helps_less(self, monkeypatch, tmp_path):
+        # Row 0: Q strongly helps (cond << uncond) → low IFD → low score
+        # Row 1: Q barely helps (cond ≈ uncond) → high IFD ≈ 1 → high score
+        self._seed_nll(monkeypatch, tmp_path, [0.5, 2.0], [3.0, 2.1])
+        scores = score_ifd(_s1k_table(2), None)
+        assert scores[1] > scores[0]
+
+    def test_raises_when_response_only_missing(self, monkeypatch, tmp_path):
+        cond = tmp_path / "cond.parquet"
+        pq.write_table(pa.table({
+            "index": [0],
+            "total_nll": [1.0],
+            "mean_nll": [0.1],
+            "response_tokens": [10],
+        }), cond)
+        monkeypatch.setattr("s1.pruning.strategies._BASE_NLL_PATH", str(cond))
+        monkeypatch.setattr(
+            "s1.pruning.strategies._BASE_NLL_RESPONSE_ONLY_PATH",
+            str(tmp_path / "missing.parquet"),
+        )
+        import pytest
+        with pytest.raises(FileNotFoundError, match="response_only"):
+            score_ifd(_s1k_table(1), None)
+
+
+class TestStrategySkillCoverage:
+    def _patch_cache(self, monkeypatch, tmp_path):
+        cache = tmp_path / "rank.parquet"
+        monkeypatch.setattr(
+            "s1.pruning.skill_coverage._DEFAULT_RANK_PATH", str(cache)
+        )
+        return cache
+
+    def test_score_shape_matches_s1k_rows(self, monkeypatch, tmp_path):
+        self._patch_cache(monkeypatch, tmp_path)
+        skills = _skills_table([{"algebra": ["a"]}, {"geometry": ["b"]}, {}])
+        s1k = _s1k_table(3)
+        scores = score_skill_coverage(s1k, skills)
+        assert len(scores) == 3
+
+    def test_first_picked_row_has_highest_score(self, monkeypatch, tmp_path):
+        cache = self._patch_cache(monkeypatch, tmp_path)
+        # Seed a known ranking; the strategy should map selection_order → score.
+        pq.write_table(pa.table({"selection_order": [2, 0, 1]}), cache)
+        skills = _skills_table([{"algebra": ["a"]}, {"algebra": ["b"]}, {"algebra": ["c"]}])
+        scores = score_skill_coverage(_s1k_table(3), skills)
+        # Row 2 picked first → highest score; row 1 picked last → lowest.
+        assert scores[2] > scores[0] > scores[1]
+
+    def test_raises_when_skills_table_none(self, monkeypatch, tmp_path):
+        self._patch_cache(monkeypatch, tmp_path)
+        import pytest
+        with pytest.raises(ValueError, match="skills"):
+            score_skill_coverage(_s1k_table(3), None)
+
+    def test_raises_on_row_mismatch(self, monkeypatch, tmp_path):
+        cache = self._patch_cache(monkeypatch, tmp_path)
+        # Cache built for 2 rows but s1k has 3 — should error after recompute
+        # produces 2 entries against a 3-row s1k_table.
+        pq.write_table(pa.table({"selection_order": [1, 0]}), cache)
+        skills = _skills_table([{"algebra": ["a"]}, {"algebra": ["b"]}])
+        import pytest
+        with pytest.raises(ValueError, match="skill_coverage"):
+            score_skill_coverage(_s1k_table(3), skills)

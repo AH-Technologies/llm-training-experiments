@@ -75,25 +75,36 @@ def score_skill_count(s1k_table: pa.Table, skills_table: pa.Table | None) -> lis
 
 
 _BASE_NLL_PATH = "data/s1K/s1k_base_nll.parquet"
+_BASE_NLL_RESPONSE_ONLY_PATH = "data/s1K/s1k_base_nll_response_only.parquet"
 
 
-def _load_base_nll(s1k_table: pa.Table) -> pa.Table:
-    """Load s1k_base_nll.parquet and assert row alignment with s1K."""
+def _load_base_nll_at(path: str, hint: str, s1k_table: pa.Table) -> pa.Table:
+    """Load a base-NLL parquet and assert row alignment with s1K."""
     import pyarrow.parquet as pq
     try:
-        nll = pq.read_table(_BASE_NLL_PATH)
+        nll = pq.read_table(path)
     except FileNotFoundError as e:
         raise FileNotFoundError(
-            f"{_BASE_NLL_PATH} not found. Run "
-            "`python -m s1.pruning.compute_base_nll` to precompute base-model "
-            "NLL signals before using base_loss / base_logprob_mean strategies."
+            f"{path} not found. Run "
+            f"`python -m s1.pruning.compute_base_nll {hint}` to precompute the "
+            "base-model NLL signal first."
         ) from e
     if nll.num_rows != s1k_table.num_rows:
         raise ValueError(
-            f"{_BASE_NLL_PATH} has {nll.num_rows} rows but s1K has {s1k_table.num_rows}; "
+            f"{path} has {nll.num_rows} rows but s1K has {s1k_table.num_rows}; "
             "regenerate the NLL parquet against the current s1K."
         )
     return nll
+
+
+def _load_base_nll(s1k_table: pa.Table) -> pa.Table:
+    return _load_base_nll_at(_BASE_NLL_PATH, "", s1k_table)
+
+
+def _load_base_nll_response_only(s1k_table: pa.Table) -> pa.Table:
+    return _load_base_nll_at(
+        _BASE_NLL_RESPONSE_ONLY_PATH, "--mode response_only", s1k_table
+    )
 
 
 @register("base_loss")
@@ -126,3 +137,64 @@ def score_base_logprob_mean(s1k_table: pa.Table, skills_table: pa.Table | None) 
     """
     nll = _load_base_nll(s1k_table)
     return [-float(x) for x in nll.column("mean_nll").to_pylist()]
+
+
+@register("ifd")
+def score_ifd(s1k_table: pa.Table, skills_table: pa.Table | None) -> list[float]:
+    """Instruction-Following Difficulty (Cherry-LLM, Li et al., NAACL 2024).
+
+    log(IFD) = mean_nll(response | question) - mean_nll(response).
+
+    Both terms are mean per-token NLL of the response under the untrained
+    base model — the conditional pass scores the response given the
+    question; the response-only pass scores it without. Their difference
+    cancels the length / style confound that makes raw `base_loss` mostly
+    a length signal.
+
+    HIGH score = the question barely lowers (or even raises) the response's
+    perplexity = the base model can't infer this response from this question.
+    These are the examples Cherry-LLM argues SFT actually moves the needle
+    on. LOW score = the question strongly determines the response = the base
+    model already does this. Top of the partition picks the harder mappings.
+
+    Requires both `data/s1K/s1k_base_nll.parquet` and
+    `data/s1K/s1k_base_nll_response_only.parquet`. The screening SLURM runs
+    `compute_base_nll` in the right modes if either is missing.
+    """
+    cond = _load_base_nll(s1k_table).column("mean_nll").to_pylist()
+    uncond = _load_base_nll_response_only(s1k_table).column("mean_nll").to_pylist()
+    return [float(c) - float(u) for c, u in zip(cond, uncond)]
+
+
+@register("skill_coverage")
+def score_skill_coverage(s1k_table: pa.Table, skills_table: pa.Table | None) -> list[float]:
+    """Lazy-greedy facility-location ranking over Jaccard similarity of
+    skill sets (paper-native categories).
+
+    Where `skill_count` ranks rows individually by raw skill count, this
+    ranks rows by their marginal contribution to coverage of the global
+    skill space — the canonical diversity / coverage objective in the
+    instruction-tuning data-selection literature.
+
+    Score = -selection_order, so the row picked first by the greedy
+    selector gets the highest score and lands in the top third. The full
+    ranking is cached to `data/s1K/s1k_skill_coverage_rank.parquet` after
+    the first call (sub-second on 1000 rows; cached for idempotency).
+    """
+    if skills_table is None:
+        raise ValueError(
+            "score_skill_coverage requires --skills <s1k_skills.parquet>; "
+            "pass it via the prune CLI."
+        )
+    from s1.pruning.skill_coverage import load_or_compute_ranking
+    rank = load_or_compute_ranking(skills_table)
+    n = s1k_table.num_rows
+    if len(rank) != n:
+        raise ValueError(
+            f"skill_coverage ranking has {len(rank)} entries but s1K has {n} rows; "
+            "delete data/s1K/s1k_skill_coverage_rank.parquet and rerun."
+        )
+    scores = [0.0] * n
+    for order, idx in enumerate(rank):
+        scores[idx] = -float(order)
+    return scores
