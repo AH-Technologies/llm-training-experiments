@@ -99,6 +99,19 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 unset ROCR_VISIBLE_DEVICES
 
+# --- Compile / kernel caches ---
+# vLLM, torch.compile and Triton write multi-GiB caches under $HOME/.cache by
+# default. The home volume here has a 30 GiB hard quota; one full vLLM compile
+# (~20 GiB) tips it over and the next eval crashes mid-init with
+# "OSError: [Errno 122] Disk quota exceeded". Pin every cache to the project
+# volume (1 TiB quota) instead.
+PROJECT_CACHE=$PROJECT_DIR/.cache
+mkdir -p $PROJECT_CACHE/vllm $PROJECT_CACHE/torch_inductor $PROJECT_CACHE/triton
+export XDG_CACHE_HOME=$PROJECT_CACHE
+export VLLM_CACHE_ROOT=$PROJECT_CACHE/vllm
+export TORCHINDUCTOR_CACHE_DIR=$PROJECT_CACHE/torch_inductor
+export TRITON_CACHE_DIR=$PROJECT_CACHE/triton
+
 # --- Multi-node setup ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
